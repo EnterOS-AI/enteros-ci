@@ -19,6 +19,14 @@ jobs:
         with:
           repository: molecule-ai/molecule-ci
           path: .molecule-ci-canonical
+          # Force anonymous fetch. molecule-ci is a public repo. On Gitea,
+          # actions/checkout@v4 sends the per-job ${{ github.token }} which
+          # is scoped to the calling repo only — Gitea 404s the cross-repo
+          # request instead of falling back to anon-public-read (different
+          # from GitHub's behaviour). Empty token bypasses auth entirely.
+          # See molecule-ci#1 commit + the post-public-flip CI run on
+          # plugin-molecule-careful-bash@663bf72 for the exact failure shape.
+          token: ''
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

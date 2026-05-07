@@ -58,6 +58,8 @@ jobs:
         with:
           repository: molecule-ai/molecule-ci
           path: .molecule-ci-canonical
+          # Force anonymous; see validate-plugin.yml note. molecule-ci is public.
+          token: ''
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -137,6 +139,8 @@ jobs:
         with:
           repository: molecule-ai/molecule-ci
           path: .molecule-ci-canonical
+          # Force anonymous; see validate-plugin.yml note. molecule-ci is public.
+          token: ''
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
