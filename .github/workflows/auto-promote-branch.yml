@@ -21,7 +21,7 @@ name: Auto-promote branch (reusable)
 #     administration: read     # read branch protection (REQUIRED — see below)
 #   jobs:
 #     promote:
-#       uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@v1
+#       uses: molecule-ai/molecule-ci/.github/workflows/auto-promote-branch.yml@v1
 #       with:
 #         from-branch: staging
 #         to-branch: main

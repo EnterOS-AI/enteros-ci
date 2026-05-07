@@ -1,6 +1,6 @@
 name: Publish Workspace Template Image
 
-# Reusable workflow for every Molecule-AI/molecule-ai-workspace-template-*
+# Reusable workflow for every molecule-ai/molecule-ai-workspace-template-*
 # repo. Builds the template's Dockerfile on main and pushes to GHCR as
 # `ghcr.io/molecule-ai/workspace-template-<runtime>:latest` (plus a
 # per-commit `sha-<7>` tag). Auto-derives <runtime> from the caller repo
@@ -17,7 +17,7 @@ name: Publish Workspace Template Image
 #     packages: write
 #   jobs:
 #     publish:
-#       uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@v1
+#       uses: molecule-ai/molecule-ci/.github/workflows/publish-template-image.yml@v1
 #       secrets: inherit
 #
 # Runner choice (2026-04-22): ubuntu-latest

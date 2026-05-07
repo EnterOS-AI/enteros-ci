@@ -17,7 +17,7 @@ jobs:
       # pattern already used by validate-workspace-template.yml.
       - uses: actions/checkout@v4
         with:
-          repository: Molecule-AI/molecule-ci
+          repository: molecule-ai/molecule-ci
           path: .molecule-ci-canonical
       - uses: actions/setup-python@v5
         with:
