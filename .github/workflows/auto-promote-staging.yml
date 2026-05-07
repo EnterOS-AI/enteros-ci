@@ -4,7 +4,7 @@ name: Auto-promote staging → main
 # `auto-promote-branch.yml` workflow factored out for org-wide reuse.
 # Other repos consume the same reusable workflow via:
 #
-#   uses: Molecule-AI/molecule-ci/.github/workflows/auto-promote-branch.yml@v1
+#   uses: molecule-ai/molecule-ci/.github/workflows/auto-promote-branch.yml@v1
 #
 # Excluded by policy: molecule-core + molecule-controlplane stay
 # manual per CEO directive 2026-04-24. Those repos do NOT call the
