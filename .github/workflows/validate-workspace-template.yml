@@ -54,12 +54,10 @@ jobs:
       # template repos as the validator evolved. Single source of truth
       # eliminates that drift class entirely — every template runs the
       # same canonical contract check on every CI run.
-      - uses: actions/checkout@v4
-        with:
-          repository: molecule-ai/molecule-ci
-          path: .molecule-ci-canonical
-          # Force anonymous; see validate-plugin.yml note. molecule-ci is public.
-          token: ''
+      # Direct git-clone — see validate-plugin.yml for the rationale.
+      # Anonymous fetch of public molecule-ci, no actions/checkout idiosyncrasies.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -135,12 +133,10 @@ jobs:
     if: github.event.pull_request.head.repo.fork != true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: molecule-ai/molecule-ci
-          path: .molecule-ci-canonical
-          # Force anonymous; see validate-plugin.yml note. molecule-ci is public.
-          token: ''
+      # Direct git-clone — see validate-plugin.yml for the rationale.
+      # Anonymous fetch of public molecule-ci, no actions/checkout idiosyncrasies.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
