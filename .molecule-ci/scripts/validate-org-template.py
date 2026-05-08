@@ -2,19 +2,47 @@
 """Validate a Molecule AI org template repo."""
 import os, sys, yaml
 
-# Support !include and other custom YAML tags used by org templates.
-# These resolve at platform load time, not at validation time — we just
-# need to parse past them without crashing.
+# Support custom YAML tags used by org templates. Two shapes:
+#
+#   - `!include teams/pm.yaml`  → scalar string referencing another YAML
+#     file in the same repo. Platform inlines at load time.
+#
+#   - `!external\n  repo: ...\n  ref: ...\n  path: ...`  → mapping
+#     referencing a workspace tree to fetch from another repo. Platform
+#     fetches into a content-addressable cache at load time
+#     (internal#77 / molecule-core#105).
+#
+# Both shapes resolve at platform load time, not at validation time.
+# The validator treats them as opaque references — it does NOT chase
+# them down. We mark each parsed value with a sentinel subtype so the
+# `validate_workspace` walk knows to skip them rather than tripping
+# the "missing 'name'" branch.
+class IncludeRef(str):
+    """`!include path/to.yaml` — opaque reference, skipped by validator."""
+
+class ExternalRef(dict):
+    """`!external` mapping — opaque reference, skipped by validator."""
+
 class PermissiveLoader(yaml.SafeLoader):
     pass
 
+def _include_constructor(loader, node):
+    return IncludeRef(loader.construct_scalar(node))
+
+def _external_constructor(loader, node):
+    return ExternalRef(loader.construct_mapping(node))
+
 def _generic_constructor(loader, tag_suffix, node):
+    # Fallback for unknown tags. Preserve the parsed shape so legacy
+    # docs that lean on tags we have not modeled yet still parse.
     if isinstance(node, yaml.MappingNode):
         return loader.construct_mapping(node)
     if isinstance(node, yaml.SequenceNode):
         return loader.construct_sequence(node)
     return loader.construct_scalar(node)
 
+PermissiveLoader.add_constructor("!include", _include_constructor)
+PermissiveLoader.add_constructor("!external", _external_constructor)
 PermissiveLoader.add_multi_constructor("!", _generic_constructor)
 
 errors = []
@@ -33,7 +61,13 @@ if not org.get("workspaces") and not org.get("defaults"):
     errors.append("org.yaml must have at least 'workspaces' or 'defaults'")
 
 def validate_workspace(ws, path=""):
-    # !include tags resolve to strings at parse time; skip non-dicts
+    # `!include path/to.yaml` parses as IncludeRef (str subclass).
+    # `!external {repo, ref, path}` parses as ExternalRef (dict subclass).
+    # Both are opaque references — skip without chasing.
+    if isinstance(ws, (IncludeRef, ExternalRef)):
+        return []
+    # Legacy unknown-tag scalars (handled by _generic_constructor) stay
+    # as plain strings; they are not workspace dicts either.
     if not isinstance(ws, dict):
         return []
     ws_errors = []
@@ -59,6 +93,11 @@ if errors:
 def count_ws(nodes):
     c = 0
     for n in nodes:
+        # Skip opaque references — we do not know how many workspaces
+        # they expand to without resolving them, and resolution is the
+        # platform's job, not the validator's.
+        if isinstance(n, (IncludeRef, ExternalRef)):
+            continue
         if not isinstance(n, dict):
             continue
         c += 1
@@ -66,4 +105,4 @@ def count_ws(nodes):
     return c
 
 total = count_ws(org.get("workspaces", []))
-print(f"✓ org.yaml valid: {org['name']} ({total} workspaces)")
+print(f"✓ org.yaml valid: {org['name']} ({total} direct workspaces; external refs not counted)")
