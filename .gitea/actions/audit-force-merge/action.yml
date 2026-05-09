@@ -1,0 +1,55 @@
+name: 'Audit force-merge'
+description: >-
+  §SOP-6 force-merge audit. Detects PRs merged with required-status-checks
+  not green at HEAD SHA and emits incident.force_merge JSON to runner
+  stdout. Vector docker_logs source ships the line to Loki on
+  molecule-canonical-obs (per reference_obs_stack_phase1).
+
+# Why a composite action and not a reusable workflow:
+# Gitea 1.22.6 does NOT support cross-repo `uses: org/repo/.gitea/
+# workflows/X.yml@ref`. Cross-repo reusable workflows landed in
+# go-gitea/gitea PR #32562 in Gitea 1.26.0 (Oct 2025). On 1.22.x the
+# clone fails because act_runner mints a caller-scoped GITEA_TOKEN.
+# Composite actions resolve via the actions-fetch path which works
+# cross-repo on 1.22 against a public callee — that's us. Re-evaluate
+# this choice when the operator host upgrades to Gitea ≥ 1.26.
+
+inputs:
+  gitea-token:
+    description: >-
+      PAT for sop-tier-bot (or equivalent read-only audit identity).
+      Needs read:user,read:repository,read:issue scopes — admin scope
+      is intentionally NOT required.
+    required: true
+  gitea-host:
+    description: 'Gitea host'
+    required: false
+    default: 'git.moleculesai.app'
+  repo:
+    description: 'owner/name; typically ${{ github.repository }}'
+    required: true
+  pr-number:
+    description: 'PR number; typically ${{ github.event.pull_request.number }}'
+    required: true
+  required-checks:
+    description: >-
+      Newline-separated required-status-check context names. Mirror
+      of branch protection's status_check_contexts. Declared at the
+      caller because /branch_protections requires admin scope which
+      this audit identity intentionally does not hold (least-privilege).
+      When the required-check set changes, update both branch
+      protection AND this input.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Detect force-merge + emit audit event
+      shell: bash
+      env:
+        GITEA_TOKEN: ${{ inputs.gitea-token }}
+        GITEA_HOST: ${{ inputs.gitea-host }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REQUIRED_CHECKS: ${{ inputs.required-checks }}
+      run: bash "$GITHUB_ACTION_PATH/audit.sh"
