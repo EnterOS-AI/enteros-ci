@@ -1,0 +1,93 @@
+# Gitea Actions port of .github/workflows/validate-org-template.yml
+# Ported 2026-05-10 per RFC #229 P1-1.
+# Caller migration: update `uses: molecule-ai/molecule-ci/.github/workflows/...@ref`
+# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
+# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
+#
+# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
+# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
+# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
+# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
+# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
+# not a switch-on. Until the operator-host server-side flip lands (task #109
+# actions/* mirror) consumers calling this via `uses:` will continue to no-op
+# /404 even after switching to the .gitea/ path. Land this PR first; flip the
+# server config + consumers in a follow-up batch.
+
+name: Validate Org Template
+on:
+  workflow_call:
+
+jobs:
+  validate:
+    name: Org template validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Canonical validator script lives in molecule-ci, fetched fresh on
+      # every run. The previous setup expected `.molecule-ci/scripts/` to
+      # be vendored INTO each org-template repo, which drifted across the
+      # 5 org-template repos as the validator evolved. Single source of
+      # truth eliminates that drift class entirely. Mirrors the same
+      # pattern already used by validate-workspace-template.yml.
+      # Direct git-clone — see validate-plugin.yml for the rationale.
+      # Anonymous fetch of public molecule-ci, no actions/checkout idiosyncrasies.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: .molecule-ci-canonical/.molecule-ci/scripts/requirements.txt
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci-canonical/.molecule-ci/scripts/validate-org-template.py
+      - name: Check for secrets
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, sys
+          from pathlib import Path
+
+          PATTERNS = [
+              re.compile(r'''["']sk-ant-[a-zA-Z0-9]{50,}["']'''),
+              re.compile(r'''["']ghp_[a-zA-Z0-9]{36,}["']'''),
+              re.compile(r'''["']AKIA[A-Z0-9]{16}["']'''),
+              re.compile(r'''["'][a-zA-Z0-9/+=]{40}["']'''),
+              re.compile(r'''["']sk_test_[a-zA-Z0-9]{24,}["']'''),
+              re.compile(r'''["']Bearer\s+[a-zA-Z0-9_.-]{20,}["']'''),
+              re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
+              re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
+          ]
+          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
+
+          def is_false_positive(line):
+              ctx = line.lower()
+              return '...' in ctx or '<example' in ctx or '</example' in ctx
+
+          root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
+          warnings = []
+          for dirpath, dirnames, filenames in os.walk(root):
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for filename in filenames:
+                  if Path(filename).suffix not in EXTENSIONS:
+                      continue
+                  filepath = Path(dirpath) / filename
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          for lineno, line in enumerate(f.readlines(), 1):
+                              for pattern in PATTERNS:
+                                  for match in pattern.finditer(line):
+                                      if not is_false_positive(line):
+                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
+                  except Exception:
+                      pass
+
+          if warnings:
+              print("::error::Potential secret found in committed files:")
+              for w in warnings:
+                  print(w)
+              sys.exit(1)
+          else:
+              print("::notice::No secrets detected")
+          PYEOF
