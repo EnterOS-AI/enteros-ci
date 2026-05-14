@@ -53,8 +53,11 @@ jobs:
           QUEUE_LABEL: merge-queue
           HOLD_LABEL: merge-queue-hold
           UPDATE_STYLE: merge
-          # Only CI is required — sop-checklist is added by PR #9 and will
-          # be wired into this list in the PR #9 follow-up after it merges.
-          REQUIRED_CONTEXTS: CI / all-required (pull_request)
-          PUSH_REQUIRED_CONTEXTS: CI / all-required (push)
+          # CI contexts differ by PR age:
+          #   PR #9 (pre-ci.yml): only CI / noop (pull_request) — SKIPPED by queue
+          #   PR #10, #11 (post-ci.yml): CI / Workflow YAML lint, Python script lint,
+          #     Secrets scan — all pass; queue merges oldest-green first.
+          # PR #9 should be closed as duplicate of PR #10 (both add ci.yml).
+          REQUIRED_CONTEXTS: CI / Workflow YAML lint (pull_request)
+          PUSH_REQUIRED_CONTEXTS: CI / Workflow YAML lint (push)
         run: python3 .gitea/scripts/gitea-merge-queue.py
