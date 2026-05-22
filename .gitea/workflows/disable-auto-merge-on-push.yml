@@ -1,6 +1,6 @@
 # Gitea Actions port of .github/workflows/disable-auto-merge-on-push.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.github/workflows/...@ref`
+# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
 # → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
 # Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
 #
@@ -38,7 +38,7 @@ name: Disable auto-merge on push
 #     pull-requests: write
 #   jobs:
 #     disable-auto-merge-on-push:
-#       uses: molecule-ai/molecule-ci/.github/workflows/disable-auto-merge-on-push.yml@v1
+#       uses: molecule-ai/molecule-ci/.gitea/workflows/disable-auto-merge-on-push.yml@v1
 #
 # False-positive behavior: if a CI bot pushes (e.g. dependency-update
 # rebase, secret rotation), this also disables auto-merge for that
