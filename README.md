@@ -12,7 +12,7 @@ name: CI
 on: [push, pull_request]
 jobs:
   validate:
-    uses: Molecule-AI/molecule-ci/.github/workflows/validate-plugin.yml@v1
+    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-plugin.yml@v1
 ```
 
 ### Workspace template repos (`molecule-ai-workspace-template-*`)
@@ -23,7 +23,7 @@ name: CI
 on: [push, pull_request]
 jobs:
   validate:
-    uses: Molecule-AI/molecule-ci/.github/workflows/validate-workspace-template.yml@v1
+    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@v1
 ```
 
 ### Org template repos (`molecule-ai-org-template-*`)
@@ -34,7 +34,7 @@ name: CI
 on: [push, pull_request]
 jobs:
   validate:
-    uses: Molecule-AI/molecule-ci/.github/workflows/validate-org-template.yml@v1
+    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-org-template.yml@v1
 ```
 
 ### Any repo with auto-merge enabled
@@ -51,7 +51,7 @@ permissions:
   pull-requests: write
 jobs:
   disable-auto-merge-on-push:
-    uses: Molecule-AI/molecule-ci/.github/workflows/disable-auto-merge-on-push.yml@v1
+    uses: molecule-ai/molecule-ci/.gitea/workflows/disable-auto-merge-on-push.yml@v1
 ```
 
 When the team lands more PR-time guards in this repo, add them as additional jobs in the same caller — keeps each consuming repo's footprint to one file.

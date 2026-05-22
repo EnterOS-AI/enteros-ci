@@ -1,8 +1,8 @@
 # Gitea Actions port of .github/workflows/publish-template-image.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.github/workflows/...@ref`
+# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
 # → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
+# The legacy .github/ copy has been removed; Gitea is the CI source of truth.
 #
 # CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
 # Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
@@ -17,8 +17,8 @@
 name: Publish Workspace Template Image
 
 # Reusable workflow for every molecule-ai/molecule-ai-workspace-template-*
-# repo. Builds the template's Dockerfile on main and pushes to GHCR as
-# `ghcr.io/molecule-ai/workspace-template-<runtime>:latest` (plus a
+# repo. Builds the template's Dockerfile on main and pushes to ECR as
+# `<ECR_REGISTRY>/molecule-ai/workspace-template-<runtime>:latest` (plus a
 # per-commit `sha-<7>` tag). Auto-derives <runtime> from the caller repo
 # name so the per-repo wrapper stays one line.
 #
@@ -30,20 +30,14 @@ name: Publish Workspace Template Image
 #     workflow_dispatch:
 #   permissions:
 #     contents: read
-#     packages: write
 #   jobs:
 #     publish:
-#       uses: molecule-ai/molecule-ci/.github/workflows/publish-template-image.yml@v1
+#       uses: molecule-ai/molecule-ci/.gitea/workflows/publish-template-image.yml@v1
 #       secrets: inherit
 #
-# Runner choice (2026-04-22): ubuntu-latest
-#   - All caller repos are PUBLIC → GHA-hosted minutes are free.
-#   - Targets are linux/amd64 natively; Ubuntu runners skip QEMU that
-#     our arm64 Mac mini had to emulate through, so builds go ~2-3x
-#     faster on top of having no queue wait when the Mac mini is busy.
-#   - No macOS Keychain gymnastics — standard docker/login-action works.
-#   The self-hosted Mac mini remains in service for private repo
-#   workflows (see memory: feedback_selfhosted_runner).
+# Runner choice: use the dedicated Linux publish runners. They have
+# Docker + AWS CLI wired for ECR publishing and avoid the mixed
+# ubuntu-latest pool.
 
 on:
   workflow_call:
@@ -77,10 +71,15 @@ on:
         description: "Short SHA tag pushed alongside :latest"
         value: ${{ jobs.publish.outputs.sha }}
 
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
+  AWS_DEFAULT_REGION: us-east-2
+
 jobs:
   publish:
     name: Build & push template image
-    runs-on: ubuntu-latest
+    runs-on: [publish, release]
     outputs:
       image: ${{ steps.tags.outputs.image }}
       sha: ${{ steps.tags.outputs.sha }}
@@ -112,7 +111,7 @@ jobs:
                 ;;
             esac
           fi
-          IMAGE="ghcr.io/molecule-ai/workspace-template-${RUNTIME}"
+          IMAGE="${ECR_REGISTRY}/molecule-ai/workspace-template-${RUNTIME}"
           SHA="${GITHUB_SHA::7}"
           echo "runtime=${RUNTIME}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}"     >> "$GITHUB_OUTPUT"
@@ -177,15 +176,34 @@ jobs:
           fi
           echo "::notice::✓ no bare imports of runtime modules in template *.py files"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Ensure ECR repository exists
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          repo_path="molecule-ai/workspace-template-${{ steps.tags.outputs.runtime }}"
+          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name "${repo_path}" \
+              --image-scanning-configuration scanOnPush=true \
+              --region "${AWS_DEFAULT_REGION}" >/dev/null
+            echo "::notice::created ECR repository ${repo_path}"
+          else
+            echo "ECR repository ${repo_path} already exists"
+          fi
 
       - name: Build template image (load for smoke test, do not push yet)
         # Build into the runner's local docker first so the smoke test can
@@ -195,7 +213,7 @@ jobs:
         # template's adapter.py imported a symbol (RuntimeCapabilities)
         # that the published runtime didn't yet export. The old smoke
         # test only inspected the entrypoint string, so the broken image
-        # shipped to GHCR and every workspace provision hung.
+        # shipped to the registry and every workspace provision hung.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -204,8 +222,6 @@ jobs:
           load: true
           push: false
           tags: ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           # RUNTIME_VERSION is empty by default. When the cascade fires
           # (or workflow_dispatch is invoked with a version), it's the
           # exact runtime version about to be installed. Forwarded as a
@@ -215,7 +231,7 @@ jobs:
           build-args: |
             RUNTIME_VERSION=${{ inputs.runtime_version }}
           labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
 
@@ -389,7 +405,7 @@ jobs:
           fi
           echo "::notice::✓ ${IMAGE} executor.execute() smoke passed (imports healthy, no runtime wedge)"
 
-      - name: Push image to GHCR (post-smoke)
+      - name: Push image to ECR (post-smoke)
         # Now that the smoke test passed, push both tags. build-push-action
         # reuses the cached build from the load step above, so this is fast
         # — it's effectively a layer push, not a rebuild. Same build-args
@@ -403,11 +419,9 @@ jobs:
           tags: |
             ${{ steps.tags.outputs.image }}:latest
             ${{ steps.tags.outputs.image }}:sha-${{ steps.tags.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           build-args: |
             RUNTIME_VERSION=${{ inputs.runtime_version }}
           labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — ${{ steps.tags.outputs.runtime }} runtime
