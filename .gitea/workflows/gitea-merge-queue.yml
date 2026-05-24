@@ -1,0 +1,63 @@
+# External serialized merge queue for Gitea 1.22.6.
+#
+# Same as molecule-core/.gitea/workflows/gitea-merge-queue.yml but scoped
+# to molecule-ci's needs:
+#   - REQUIRED_CONTEXTS omits sop-checklist (not yet installed; added by PR #9)
+#   - Only CI / all-required is required as a pre-merge gate
+#
+# Requires repo secret AUTO_SYNC_TOKEN (devops-engineer persona PAT) to be
+# provisioned — without it, the queue will exit 0 (API error → no-op per
+# queue script design) and PRs will not auto-merge.
+#
+# Queue contract:
+#   - add label `merge-queue` to an open same-repo PR
+#   - bot updates stale PR heads with current main, then waits for CI
+#   - bot merges only when current main is green and required PR contexts pass
+#   - add `merge-queue-hold` to pause a queued PR without removing it
+
+name: gitea-merge-queue
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitea-merge-queue-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out queue script from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Process one queued PR
+        env:
+          # AUTO_SYNC_TOKEN is the devops-engineer persona PAT. It is the
+          # non-bypass merge actor allowed by branch protection.
+          # MUST be provisioned as a repo secret in molecule-ci settings.
+          # Without it, the queue script exits 0 (API error → no-op) and
+          # PRs will not auto-merge.
+          GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          WATCH_BRANCH: ${{ github.event.repository.default_branch }}
+          QUEUE_LABEL: merge-queue
+          HOLD_LABEL: merge-queue-hold
+          UPDATE_STYLE: merge
+          # CI contexts differ by PR age:
+          #   PR #9 (pre-ci.yml): only CI / noop (pull_request) — SKIPPED by queue
+          #   PR #10, #11 (post-ci.yml): CI / Workflow YAML lint, Python script lint,
+          #     Secrets scan — all pass; queue merges oldest-green first.
+          # PR #9 should be closed as duplicate of PR #10 (both add ci.yml).
+          REQUIRED_CONTEXTS: CI / Workflow YAML lint (pull_request)
+          PUSH_REQUIRED_CONTEXTS: CI / Workflow YAML lint (push)
+        run: python3 .gitea/scripts/gitea-merge-queue.py

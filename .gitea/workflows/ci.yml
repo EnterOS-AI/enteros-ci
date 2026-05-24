@@ -1,0 +1,88 @@
+name: CI
+
+# CI gate for molecule-ci itself.
+# Validates YAML syntax of all workflow files and lints the validator scripts.
+# Does NOT run the plugin/template validators — those require plugin.yaml,
+# Dockerfile, and config.yaml which this repo doesn't contain.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Daily smoke to keep the CI badge green even on quiet days.
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  yaml-lint:
+    name: Workflow YAML lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check all workflow YAMLs parse correctly
+        run: |
+          python3 - << 'PYEOF'
+          import sys, os
+          from pathlib import Path
+          import yaml
+
+          errors = 0
+          for subdir in ('.gitea/workflows', '.github/workflows'):
+              for path in Path(subdir).glob('*.yml'):
+                  try:
+                      with open(path, 'rb') as f:
+                          yaml.safe_load(f)
+                      print(f"  OK  {path}")
+                  except yaml.YAMLError as e:
+                      print(f"  FAIL {path}: {e}")
+                      errors += 1
+          if errors > 0:
+              print(f"::error::{errors} workflow file(s) have invalid YAML")
+              sys.exit(1)
+          print("All workflow YAMLs are syntactically valid.")
+          PYEOF
+
+  python-lint:
+    name: Python script lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python syntax check (compileall)
+        run: |
+          errors=0
+          for f in scripts/*.py; do
+            [ -f "$f" ] || continue
+            if python3 -m py_compile "$f" 2>&1; then
+              echo "  OK  $f"
+            else
+              echo "  FAIL $f"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::$errors Python file(s) failed to compile"
+            exit 1
+          fi
+
+  secrets-scan:
+    name: Secrets scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+      - run: pip install pyyaml -q
+      - run: python3 scripts/check-secrets.py
