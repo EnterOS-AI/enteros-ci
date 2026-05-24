@@ -1,6 +1,6 @@
 # Gitea Actions port of .github/workflows/validate-workspace-template.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.github/workflows/...@ref`
+# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
 # → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
 # Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
 #

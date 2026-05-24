@@ -54,7 +54,7 @@ name: CI
 on: [push, pull_request]
 jobs:
   validate:
-    uses: Molecule-AI/molecule-ci/.github/workflows/validate-workspace-template.yml@v1
+    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@v1
 ```
 
 The reusable workflow checks out `molecule-ci` itself (into `.molecule-ci-canonical`) and runs the canonical `validate-workspace-template.py` from there — so no per-repo vendoring of the script is needed. The legacy `.molecule-ci/scripts/` directory in each template repo is being phased out.
