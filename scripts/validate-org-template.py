@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate a Molecule AI org template repo."""
-import os, sys, yaml
+import os
+import sys
+import yaml
 
 # Support !include and other custom YAML tags used by org templates.
 # These resolve at platform load time, not at validation time — we just

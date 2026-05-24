@@ -17,7 +17,6 @@ test via _reset_validator_state().
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
 import pytest
