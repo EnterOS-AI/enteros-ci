@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate a Molecule AI plugin repo."""
-import os, sys, yaml
+import os
+import sys
+import yaml
 
 errors = []
 

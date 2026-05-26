@@ -6,7 +6,9 @@ Dockerfile + config.yaml + requirements.txt against the canonical
 contract. Replaces the existing soft-warnings-only validator at
 molecule-ci/scripts/validate-workspace-template.py.
 """
-import os, re, sys
+import os
+import re
+import sys
 import yaml
 
 ERRORS: list[str] = []
