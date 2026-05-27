@@ -452,6 +452,7 @@ def _fetch_providers_manifest() -> dict | None:
                 return yaml.safe_load(f)
         except Exception:
             return None
+    import shutil
     import subprocess
     import tempfile
     repo = os.environ.get(
@@ -459,6 +460,10 @@ def _fetch_providers_manifest() -> dict | None:
         "https://git.moleculesai.app/molecule-ai/molecule-controlplane.git",
     )
     rel = "internal/providers/providers.yaml"
+    # sparse-checkout cone mode (the default) takes DIRECTORY paths, not file
+    # paths — `set internal/providers/providers.yaml` fails ("not a
+    # directory"). Use the containing directory; the file read below narrows it.
+    sparse_dir = "internal/providers"
     tmp = tempfile.mkdtemp(prefix="cp-manifest-")
     try:
         subprocess.run(
@@ -466,15 +471,20 @@ def _fetch_providers_manifest() -> dict | None:
             check=True, capture_output=True, timeout=60,
         )
         subprocess.run(
-            ["git", "-C", tmp, "sparse-checkout", "set", rel],
+            ["git", "-C", tmp, "sparse-checkout", "set", sparse_dir],
             check=True, capture_output=True, timeout=30,
         )
         with open(os.path.join(tmp, rel), encoding="utf-8") as f:
             return yaml.safe_load(f)
-    except Exception:
+    except subprocess.CalledProcessError as e:
+        # Log stderr so a future fetch breakage is visible, not a silent skip.
+        stderr = (e.stderr or b"").decode("utf-8", "replace")[-300:] if isinstance(e.stderr, bytes) else str(e.stderr or "")[-300:]
+        print(f"::warning::providers manifest fetch failed (git {e.returncode}): {stderr.strip()}")
+        return None
+    except Exception as e:
+        print(f"::warning::providers manifest fetch failed: {e}")
         return None
     finally:
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
 

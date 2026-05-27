@@ -771,3 +771,81 @@ def test_runtime_absent_from_manifest_warns(validator, tmp_path, monkeypatch):
     validator.check_platform_models()
     assert validator.ERRORS == [], validator.ERRORS
     assert any("not in the controlplane providers manifest" in w for w in validator.WARNINGS), validator.WARNINGS
+
+
+def test_manifest_fetch_via_real_git_clone(validator, tmp_path, monkeypatch):
+    """Exercise the REAL blobless+sparse git clone fetch path (not the
+    PROVIDERS_MANIFEST_FILE short-circuit) against a local file:// repo.
+    Regression guard: the sparse-checkout must use a DIRECTORY (cone mode),
+    not a file path — the file-path form silently failed -> WARN-skip, so the
+    gate never blocked via the live path."""
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _sp
+
+    if _shutil.which("git") is None:
+        import pytest as _pytest
+        _pytest.skip("git not available")
+
+    # Build a source repo containing internal/providers/providers.yaml.
+    src = tmp_path / "cp-src"
+    (src / "internal" / "providers").mkdir(parents=True)
+    (src / "internal" / "providers" / "providers.yaml").write_text(_manifest_fixture())
+    (src / "README.md").write_text("root file so the sparse cone has a base\n")
+    genv = {
+        **_os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    _sp.run(["git", "init", "-q", "-b", "main", str(src)], check=True, capture_output=True)
+    _sp.run(["git", "-C", str(src), "add", "-A"], check=True, capture_output=True, env=genv)
+    _sp.run(["git", "-C", str(src), "commit", "-q", "-m", "init"], check=True, capture_output=True, env=genv)
+
+    # The template under validation (cwd) — hermes offering an in-manifest model.
+    tmpl = tmp_path / "tmpl"
+    tmpl.mkdir()
+    (tmpl / "config.yaml").write_text(_config_with_platform("hermes", ["moonshot/kimi-k2.6"]))
+    monkeypatch.chdir(tmpl)
+    monkeypatch.delenv("PROVIDERS_MANIFEST_FILE", raising=False)
+    # file:// enables --filter on a local clone (plain paths ignore it).
+    monkeypatch.setenv("PROVIDERS_MANIFEST_REPO", "file://" + str(src))
+
+    validator.check_platform_models()
+    # Fetch succeeded via the clone path -> subset holds -> no error, no skip-warn.
+    assert validator.ERRORS == [], validator.ERRORS
+    assert validator.WARNINGS == [], validator.WARNINGS
+
+
+def test_real_git_clone_detects_drift(validator, tmp_path, monkeypatch):
+    """Same real-clone path, but the template offers a platform model NOT in
+    the fetched manifest -> must err (proves the live path actually gates)."""
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _sp
+
+    if _shutil.which("git") is None:
+        import pytest as _pytest
+        _pytest.skip("git not available")
+
+    src = tmp_path / "cp-src2"
+    (src / "internal" / "providers").mkdir(parents=True)
+    (src / "internal" / "providers" / "providers.yaml").write_text(_manifest_fixture())
+    (src / "README.md").write_text("x\n")
+    genv = {
+        **_os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    _sp.run(["git", "init", "-q", "-b", "main", str(src)], check=True, capture_output=True)
+    _sp.run(["git", "-C", str(src), "add", "-A"], check=True, capture_output=True, env=genv)
+    _sp.run(["git", "-C", str(src), "commit", "-q", "-m", "init"], check=True, capture_output=True, env=genv)
+
+    tmpl = tmp_path / "tmpl2"
+    tmpl.mkdir()
+    (tmpl / "config.yaml").write_text(_config_with_platform("hermes", ["moonshot/kimi-k2.99"]))
+    monkeypatch.chdir(tmpl)
+    monkeypatch.delenv("PROVIDERS_MANIFEST_FILE", raising=False)
+    monkeypatch.setenv("PROVIDERS_MANIFEST_REPO", "file://" + str(src))
+
+    validator.check_platform_models()
+    assert any("kimi-k2.99" in e for e in validator.ERRORS), validator.ERRORS
