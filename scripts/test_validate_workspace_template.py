@@ -683,3 +683,91 @@ def test_runtime_not_installed_warns_not_errors(validator, tmp_path, monkeypatch
         "skipping runtime-load check" in w
         for w in validator.WARNINGS
     ), validator.WARNINGS
+
+
+# ──────────────────────────────── platform-model SSOT drift gate
+
+def _manifest_fixture() -> str:
+    """Minimal controlplane providers manifest: only the runtimes block the
+    drift gate reads."""
+    return (
+        "schema_version: 1\n"
+        "runtimes:\n"
+        "  hermes:\n"
+        "    providers:\n"
+        "      - name: kimi-coding\n"
+        "        models: [kimi-coding/kimi-k2]\n"
+        "      - name: platform\n"
+        "        models: [moonshot/kimi-k2.6, moonshot/kimi-k2.5]\n"
+    )
+
+
+def _config_with_platform(runtime: str, platform_ids: list[str]) -> str:
+    lines = [
+        "name: t\n",
+        f"runtime: {runtime}\n",
+        "template_schema_version: 1\n",
+        "runtime_config:\n",
+        "  models:\n",
+        "    - id: kimi-coding/kimi-k2\n",
+        "      required_env: [KIMI_API_KEY]\n",
+    ]
+    for mid in platform_ids:
+        lines += [f"    - id: {mid}\n", "      provider: platform\n", "      required_env: []\n"]
+    return "".join(lines)
+
+
+def _setup_drift(tmp_path, monkeypatch, config_yaml, manifest_text=None):
+    (tmp_path / "config.yaml").write_text(config_yaml)
+    if manifest_text is not None:
+        mp = tmp_path / "manifest.yaml"
+        mp.write_text(manifest_text)
+        monkeypatch.setenv("PROVIDERS_MANIFEST_FILE", str(mp))
+    monkeypatch.chdir(tmp_path)
+
+
+def test_platform_models_subset_passes(validator, tmp_path, monkeypatch):
+    _setup_drift(tmp_path, monkeypatch,
+                 _config_with_platform("hermes", ["moonshot/kimi-k2.6"]),
+                 _manifest_fixture())
+    validator.check_platform_models()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert validator.WARNINGS == [], validator.WARNINGS
+
+
+def test_platform_model_not_in_manifest_errors(validator, tmp_path, monkeypatch):
+    _setup_drift(tmp_path, monkeypatch,
+                 _config_with_platform("hermes", ["moonshot/kimi-k2.6", "moonshot/kimi-k2.99"]),
+                 _manifest_fixture())
+    validator.check_platform_models()
+    assert any("kimi-k2.99" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_no_platform_models_skips(validator, tmp_path, monkeypatch):
+    cfg = (
+        "name: t\nruntime: hermes\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  models:\n    - id: kimi-coding/kimi-k2\n      required_env: [KIMI_API_KEY]\n"
+    )
+    _setup_drift(tmp_path, monkeypatch, cfg, _manifest_fixture())
+    validator.check_platform_models()
+    assert validator.ERRORS == []
+    assert validator.WARNINGS == []
+
+
+def test_manifest_unreachable_warns_not_errors(validator, tmp_path, monkeypatch):
+    _setup_drift(tmp_path, monkeypatch,
+                 _config_with_platform("hermes", ["moonshot/kimi-k2.6"]))
+    # Point at a path that does not exist -> fetch returns None -> warn-skip.
+    monkeypatch.setenv("PROVIDERS_MANIFEST_FILE", str(tmp_path / "nope.yaml"))
+    validator.check_platform_models()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert any("drift check skipped" in w for w in validator.WARNINGS), validator.WARNINGS
+
+
+def test_runtime_absent_from_manifest_warns(validator, tmp_path, monkeypatch):
+    _setup_drift(tmp_path, monkeypatch,
+                 _config_with_platform("mystery-runtime", ["moonshot/kimi-k2.6"]),
+                 _manifest_fixture())
+    validator.check_platform_models()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert any("not in the controlplane providers manifest" in w for w in validator.WARNINGS), validator.WARNINGS
