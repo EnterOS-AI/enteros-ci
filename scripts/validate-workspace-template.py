@@ -411,6 +411,137 @@ def check_adapter_runtime_load() -> None:
         )
 
 
+# ───────────────────────────────── platform-model SSOT drift gate
+#
+# The controlplane providers manifest (internal/providers/providers.yaml
+# `runtimes:` block) is the SINGLE source of truth for which
+# platform-managed (Molecule-billed) models each runtime offers (RFC
+# internal#580 Option C). A template's config.yaml `runtime_config.models`
+# entries tagged `provider: platform` are a PROJECTION of that SSOT — they
+# must be a SUBSET. Offering a platform model the manifest doesn't declare
+# risks shipping an unservable option (the SEO 1033 / "Exception: success"
+# class), so we gate it here.
+#
+# Best-effort by design: if the manifest can't be fetched (no network /
+# git access in this CI context) we WARN and skip rather than couple every
+# template's CI to controlplane reachability. The deploy-time e2e
+# platform-models smoke (molecule-controlplane) is the hard backstop that
+# actually proves servability.
+
+def _template_platform_models(config: dict) -> list[str]:
+    rc = config.get("runtime_config") or {}
+    out = []
+    for m in rc.get("models") or []:
+        if isinstance(m, dict) and str(m.get("provider", "")).strip().lower() == "platform":
+            mid = m.get("id")
+            if mid:
+                out.append(mid)
+    return out
+
+
+def _fetch_providers_manifest() -> dict | None:
+    """Load the controlplane providers manifest. PROVIDERS_MANIFEST_FILE
+    (a local path) short-circuits the fetch for tests / offline. Otherwise
+    a blobless sparse `git` clone pulls just providers.yaml using the
+    runner's ambient git credentials (same access the molecule-ci clone
+    uses). Returns the parsed dict, or None on any failure."""
+    local = os.environ.get("PROVIDERS_MANIFEST_FILE")
+    if local:
+        try:
+            with open(local, encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        except Exception:
+            return None
+    import shutil
+    import subprocess
+    import tempfile
+    repo = os.environ.get(
+        "PROVIDERS_MANIFEST_REPO",
+        "https://git.moleculesai.app/molecule-ai/molecule-controlplane.git",
+    )
+    rel = "internal/providers/providers.yaml"
+    # sparse-checkout cone mode (the default) takes DIRECTORY paths, not file
+    # paths — `set internal/providers/providers.yaml` fails ("not a
+    # directory"). Use the containing directory; the file read below narrows it.
+    sparse_dir = "internal/providers"
+    tmp = tempfile.mkdtemp(prefix="cp-manifest-")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", repo, tmp],
+            check=True, capture_output=True, timeout=60,
+        )
+        subprocess.run(
+            ["git", "-C", tmp, "sparse-checkout", "set", sparse_dir],
+            check=True, capture_output=True, timeout=30,
+        )
+        with open(os.path.join(tmp, rel), encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except subprocess.CalledProcessError as e:
+        # Log stderr so a future fetch breakage is visible, not a silent skip.
+        stderr = (e.stderr or b"").decode("utf-8", "replace")[-300:] if isinstance(e.stderr, bytes) else str(e.stderr or "")[-300:]
+        print(f"::warning::providers manifest fetch failed (git {e.returncode}): {stderr.strip()}")
+        return None
+    except Exception as e:
+        print(f"::warning::providers manifest fetch failed: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_platform_models() -> None:
+    if not os.path.isfile("config.yaml"):
+        return  # check_config_yaml already errored
+    try:
+        with open("config.yaml") as f:
+            config = yaml.safe_load(f)
+    except Exception:
+        return  # check_config_yaml already errored on the parse
+    if not isinstance(config, dict):
+        return
+
+    tmpl_models = _template_platform_models(config)
+    if not tmpl_models:
+        return  # nothing platform-managed to gate
+
+    runtime = config.get("runtime")
+    manifest = _fetch_providers_manifest()
+    if manifest is None:
+        warn(
+            "platform-model SSOT drift check skipped: could not load the controlplane "
+            "providers manifest (no git/network access here, or set "
+            "PROVIDERS_MANIFEST_FILE). The deploy-time platform-models e2e smoke is the "
+            "backstop."
+        )
+        return
+
+    runtimes = (manifest.get("runtimes") or {})
+    if runtime not in runtimes:
+        warn(
+            f"platform-model SSOT drift check skipped: runtime `{runtime}` is not in the "
+            f"controlplane providers manifest runtimes block, so its platform set is "
+            f"undefined there. Add it to providers.yaml to enable the gate."
+        )
+        return
+
+    allowed = set()
+    for ref in (runtimes[runtime].get("providers") or []):
+        if ref.get("name") == "platform":
+            allowed.update(ref.get("models") or [])
+
+    extra = [m for m in tmpl_models if m not in allowed]
+    if extra:
+        err(
+            f"config.yaml: runtime `{runtime}` offers platform model(s) {sorted(extra)} "
+            f"NOT in the controlplane providers manifest's platform set for this runtime "
+            f"({sorted(allowed)}). That manifest (internal/providers/providers.yaml "
+            f"runtimes block) is the SSOT for platform-managed models — declare them there "
+            f"first, or remove them here. Offering a platform model the SSOT doesn't "
+            f"declare risks an unservable option (the 1033 class)."
+        )
+    else:
+        print(f"✓ platform models {sorted(tmpl_models)} ⊆ manifest platform set for `{runtime}`")
+
+
 def main() -> None:
     # --static-only skips check_adapter_runtime_load(), which calls
     # importlib's exec_module() on the template's adapter.py. That's
@@ -421,6 +552,7 @@ def main() -> None:
 
     check_dockerfile()
     check_config_yaml()
+    check_platform_models()
     check_requirements()
     check_adapter()
     if not static_only:
