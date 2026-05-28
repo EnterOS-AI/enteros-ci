@@ -849,3 +849,128 @@ def test_real_git_clone_detects_drift(validator, tmp_path, monkeypatch):
 
     validator.check_platform_models()
     assert any("kimi-k2.99" in e for e in validator.ERRORS), validator.ERRORS
+
+
+# ──────────── internal#718 P4 PR-3: full-providers + native-set drift gate ────────────
+#
+# check_full_providers_block extends the platform-only gate to ALL
+# (provider, model) pairs in runtime_config.models. It fails closed on:
+#   (a) a `provider:` ref that is NOT in the runtime's manifest native set
+#   (b) a model id NOT in that native provider's manifest model set
+# and fails OPEN on:
+#   - templates without runtime_config.models (legacy top-level `model:` shape)
+#   - models without an explicit `provider:` (adapter infers; out of scope)
+#   - runtimes absent from the manifest (federation-friendly)
+#   - manifest fetch failures (best-effort)
+
+
+def _full_manifest_fixture() -> str:
+    """Richer fixture covering multi-provider per runtime (claude-code) so the
+    full-providers gate can be exercised across the (a)+(b) failure modes."""
+    return (
+        "schema_version: 1\n"
+        "runtimes:\n"
+        "  claude-code:\n"
+        "    providers:\n"
+        "      - name: anthropic-api\n"
+        "        models: [claude-opus-4-7, anthropic:claude-opus-4-7]\n"
+        "      - name: kimi-coding\n"
+        "        models: [kimi-for-coding, moonshot:kimi-k2.6]\n"
+        "      - name: platform\n"
+        "        models: [anthropic/claude-opus-4-7, moonshot/kimi-k2.6]\n"
+        "  hermes:\n"
+        "    providers:\n"
+        "      - name: kimi-coding\n"
+        "        models: [kimi-coding/kimi-k2]\n"
+        "      - name: platform\n"
+        "        models: [moonshot/kimi-k2.6]\n"
+    )
+
+
+def _config_with_providers(runtime: str, entries) -> str:
+    """entries = [(model_id, provider_name), ...]"""
+    lines = [
+        "name: t\n",
+        f"runtime: {runtime}\n",
+        "template_schema_version: 1\n",
+        "runtime_config:\n",
+        "  models:\n",
+    ]
+    for mid, prov in entries:
+        lines += [f"    - id: {mid}\n"]
+        if prov:
+            lines += [f"      provider: {prov}\n"]
+        lines += ["      required_env: []\n"]
+    return "".join(lines)
+
+
+def test_full_providers_subset_passes_no_drift(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("claude-code", [
+        ("claude-opus-4-7", "anthropic-api"),
+        ("anthropic:claude-opus-4-7", "anthropic-api"),
+        ("kimi-for-coding", "kimi-coding"),
+        ("anthropic/claude-opus-4-7", "platform"),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert validator.WARNINGS == [], validator.WARNINGS
+
+
+def test_full_providers_unknown_provider_errors(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("claude-code", [
+        ("nousresearch/hermes-4-70b", "nousresearch"),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert any("nousresearch" in e and "NATIVE provider set" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_full_providers_native_provider_unknown_model_errors(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("claude-code", [
+        ("claude-opus-99", "anthropic-api"),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert any("claude-opus-99" in e and "native model set" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_full_providers_no_models_block_skips(validator, tmp_path, monkeypatch):
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "model: claude-opus-4-7\n"
+    )
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert validator.WARNINGS == [], validator.WARNINGS
+
+
+def test_full_providers_unknown_runtime_warns(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("federated-runtime", [
+        ("any-model", "any-provider"),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert any("not in the controlplane providers manifest" in w for w in validator.WARNINGS), validator.WARNINGS
+
+
+def test_full_providers_manifest_unreachable_warns(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("claude-code", [
+        ("claude-opus-4-7", "anthropic-api"),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg)  # no manifest_text
+    monkeypatch.setenv("PROVIDERS_MANIFEST_FILE", str(tmp_path / "nope.yaml"))
+    validator.check_full_providers_block()
+    assert validator.ERRORS == [], validator.ERRORS
+    assert any("drift check skipped" in w for w in validator.WARNINGS), validator.WARNINGS
+
+
+def test_full_providers_blank_provider_ignored(validator, tmp_path, monkeypatch):
+    cfg = _config_with_providers("claude-code", [
+        ("some-id-no-provider", ""),
+    ])
+    _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
+    validator.check_full_providers_block()
+    assert validator.ERRORS == [], validator.ERRORS

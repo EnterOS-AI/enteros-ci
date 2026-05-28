@@ -542,6 +542,160 @@ def check_platform_models() -> None:
         print(f"✓ platform models {sorted(tmpl_models)} ⊆ manifest platform set for `{runtime}`")
 
 
+# ─────────────────────── full-providers + runtime-native-set drift gate
+#
+# internal#718 P4 PR-3 (Audit-A finding #4 / #715C closure): extend the
+# platform-only drift gate above to the FULL providers block + runtime native
+# sets. The controlplane providers manifest (internal/providers/providers.yaml)
+# is the SSOT for not just platform-managed models but every (provider, model)
+# pair each runtime natively supports. A template's `runtime_config.models`
+# entries — across ALL providers, not just `platform` — must be a subset of the
+# manifest's per-runtime native set for that runtime.
+#
+# Pre-P4 the gate only caught drift on `provider: platform` models — the 1033
+# class. After PR-1's colon-vocab reconcile the registry now lists every
+# legitimate (runtime, model) pair (bare + slash + colon forms across each
+# runtime's native providers); pre-PR4 the FULL set was unenforced and
+# templates could silently offer e.g. `nousresearch/hermes-4-70b` on hermes
+# (drift outside the CTO kimi-only matrix). PR-4 codegen will retire the
+# hand-authored providers block entirely, but the drift gate is what keeps the
+# template in sync with the registry as long as the providers block is still
+# hand-authored.
+#
+# Semantics: every `runtime_config.models[*].id` whose `provider:` is in the
+# manifest's per-runtime native provider name set MUST also be in that
+# provider's native model set. Models with a `provider:` that is NOT in the
+# native set are themselves a drift signal (the template is offering a model
+# routed through a provider the runtime cannot natively serve).
+#
+# Same best-effort posture as check_platform_models: skip on manifest-fetch
+# failure (warn, do not error); skip on runtime absent from the manifest
+# (federation-friendly).
+#
+# Fail OPEN intentionally on templates that DO NOT declare runtime_config.models
+# at all: the legacy templates carry only a top-level `model:` and no per-model
+# entries; gating those would be a behavior change orthogonal to this PR.
+
+def _template_models_by_provider(config: dict) -> dict[str, list[str]]:
+    """Group runtime_config.models entries by their declared `provider:`."""
+    rc = config.get("runtime_config") or {}
+    out: dict[str, list[str]] = {}
+    for m in rc.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        prov = str(m.get("provider", "")).strip()
+        mid = m.get("id")
+        if not mid:
+            continue
+        out.setdefault(prov, []).append(str(mid))
+    return out
+
+
+def check_full_providers_block() -> None:
+    """internal#718 P4 PR-3: validate template's FULL runtime_config.models
+    (every provider, not just `platform`) against the manifest's per-runtime
+    native (provider, model) matrix."""
+    if not os.path.isfile("config.yaml"):
+        return  # check_config_yaml already errored
+    try:
+        with open("config.yaml") as f:
+            config = yaml.safe_load(f)
+    except Exception:
+        return  # check_config_yaml already errored
+    if not isinstance(config, dict):
+        return
+
+    by_prov = _template_models_by_provider(config)
+    if not by_prov:
+        return  # no per-model entries — nothing to gate (legacy top-level `model:` shape)
+
+    runtime = config.get("runtime")
+    manifest = _fetch_providers_manifest()
+    if manifest is None:
+        warn(
+            "full-providers SSOT drift check skipped (P4 PR-3): could not load the "
+            "controlplane providers manifest. The deploy-time platform-models e2e "
+            "smoke + the workspace-server only-registered create gate (internal#718 "
+            "P4 PR-2 422 UNREGISTERED_MODEL_FOR_RUNTIME) remain backstops."
+        )
+        return
+
+    runtimes = (manifest.get("runtimes") or {})
+    if runtime not in runtimes:
+        # Federation-friendly: a non-first-party runtime is not in the registry
+        # by design. The workspace-server only-registered gate fails OPEN for it
+        # too; do not block here.
+        warn(
+            f"full-providers SSOT drift check skipped (P4 PR-3): runtime `{runtime}` is "
+            f"not in the controlplane providers manifest. Federation-runtime templates "
+            f"are gated by the deploy-time only-registered fail-open path, not here."
+        )
+        return
+
+    # Build the per-runtime native (provider → set-of-models) matrix from the
+    # manifest. Both keys (provider names) AND values (model id sets) are the
+    # gate inputs.
+    native: dict[str, set[str]] = {}
+    for ref in (runtimes[runtime].get("providers") or []):
+        native[ref.get("name")] = set(ref.get("models") or [])
+
+    if not native:
+        warn(
+            f"full-providers SSOT drift check skipped (P4 PR-3): runtime `{runtime}` "
+            f"has an empty native provider set in the manifest. Declare its native "
+            f"matrix in providers.yaml to enable this gate."
+        )
+        return
+
+    # Two failure modes:
+    #
+    #   (a) The template references a `provider:` that is NOT in the runtime's
+    #       native set at all. The template is offering a model routed through
+    #       a provider the runtime cannot natively serve — over-offer drift.
+    #
+    #   (b) The provider IS native but the specific model id is NOT in that
+    #       provider's native model set — model-id drift (same class as the
+    #       pre-PR3 platform gate, generalized to every provider).
+    unknown_providers: dict[str, list[str]] = {}
+    extra_models_by_prov: dict[str, list[str]] = {}
+    for prov, mids in by_prov.items():
+        if not prov:
+            # Models without an explicit `provider:` are out of scope (the
+            # workspace adapter infers their provider at boot; gating those
+            # requires the inferVendor heuristic which is a different layer).
+            continue
+        if prov not in native:
+            unknown_providers[prov] = sorted(set(mids))
+            continue
+        extra = [m for m in mids if m not in native[prov]]
+        if extra:
+            extra_models_by_prov[prov] = sorted(set(extra))
+
+    if unknown_providers:
+        for prov, mids in sorted(unknown_providers.items()):
+            err(
+                f"config.yaml: runtime `{runtime}` offers models {mids} routed through "
+                f"provider `{prov}`, which is NOT in the runtime's NATIVE provider set "
+                f"per the controlplane providers manifest ({sorted(native.keys())}). "
+                f"Either remove these entries, or declare `{prov}` as a native provider "
+                f"for `{runtime}` in providers.yaml. (internal#718 P4 PR-3 — extends the "
+                f"platform-only gate to the full providers block.)"
+            )
+
+    if extra_models_by_prov:
+        for prov, mids in sorted(extra_models_by_prov.items()):
+            err(
+                f"config.yaml: runtime `{runtime}` provider `{prov}` offers model(s) {mids} "
+                f"NOT in the manifest's native model set for `{prov}` "
+                f"({sorted(native[prov])}). Add the ids to providers.yaml's runtimes "
+                f"block first, or remove them here. (internal#718 P4 PR-3.)"
+            )
+
+    if not unknown_providers and not extra_models_by_prov:
+        flat = sorted({m for mids in by_prov.values() for m in mids})
+        print(f"✓ full providers block ⊆ manifest native (provider, model) matrix for `{runtime}` ({len(flat)} model id(s))")
+
+
 def main() -> None:
     # --static-only skips check_adapter_runtime_load(), which calls
     # importlib's exec_module() on the template's adapter.py. That's
@@ -553,6 +707,7 @@ def main() -> None:
     check_dockerfile()
     check_config_yaml()
     check_platform_models()
+    check_full_providers_block()
     check_requirements()
     check_adapter()
     if not static_only:
