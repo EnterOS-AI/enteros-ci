@@ -99,6 +99,7 @@ KNOWN_RUNTIMES = {
     "deepagents",
     "hermes",
     "gemini-cli",
+    "google-adk",
     "openclaw",
 }
 
