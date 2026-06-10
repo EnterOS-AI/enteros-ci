@@ -18,8 +18,16 @@
 name: gitea-merge-queue
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # `schedule:` removed — the operator conductor tick now runs this queue
+  # in-process every 5 min with THIS repo's env + script version preserved
+  # (operator-config#194; measurement on operator-config#157: the schedule
+  # burned 288 container jobs/day/repo, ~52k/week fleet-wide, ~99% no-ops).
+  # workflow_dispatch below remains the manual fallback vehicle.
+  # Conductor kill-switch (operator host):
+  #   touch /etc/molecule-bootstrap/molecule-ci-conductor-fleet.disabled
+  # Full rollback: restore
+  #   schedule:
+  #     - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
