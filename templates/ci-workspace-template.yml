@@ -1,0 +1,84 @@
+# CANONICAL consumer ci.yml for workspace-template repos — molecule-ai/molecule-ci SSOT.
+#
+# This is the file NEW workspace-template repos inherit. It standardizes the
+# emitted commit-status context to `CI / validate` (workflow `name: CI` + a
+# job whose status display-name is `validate`), so a single canonical
+# branch-protection required context — `CI / validate (pull_request)` —
+# works fleet-wide. See molecule-ci .gitea/workflows/bp-context-drift-gate.yml
+# and the design doc bp-drift-durable-fix.md for the drift root cause this
+# resolves (a BP-required context with no emitter = perma-pending = HTTP 405
+# merge-block forever).
+#
+# WHY INLINE (not `uses: molecule-ai/molecule-ci/.gitea/workflows/...`):
+# cross-repo `uses:` (workflow_call) does NOT resolve on Gitea 1.22.6 —
+# [actions].DEFAULT_ACTIONS_URL=github routes the fetch to github.com where
+# the `molecule-ai` org is suspended → 404/no-op. So the reusable
+# validate-workspace-template.yml in molecule-ci is currently un-callable
+# from a consumer. This template instead INLINES the validate job: it
+# anon-clones the public molecule-ci SSOT at CI time and runs the canonical
+# validator script directly. Same single-source-of-truth (the validator
+# lives in molecule-ci, fetched fresh on every run), no cross-repo `uses:`.
+#
+# When the operator-host actions/* mirror lands (internal task #109) and
+# cross-repo `uses:` resolves, this inline job can collapse back to a
+# `uses:` call WITHOUT changing the emitted `CI / validate` context.
+#
+# Fork-PR security: on EXTERNAL fork PRs the validator runs in --static-only
+# mode (no pip install of the template's requirements.txt, no adapter.py
+# import, no docker build) — those are arbitrary-code-execution primitives
+# from an untrusted PR's perspective. Internal PRs and pushes get the full
+# runtime validation. This mirrors the static/runtime split in the reusable
+# validate-workspace-template.yml while still emitting the single
+# `CI / validate` context.
+#
+# The SSOT is cloned into `.molecule-ci` (NOT `.molecule-ci-canonical`) so
+# that the canonical check-secrets.py — whose SKIP_DIRS prunes `.molecule-ci`
+# — does not scan molecule-ci's own fixtures and self-flag.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      # Fetch the canonical validator from the molecule-ci SSOT. Anonymous
+      # clone of the public repo — see molecule-ci/.gitea/workflows/
+      # validate-plugin.yml for why a direct git-clone is used instead of
+      # actions/checkout for the cross-repo fetch on Gitea 1.22.6.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml -q
+      # Secret scan — always runs, including on external fork PRs (static,
+      # no code execution; the most important security check).
+      - name: Check for secrets
+        run: python3 .molecule-ci/.molecule-ci/scripts/check-secrets.py
+      # On external fork PRs: STATIC-ONLY validation (no pip install of the
+      # template's requirements.txt, no adapter.py import). Untrusted code.
+      - name: Validate workspace-template contract (static-only, fork PR)
+        if: github.event.pull_request.head.repo.fork == true
+        run: python3 .molecule-ci/scripts/validate-workspace-template.py --static-only
+      # Internal PRs and pushes: FULL runtime validation. Install the
+      # template's own runtime deps so the validator can import adapter.py
+      # the same way the workspace container does at boot.
+      - if: github.event.pull_request.head.repo.fork != true && hashFiles('requirements.txt') != ''
+        run: pip install -q -r requirements.txt
+      - if: github.event.pull_request.head.repo.fork != true && hashFiles('requirements.txt') == ''
+        run: pip install -q molecule-ai-workspace-runtime
+      - name: Validate workspace-template contract (full)
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 .molecule-ci/scripts/validate-workspace-template.py
