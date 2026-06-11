@@ -277,6 +277,76 @@ def test_api_transient_fails_closed(envset, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Malformed workflow YAML → FAIL CLOSED (exit 2). A workflow that does not
+# parse means the emitter inventory is INCOMPLETE; skipping it (the old
+# `continue`) is fail-OPEN, because the remaining parsed workflows might
+# happen to satisfy every BP-required context. The fixture deliberately
+# pairs a malformed workflow with a VALID one that DOES emit the single
+# BP-required context — so a fail-open implementation would green (exit 0).
+# A correct fail-closed implementation returns 2 regardless. "Nothing
+# fails open."
+# ---------------------------------------------------------------------------
+def test_malformed_workflow_yaml_fails_closed(envset, monkeypatch, capsys):
+    # Valid workflow that, on its own, satisfies the BP-required context.
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    # Malformed workflow — unparseable YAML (bad indentation / dangling
+    # mapping). yaml.safe_load raises yaml.YAMLError on this.
+    _write_wf(
+        envset,
+        "broken.yml",
+        "name: Broken\non:\n  pull_request:\n jobs:\n  : : :\n   - [unbalanced\n",
+    )
+    m = _import_lint()
+    posted = _stub_api(
+        monkeypatch,
+        m,
+        # BP requires only the context the VALID workflow emits, so a
+        # fail-open (skip-and-continue) impl would exit 0 here.
+        ("ok", {"status_check_contexts": ["CI / all-required (pull_request)"]}),
+    )
+    rc = m.run()
+    assert rc == 2, (
+        "malformed workflow YAML must fail closed (exit 2), even when the "
+        "remaining valid workflows satisfy BP; got exit %r" % rc
+    )
+    err = capsys.readouterr().err
+    assert "broken.yml" in err
+    assert "parse" in err.lower()
+    # Fail-closed happens before any issue side effect.
+    assert not posted.get("posts"), f"no issue write on parse-fail; got {posted!r}"
+    assert not posted.get("patches"), f"no issue write on parse-fail; got {posted!r}"
+
+
+def test_malformed_workflow_yaml_fails_closed_in_assert_mode(envset, monkeypatch, capsys):
+    """Fail-closed-on-parse-error must also hold in MODE=assert (PR-time gate)."""
+    monkeypatch.setenv("MODE", "assert")
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    _write_wf(
+        envset,
+        "broken.yml",
+        "name: Broken\non:\n  pull_request:\n jobs:\n  : : :\n   - [unbalanced\n",
+    )
+    m = _import_lint()
+    _stub_api(
+        monkeypatch,
+        m,
+        ("ok", {"status_check_contexts": ["CI / all-required (pull_request)"]}),
+    )
+    rc = m.run()
+    assert rc == 2
+
+
+# ---------------------------------------------------------------------------
 # API 404 — authenticated absent resource (branch has no protection) →
 # tolerated graceful skip (exit 0 with ::warning::), NOT a fail-open.
 # ---------------------------------------------------------------------------

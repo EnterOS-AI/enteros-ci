@@ -457,16 +457,44 @@ def run() -> int:
         return 0
 
     # 2. Enumerate emitter contexts from all workflows.
+    #
+    # FAIL-CLOSED on YAML parse errors. A malformed workflow means we
+    # CANNOT enumerate the contexts it emits, so the emitter inventory is
+    # INCOMPLETE. Silently skipping it (the old `continue`) is fail-OPEN:
+    # the remaining parsed workflows might happen to satisfy every
+    # BP-required context, greening a gate built on an incomplete
+    # inventory. Per the exit-code contract (2 = cannot-verify), we
+    # accumulate every parse error, report each with an `::error::`
+    # message, and return 2 after the scan if ANY workflow failed to
+    # parse — same fail-closed code used for auth/transient errors, and
+    # consistent across BOTH MODE=assert and MODE=issue (this runs before
+    # the mode branch). "Nothing fails open."
     all_emitter: set[str] = set()
+    parse_errors: list[str] = []
     for path in _iter_workflow_files(wf_dir):
         try:
             doc = yaml.safe_load(path.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
+            parse_errors.append(str(path))
             sys.stderr.write(
-                f"::error file={path}::YAML parse error: {e}; skipping.\n"
+                f"::error file={path}::YAML parse error: {e}. The emitter "
+                f"inventory would be INCOMPLETE, so this lint CANNOT verify "
+                f"the BP↔emitter invariant; FAILING CLOSED (exit 2) instead "
+                f"of greening on a partial inventory. Fix the malformed "
+                f"workflow.\n"
             )
             continue
         all_emitter |= workflow_contexts(doc)
+
+    if parse_errors:
+        sys.stderr.write(
+            f"::error::{len(parse_errors)} workflow file(s) failed to parse "
+            f"({', '.join(parse_errors)}); the emitter inventory is "
+            f"INCOMPLETE. FAILING CLOSED (exit 2) — the BP↔emitter invariant "
+            f"cannot be verified against a partial inventory. Holds in both "
+            f"MODE=assert and MODE=issue.\n"
+        )
+        return 2
 
     print(
         f"::notice::[MODE={mode}] Linting {len(bp_contexts)} BP context(s) "
