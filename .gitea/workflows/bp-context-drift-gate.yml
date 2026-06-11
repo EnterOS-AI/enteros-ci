@@ -1,0 +1,74 @@
+name: bp-context-drift-gate
+
+# BP-context drift gate (ADVISORY) — ported BP⊆emitted asserter.
+#
+# Asserts that every context required by this repo's branch-protection
+# (branch_protections/main.status_check_contexts) is EMITTED by some
+# workflow in .gitea/workflows/*.yml. A required context with no emitter
+# is perma-pending — Gitea treats absent-as-`pending`, NOT
+# absent-as-`skipped`-as-`success` — so the merge endpoint returns HTTP
+# 405 "try again later" FOREVER. This is the perma-block root cause
+# class (feedback_phantom_required_check_after_gitea_migration).
+#
+# ADVISORY for now: this job is `continue-on-error: true`, so it NEVER
+# blocks a merge yet. The SCRIPT it runs
+# (.molecule-ci/scripts/lint_bp_context_emit_match.py, MODE=assert) is
+# FAIL-CLOSED: it exits nonzero on auth failure / missing token / orphan
+# context, so when this job is later promoted to a required hard gate
+# (after a clean advisory window) it is already correct.
+#
+# To actually verify, the job needs a DRIFT_BOT_TOKEN org secret —
+# read-only repo-admin, used only for the branch_protections GET. Until
+# that secret is set, the script fails-closed (advisory, so it does not
+# block) and surfaces the auth error loudly in the job log.
+#
+# Modeled on molecule-controlplane's cf-tunnel-drift-gate job
+# (cross-repo drift gate) for conventions: pinned action SHAs,
+# concurrency cancel-in-progress, manual workflow_dispatch.
+#
+# Follow-up (separate PR): canonical-name standardization (CI/validate)
+# across the template repos so no BP requires a context name no
+# workflow emits.
+
+on:
+  pull_request:
+    paths:
+      - ".gitea/workflows/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bp-context-drift-gate:
+    name: BP-context drift gate (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # ADVISORY: never block a merge while this gate beds in. The script
+    # itself is fail-closed (nonzero on auth error / orphan); this flag
+    # only governs whether THIS job's red blocks the PR. Flip to false
+    # (and add the context to BP) to promote to a required hard gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Install PyYAML
+        run: pip install PyYAML==6.0.2 -q
+      - name: Assert BP-required contexts are all emitted
+        env:
+          # DRIFT_BOT_TOKEN: read-only repo-admin org secret, used only
+          # for the branch_protections GET. Until it is set, the script
+          # fails-closed (advisory job, so it does not block the PR).
+          GITEA_TOKEN: ${{ secrets.DRIFT_BOT_TOKEN }}
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          BRANCH: main
+          WORKFLOWS_DIR: .gitea/workflows
+          MODE: assert
+        run: python3 .molecule-ci/scripts/lint_bp_context_emit_match.py
