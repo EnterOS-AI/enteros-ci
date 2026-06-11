@@ -71,7 +71,7 @@ jobs:
       # template's requirements.txt, no adapter.py import). Untrusted code.
       - name: Validate workspace-template contract (static-only, fork PR)
         if: github.event.pull_request.head.repo.fork == true
-        run: python3 .molecule-ci/scripts/validate-workspace-template.py --static-only
+        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py --static-only
       # Internal PRs and pushes: FULL runtime validation. Install the
       # template's own runtime deps so the validator can import adapter.py
       # the same way the workspace container does at boot.
@@ -81,4 +81,4 @@ jobs:
         run: pip install -q molecule-ai-workspace-runtime
       - name: Validate workspace-template contract (full)
         if: github.event.pull_request.head.repo.fork != true
-        run: python3 .molecule-ci/scripts/validate-workspace-template.py
+        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py
