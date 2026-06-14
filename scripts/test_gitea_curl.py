@@ -95,6 +95,8 @@ REJECT_CASES = [
     ('-H "Authorization : Bearer tok"', ["-H", "Authorization : Bearer tok"]),
     ('--header=Authorization : Bearer tok', ["--header=Authorization : Bearer tok"]),
     ('-H "Authorization:token"', ["-H", "Authorization:token"]),
+    # exact #11721 form verified by Researcher on b65272e
+    ('-H=Authorization: token SECRET', ["-H=Authorization: token SECRET"]),
 ]
 
 
