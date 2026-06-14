@@ -152,5 +152,70 @@ def test_gitea_curl_allows_safe_headers(
     assert "refusing" not in result.stderr.lower()
 
 
+# ---- setup-gitea-netrc.sh regression tests ----
+
+
+@pytest.fixture
+def setup_script() -> pathlib.Path:
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    return repo_root / "scripts" / "setup-gitea-netrc.sh"
+
+
+def test_setup_netrc_creates_file_mode_600(
+    setup_script: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    """The final ~/.netrc must be mode 0600 and contain the credentials."""
+    result = subprocess.run(
+        ["bash", str(setup_script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(tmp_home),
+            "GIT_HTTP_USERNAME": "agent-dev-a",
+            "GIT_HTTP_PASSWORD": "s3cr3t-t0k3n",
+            "GITEA_HOST": "git.moleculesai.app",
+        },
+        check=False,
+    )
+    assert result.returncode == 0, f"setup script failed: {result.stderr}"
+
+    netrc = tmp_home / ".netrc"
+    assert netrc.exists()
+    # Fail-closed: exact mode 0600, no wider permissions.
+    mode = netrc.stat().st_mode & 0o777
+    assert mode == 0o600, f"expected .netrc mode 0600, got {oct(mode)}"
+
+    content = netrc.read_text()
+    assert "machine git.moleculesai.app" in content
+    assert "login agent-dev-a" in content
+    assert "password s3cr3t-t0k3n" in content
+
+
+def test_setup_netrc_skips_when_credentials_absent(
+    setup_script: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    """Without env credentials the script exits cleanly and does not create netrc."""
+    env = {
+        **os.environ,
+        "HOME": str(tmp_home),
+        "GITEA_HOST": "git.moleculesai.app",
+    }
+    env.pop("GIT_HTTP_USERNAME", None)
+    env.pop("GIT_HTTP_PASSWORD", None)
+    result = subprocess.run(
+        ["bash", str(setup_script)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, f"setup script failed: {result.stderr}"
+    assert not (tmp_home / ".netrc").exists()
+    assert "skipping" in result.stderr.lower()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
