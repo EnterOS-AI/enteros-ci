@@ -86,6 +86,8 @@ REJECT_CASES = [
     ("--header=Proxy-Authorization: Basic b64", ["--header=Proxy-Authorization: Basic b64"]),
     # equals-attached value bypass (RC #11714)
     ('--header=Authorization=Bearer tok', ["--header=Authorization=Bearer tok"]),
+    ('-H=Authorization: Bearer tok', ["-H=Authorization: Bearer tok"]),
+    ('-H=Authorization=Bearer tok', ["-H=Authorization=Bearer tok"]),
     ('-H "Authorization=token tok"', ["-H", "Authorization=token tok"]),
     ('--header=Proxy-Authorization=Basic b64', ["--header=Proxy-Authorization=Basic b64"]),
     # structural-scan catch-all: unusual spacing/separators that prior form-by-form
@@ -93,6 +95,8 @@ REJECT_CASES = [
     ('-H "Authorization : Bearer tok"', ["-H", "Authorization : Bearer tok"]),
     ('--header=Authorization : Bearer tok', ["--header=Authorization : Bearer tok"]),
     ('-H "Authorization:token"', ["-H", "Authorization:token"]),
+    # exact #11721 form verified by Researcher on b65272e
+    ('-H=Authorization: token SECRET', ["-H=Authorization: token SECRET"]),
 ]
 
 
@@ -256,6 +260,65 @@ def test_setup_netrc_tempfile_is_private_before_token_write(
     # The file must remain 0600 after writing as well.
     mode_after = tmp_path.stat().st_mode & 0o777
     assert mode_after == 0o600, f"tempfile widened during write: {oct(mode_after)}"
+
+
+def test_setup_netrc_main_orders_create_before_write(
+    setup_script: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    """Regression: main() must call _create_private_tempfile (mode 0600, empty)
+    BEFORE _write_netrc puts token bytes into the file.
+
+    We source the script, override _write_netrc to assert the incoming path is
+    already mode 0600 and empty, then run main(). A create-then-write swap
+    (e.g., write-then-chmod, or reusing a pre-existing file with content)
+    will fail this assertion because the file would not be empty at write time.
+    """
+    env = {
+        **os.environ,
+        "HOME": str(tmp_home),
+        "GIT_HTTP_USERNAME": "agent-dev-a",
+        "GIT_HTTP_PASSWORD": "s3cr3t-t0k3n",
+        "GITEA_HOST": "git.moleculesai.app",
+    }
+    override = f'''
+source "{setup_script}"
+_write_netrc() {{
+  local path="$1" host="$2" user="$3" pass="$4"
+  local mode
+  mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path")
+  if [ "$mode" != "600" ]; then
+    echo "FAIL: tempfile mode is $mode, expected 600" >&2
+    exit 1
+  fi
+  if [ -s "$path" ]; then
+    echo "FAIL: tempfile is not empty at write time" >&2
+    exit 1
+  fi
+  # Write so main() can complete the atomic move.
+  cat > "$path" <<EOF
+machine $host
+login $user
+password $pass
+EOF
+}}
+main
+'''
+    result = subprocess.run(
+        ["bash", "-c", override],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, f"main() failed or ordering regression: {result.stderr}"
+
+    netrc = tmp_home / ".netrc"
+    assert netrc.exists()
+    mode = netrc.stat().st_mode & 0o777
+    assert mode == 0o600, f"final .netrc mode should be 0600, got {oct(mode)}"
+    content = netrc.read_text()
+    assert "password s3cr3t-t0k3n" in content
 
 
 def test_setup_netrc_skips_when_credentials_absent(
