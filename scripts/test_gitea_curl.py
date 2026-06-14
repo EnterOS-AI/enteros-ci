@@ -84,6 +84,10 @@ REJECT_CASES = [
     # Proxy-Authorization header forms
     ('-H "Proxy-Authorization: Basic b64"', ["-H", "Proxy-Authorization: Basic b64"]),
     ("--header=Proxy-Authorization: Basic b64", ["--header=Proxy-Authorization: Basic b64"]),
+    # equals-attached value bypass (RC #11714)
+    ('--header=Authorization=Bearer tok', ["--header=Authorization=Bearer tok"]),
+    ('-H "Authorization=token tok"', ["-H", "Authorization=token tok"]),
+    ('--header=Proxy-Authorization=Basic b64', ["--header=Proxy-Authorization=Basic b64"]),
 ]
 
 

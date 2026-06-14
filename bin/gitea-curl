@@ -25,16 +25,25 @@ fail() {
 }
 
 # is_auth_value <value>: returns 0 if the value starts with an
-# Authorization/Proxy-Authorization header (case-insensitive, any scheme).
+# Authorization/Proxy-Authorization header (case-insensitive, any scheme/separator).
+#
+# Catches both standard ':' separators and the '='-attached bypass form:
+#   Authorization: Bearer ...
+#   Authorization=Bearer ...
+#   Proxy-Authorization: Basic ...
+#   Proxy-Authorization=Basic ...
 is_auth_value() {
   local v="${1,,}"
   # Strip an optional leading quote so -H"Authorization:... and
   # --header="Authorization:... are handled uniformly.
   v="${v#\"}"
   v="${v#\'}"
-  case "$v" in
-    authorization:*|proxy-authorization:*) return 0 ;;
-  esac
+  # Match Authorization or Proxy-Authorization as a header name, followed by
+  # ':' or '=' or end-of-string. This rejects any inline auth header, not only
+  # the RFC-compliant ':' form.
+  if [[ "$v" =~ ^(authorization|proxy-authorization)([:=]|$) ]]; then
+    return 0
+  fi
   return 1
 }
 
