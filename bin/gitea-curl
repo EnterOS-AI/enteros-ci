@@ -18,23 +18,90 @@ set -euo pipefail
 HOST="${GITEA_HOST:-git.moleculesai.app}"
 NETRC="${HOME}/.netrc"
 
-# Refuse any attempt to put credentials on the command line.
-for arg in "$@"; do
-  case "$arg" in
-    -u|--user|-u*|--user=*)
-      echo "gitea-curl: refusing -u/--user; credentials must come from ~/.netrc, not argv" >&2
-      exit 1
+# fail <msg>: print message and exit 1 (fail-closed).
+fail() {
+  echo "gitea-curl: $*" >&2
+  exit 1
+}
+
+# is_auth_value <value>: returns 0 if the value starts with an
+# Authorization/Proxy-Authorization header (case-insensitive, any scheme).
+is_auth_value() {
+  local v="${1,,}"
+  # Strip an optional leading quote so -H"Authorization:... and
+  # --header="Authorization:... are handled uniformly.
+  v="${v#\"}"
+  v="${v#\'}"
+  case "$v" in
+    authorization:*|proxy-authorization:*) return 0 ;;
+  esac
+  return 1
+}
+
+# is_user_flag <arg>: returns 0 if arg is -u/--user or -U/--proxy-user in any
+# of the common spellings (combined, equals, or bare flag).
+is_user_flag() {
+  local a="$1"
+  case "$a" in
+    -u|-u*|--user|--user=*) return 0 ;;
+    -U|-U*|--proxy-user|--proxy-user=*) return 0 ;;
+  esac
+  return 1
+}
+
+# is_header_flag <arg>: returns 0 if arg is a bare -H or --header flag (split
+# form; combined/equals forms are handled separately).
+is_header_flag() {
+  case "$1" in
+    -H|--header) return 0 ;;
+  esac
+  return 1
+}
+
+# Scan every argument (and the value following a split -H/--header) for any
+# inline credential. Fail closed on any match.
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  arg="${args[$i]}"
+
+  # Reject -u / --user / -U / --proxy-user in any spelling.
+  if is_user_flag "$arg"; then
+    fail "refusing -u/--user/-U/--proxy-user; credentials must come from ~/.netrc, not argv"
+  fi
+
+  # Reject combined/equals header forms where the value is an auth header.
+  # These include: -HVALUE, -H"VALUE, --header=VALUE, --header="VALUE, etc.
+  lower="${arg,,}"
+  stripped=""
+  case "$lower" in
+    -h*)
+      stripped="${lower#-h}"
       ;;
-    -H*Authorization:*|-H*authorization:*)
-      echo "gitea-curl: refusing inline Authorization header; use ~/.netrc or redirect header from a file" >&2
-      exit 1
+    --header=*)
+      stripped="${lower#--header=}"
       ;;
   esac
+  if [ -n "$stripped" ] && is_auth_value "$stripped"; then
+    fail "refusing inline Authorization/Proxy-Authorization header; use ~/.netrc or redirect header from a file"
+  fi
+
+  # Reject split header forms: -H VALUE or --header VALUE where VALUE is next arg.
+  if is_header_flag "$arg"; then
+    next=$((i + 1))
+    if [ "$next" -lt "${#args[@]}" ]; then
+      next_arg="${args[$next]}"
+      if is_auth_value "$next_arg"; then
+        fail "refusing inline Authorization/Proxy-Authorization header; use ~/.netrc or redirect header from a file"
+      fi
+    fi
+  fi
+
+  i=$((i + 1))
 done
 
 if [ ! -f "$NETRC" ]; then
-  echo "gitea-curl: $NETRC not found; run setup-gitea-netrc.sh first" >&2
-  exit 1
+  fail "$NETRC not found; run setup-gitea-netrc.sh first"
 fi
 
 # --netrc makes curl read ~/.netrc for the matching host.

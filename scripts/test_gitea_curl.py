@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Tests for gitea-curl credential guards (runtime#? security fix).
+
+The wrapper must keep tokens out of argv by reading ~/.netrc and refusing any
+form of inline credential passed on the command line.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import pathlib
+import subprocess
+import tempfile
+from typing import Callable
+
+import pytest
+
+
+def _netrc(tmp_path: pathlib.Path, user: str = "agent", password: str = "secret") -> pathlib.Path:
+    """Create a temp ~/.netrc file with mode 600."""
+    netrc = tmp_path / ".netrc"
+    netrc.write_text(
+        f"machine git.moleculesai.app\nlogin {user}\npassword {password}\n"
+    )
+    netrc.chmod(0o600)
+    return netrc
+
+
+def _run(tmp_path: pathlib.Path, script: pathlib.Path, *argv: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run gitea-curl with a temporary netrc and return the result."""
+    test_env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "GITEA_HOST": "git.moleculesai.app",
+    }
+    if env:
+        test_env.update(env)
+    # Create netrc so the wrapper gets past the "netrc exists" check.
+    _netrc(tmp_path)
+    return subprocess.run(
+        [str(script), *argv],
+        capture_output=True,
+        text=True,
+        env=test_env,
+        check=False,
+    )
+
+
+@pytest.fixture
+def gitea_curl() -> pathlib.Path:
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    return repo_root / "bin" / "gitea-curl"
+
+
+@pytest.fixture
+def tmp_home(tmp_path: pathlib.Path) -> pathlib.Path:
+    return tmp_path
+
+
+# ---- Rejection tests: every common inline-credential form must fail ----
+
+REJECT_CASES = [
+    # user/pass forms
+    ("-u user:pass", ["-u", "user:pass"]),
+    ("-uuser:pass", ["-uuser:pass"]),
+    ("--user user:pass", ["--user", "user:pass"]),
+    ("--user=user:pass", ["--user=user:pass"]),
+    # proxy-user forms
+    ("-U proxyuser:proxypass", ["-U", "proxyuser:proxypass"]),
+    ("-Uproxyuser:proxypass", ["-Uproxyuser:proxypass"]),
+    ("--proxy-user proxyuser:proxypass", ["--proxy-user", "proxyuser:proxypass"]),
+    ("--proxy-user=proxyuser:proxypass", ["--proxy-user=proxyuser:proxypass"]),
+    # Authorization header forms
+    ('-H "Authorization: Bearer tok"', ["-H", "Authorization: Bearer tok"]),
+    ('-H"Authorization: Bearer tok"', ['-H"Authorization: Bearer tok"']),
+    ("-HAuthorization: Bearer tok", ["-HAuthorization: Bearer tok"]),
+    ('--header "Authorization: Bearer tok"', ["--header", "Authorization: Bearer tok"]),
+    ("--header=Authorization: Bearer tok", ["--header=Authorization: Bearer tok"]),
+    ('-H "Authorization: token tok"', ["-H", "Authorization: token tok"]),
+    ('-H "Authorization: Basic b64"', ["-H", "Authorization: Basic b64"]),
+    # case-insensitive Authorization
+    ('-H "authorization: bearer tok"', ["-H", "authorization: bearer tok"]),
+    # Proxy-Authorization header forms
+    ('-H "Proxy-Authorization: Basic b64"', ["-H", "Proxy-Authorization: Basic b64"]),
+    ("--header=Proxy-Authorization: Basic b64", ["--header=Proxy-Authorization: Basic b64"]),
+]
+
+
+@pytest.mark.parametrize("name,argv", REJECT_CASES)
+def test_gitea_curl_rejects_inline_credentials(
+    name: str,
+    argv: list[str],
+    gitea_curl: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    result = _run(tmp_home, gitea_curl, *argv)
+    assert result.returncode != 0, f"expected rejection for {name}"
+    stderr = result.stderr.lower()
+    assert "refusing" in stderr, f"expected 'refusing' message for {name}, got: {result.stderr}"
+
+
+# ---- Acceptance tests: safe calls must reach curl (and fail only on curl's side) ----
+
+
+def test_gitea_curl_runs_with_netrc_no_credentials_in_argv(
+    gitea_curl: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    # Point curl at a bogus URL so it fails quickly; the wrapper itself should
+    # not reject the call. This proves --netrc is passed and no guard false-positive
+    # fires on ordinary flags.
+    result = _run(tmp_home, gitea_curl, "-sS", "--max-time", "2", "https://git.moleculesai.app/api/v1/user")
+    # We expect a curl-level failure (network/auth), not a guard failure.
+    assert "refusing" not in result.stderr.lower()
+
+
+def test_gitea_curl_requires_netrc(
+    gitea_curl: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    # Call gitea-curl directly with HOME pointing at an empty directory so
+    # ~/.netrc does not exist.
+    result = subprocess.run(
+        [str(gitea_curl), "https://git.moleculesai.app/api/v1/user"],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "HOME": str(tmp_home),
+            "GITEA_HOST": "git.moleculesai.app",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "run setup-gitea-netrc.sh" in result.stderr
+
+
+def test_gitea_curl_allows_safe_headers(
+    gitea_curl: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    # Non-auth headers should pass the guard and fail at curl/network layer.
+    result = _run(
+        tmp_home,
+        gitea_curl,
+        "-H", "Accept: application/json",
+        "-H", "Content-Type: application/json",
+        "--max-time", "2",
+        "https://git.moleculesai.app/api/v1/user",
+    )
+    assert "refusing" not in result.stderr.lower()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
