@@ -88,6 +88,11 @@ REJECT_CASES = [
     ('--header=Authorization=Bearer tok', ["--header=Authorization=Bearer tok"]),
     ('-H "Authorization=token tok"', ["-H", "Authorization=token tok"]),
     ('--header=Proxy-Authorization=Basic b64', ["--header=Proxy-Authorization=Basic b64"]),
+    # structural-scan catch-all: unusual spacing/separators that prior form-by-form
+    # parsing missed (RC #11721 class — whitespace around the separator).
+    ('-H "Authorization : Bearer tok"', ["-H", "Authorization : Bearer tok"]),
+    ('--header=Authorization : Bearer tok', ["--header=Authorization : Bearer tok"]),
+    ('-H "Authorization:token"', ["-H", "Authorization:token"]),
 ]
 
 
