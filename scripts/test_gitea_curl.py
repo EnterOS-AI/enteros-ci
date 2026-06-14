@@ -97,6 +97,9 @@ REJECT_CASES = [
     ('-H "Authorization:token"', ["-H", "Authorization:token"]),
     # exact #11721 form verified by Researcher on b65272e
     ('-H=Authorization: token SECRET', ["-H=Authorization: token SECRET"]),
+    # additional short-flag equals-attached forms found in RC #11721
+    ('-H=Authorization: token', ["-H=Authorization: token"]),
+    ('-H=Authorization=Bearer xyz', ["-H=Authorization=Bearer xyz"]),
 ]
 
 
