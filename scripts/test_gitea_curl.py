@@ -197,6 +197,62 @@ def test_setup_netrc_creates_file_mode_600(
     assert "password s3cr3t-t0k3n" in content
 
 
+def test_setup_netrc_tempfile_is_private_before_token_write(
+    setup_script: pathlib.Path,
+    tmp_home: pathlib.Path,
+) -> None:
+    """Regression: the tempfile must be mode 0600 BEFORE token bytes land.
+
+    This test sources the script's helper functions, creates a tempfile, and
+    asserts it is 0600 and empty at that instant. It then writes credentials
+    and verifies the content. If the implementation were ever reordered to
+    write before chmod, this test would catch the regression because the file
+    would either not be 0600 when empty or the token would already be present.
+    """
+    # Source the script to make helper functions available without running main().
+    env = {
+        **os.environ,
+        "HOME": str(tmp_home),
+    }
+    source_cmd = f'source "{setup_script}"; _create_private_tempfile "{tmp_home}"'
+    result = subprocess.run(
+        ["bash", "-c", source_cmd],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, f"failed to create private tempfile: {result.stderr}"
+    tmp_path = pathlib.Path(result.stdout.strip())
+    assert tmp_path.exists(), f"tempfile {tmp_path} not created"
+
+    # At this point NO token bytes have been written yet; the file must already
+    # be exactly 0600.
+    mode = tmp_path.stat().st_mode & 0o777
+    assert mode == 0o600, f"tempfile not 0600 before write: {oct(mode)}"
+    assert tmp_path.read_text() == "", "tempfile should be empty before write"
+
+    # Now write credentials (same ordering the production main() uses).
+    source_cmd2 = f'source "{setup_script}"; _write_netrc "{tmp_path}" git.moleculesai.app agent-dev-a s3cr3t-t0k3n'
+    result2 = subprocess.run(
+        ["bash", "-c", source_cmd2],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result2.returncode == 0, f"failed to write netrc: {result2.stderr}"
+
+    content = tmp_path.read_text()
+    assert "machine git.moleculesai.app" in content
+    assert "login agent-dev-a" in content
+    assert "password s3cr3t-t0k3n" in content
+
+    # The file must remain 0600 after writing as well.
+    mode_after = tmp_path.stat().st_mode & 0o777
+    assert mode_after == 0o600, f"tempfile widened during write: {oct(mode_after)}"
+
+
 def test_setup_netrc_skips_when_credentials_absent(
     setup_script: pathlib.Path,
     tmp_home: pathlib.Path,

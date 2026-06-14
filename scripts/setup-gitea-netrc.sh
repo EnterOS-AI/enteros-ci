@@ -19,40 +19,66 @@
 
 set -euo pipefail
 
-NETRC="${HOME}/.netrc"
-HOST="${GITEA_HOST:-git.moleculesai.app}"
-USER="${GIT_HTTP_USERNAME:-}"
-PASS="${GIT_HTTP_PASSWORD:-}"
+# _create_private_tempfile <dir>: create a tempfile with mode 0600 and echo
+# its path. Exposed as a function so tests can verify the create-before-write
+# ordering independently.
+_create_private_tempfile() {
+  local dir="${1:-${TMPDIR:-/tmp}}"
+  local tmp
+  tmp=$(mktemp "$dir/.netrc.tmp.XXXXXX")
+  # Guarantee 0600 before any caller writes sensitive bytes. mktemp may create
+  # the file with 0600 on most systems, but we set it explicitly so the script
+  # is umask-independent and auditable.
+  chmod 600 "$tmp"
+  printf '%s' "$tmp"
+}
 
-if [ -z "$USER" ] || [ -z "$PASS" ]; then
-  echo "::warning::GIT_HTTP_USERNAME or GIT_HTTP_PASSWORD not set; skipping ~/.netrc setup. Gitea curl calls will need an alternative safe-auth method." >&2
-  exit 0
-fi
-
-# Create a private tempfile in the same directory as the destination so the
-# final rename is atomic and cannot cross filesystems.
-netrc_dir=$(dirname "$NETRC")
-mkdir -p "$netrc_dir"
-tmp=$(mktemp "$netrc_dir/.netrc.tmp.XXXXXX")
-
-# Guarantee 0600 before writing any credential bytes. mktemp may create the
-# file with 0600 on most systems, but we set it explicitly so the script is
-# umask-independent and auditable.
-chmod 600 "$tmp"
-
-# Write credentials only after the file is confirmed private.
-cat > "$tmp" <<EOF
-machine $HOST
-login $USER
-password $PASS
+# _write_netrc <path> <host> <user> <pass>: write a netrc entry to the
+# already-private file. Should only be called after the file is confirmed 0600.
+_write_netrc() {
+  local path="$1" host="$2" user="$3" pass="$4"
+  cat > "$path" <<EOF
+machine $host
+login $user
+password $pass
 EOF
+}
 
-# Atomic replace: readers either see the old file (or none) or the new file;
-# they never see a partially-written or under-permissioned file.
-mv -f "$tmp" "$NETRC"
+# main: orchestrate writing ~/.netrc from env credentials.
+main() {
+  local netrc="${HOME}/.netrc"
+  local host="${GITEA_HOST:-git.moleculesai.app}"
+  local user="${GIT_HTTP_USERNAME:-}"
+  local pass="${GIT_HTTP_PASSWORD:-}"
 
-# Defensive: ensure the final file is 0600 even if mktemp/umask/mv somehow
-# widened permissions (e.g., ACLs).
-chmod 600 "$NETRC"
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    echo "::warning::GIT_HTTP_USERNAME or GIT_HTTP_PASSWORD not set; skipping ~/.netrc setup. Gitea curl calls will need an alternative safe-auth method." >&2
+    return 0
+  fi
 
-echo "wrote $NETRC (mode 600) for $HOST"
+  # Create a private tempfile in the same directory as the destination so the
+  # final rename is atomic and cannot cross filesystems.
+  local netrc_dir
+  netrc_dir=$(dirname "$netrc")
+  mkdir -p "$netrc_dir"
+  local tmp
+  tmp=$(_create_private_tempfile "$netrc_dir")
+
+  # Write credentials only after the file is confirmed private.
+  _write_netrc "$tmp" "$host" "$user" "$pass"
+
+  # Atomic replace: readers either see the old file (or none) or the new file;
+  # they never see a partially-written or under-permissioned file.
+  mv -f "$tmp" "$netrc"
+
+  # Defensive: ensure the final file is 0600 even if mktemp/umask/mv somehow
+  # widened permissions (e.g., ACLs).
+  chmod 600 "$netrc"
+
+  echo "wrote $netrc (mode 600) for $host"
+}
+
+# Run main only when executed, not when sourced by tests.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
