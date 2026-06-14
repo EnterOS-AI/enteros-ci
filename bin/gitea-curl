@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# gitea-curl — safe curl wrapper for git.moleculesai.app.
+#
+# Refuses to pass credentials on the command line. Instead it forces curl to
+# read credentials from ~/.netrc, keeping tokens out of argv / activity logs.
+#
+# Usage: gitea-curl [curl-args...]
+#
+# Examples:
+#   gitea-curl https://git.moleculesai.app/api/v1/user
+#   gitea-curl -sS -X GET "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/pulls"
+#
+# If GIT_HTTP_USERNAME/GIT_HTTP_PASSWORD are not in ~/.netrc yet, run
+# scripts/setup-gitea-netrc.sh first (ideally from agent harness startup).
+
+set -euo pipefail
+
+HOST="${GITEA_HOST:-git.moleculesai.app}"
+NETRC="${HOME}/.netrc"
+
+# Refuse any attempt to put credentials on the command line.
+for arg in "$@"; do
+  case "$arg" in
+    -u|--user|-u*|--user=*)
+      echo "gitea-curl: refusing -u/--user; credentials must come from ~/.netrc, not argv" >&2
+      exit 1
+      ;;
+    -H*Authorization:*|-H*authorization:*)
+      echo "gitea-curl: refusing inline Authorization header; use ~/.netrc or redirect header from a file" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [ ! -f "$NETRC" ]; then
+  echo "gitea-curl: $NETRC not found; run setup-gitea-netrc.sh first" >&2
+  exit 1
+fi
+
+# --netrc makes curl read ~/.netrc for the matching host.
+# We do NOT add -u or -H Authorization here.
+exec curl --netrc "$@"
