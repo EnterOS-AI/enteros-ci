@@ -59,6 +59,25 @@ jobs:
 
 The reusable workflow checks out `molecule-ci` itself (into `.molecule-ci-canonical`) and runs the canonical `validate-workspace-template.py` from there — so no per-repo vendoring of the script is needed. The legacy `.molecule-ci/scripts/` directory in each template repo is being phased out.
 
+### T4 live-gate aggregation (templates that inline T4)
+
+Templates that run a live `t4-conformance` job must aggregate its result in a `validate` job that emits the branch-protection context. The aggregator must treat `t4-conformance` as a **hard gate**: it should require `success` on internal PRs and `push` to `main`. `skipped` is only acceptable on **fork PRs** (where the security-sensitive live gate is intentionally short-circuited). Do not accept `skipped` unconditionally; otherwise an internal PR can go green without proving host-root reach or token ownership.
+
+Recommended pattern (bash):
+
+```bash
+t4="${{ needs.t4-conformance.result }}"
+is_fork_pr="${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}"
+if [ "$t4" != "success" ]; then
+  if [ "$t4" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then
+    echo "::notice::t4-conformance skipped on fork PR — allowing aggregate to pass."
+  else
+    echo "::error::t4-conformance did not succeed: $t4"
+    exit 1
+  fi
+fi
+```
+
 ## Adding a new runtime
 
 1. Add the runtime name to `KNOWN_RUNTIMES` in `scripts/validate-workspace-template.py`.
