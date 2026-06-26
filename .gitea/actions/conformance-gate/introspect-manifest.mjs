@@ -213,7 +213,7 @@ console.log(`Accepted capabilities (required ∪ transitional): ${accepted.join(
 console.log(`Required (canonical): ${requiredTools.join(", ")}`);
 console.log(`Transitional aliases: ${aliases.join(", ") || "(none)"}`);
 
-if (expectedServerName && builtName && builtName !== expectedServerName) {
+if (expectedServerName && !(typeof builtName === "string" && builtName === expectedServerName)) {
   fail(
     `Published ${serverMode} server registers under name "${builtName}" but the expected ` +
       `server name is "${expectedServerName}" — a consumer deriving ids from the server name ` +
