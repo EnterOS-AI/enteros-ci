@@ -1,0 +1,144 @@
+name: 'Conformance gate'
+description: >-
+  Fail-closed boundary gate. Fetch a PRODUCER's PUBLISHED manifest for a pinned
+  version/dist-tag and assert it SATISFIES a consumer contract's required
+  capabilities, evaluated mode- and version-specifically. One shared, adoptable
+  unit that generalizes the per-repo bespoke scripts
+  (mcp-server provenance-gate.sh + core check-published-mcp-manifest.mjs) into a
+  single composite action. P1 of RFC #3285.
+#
+# TWO MODES (set via `mode`):
+#   registry-provenance   — assert every PUBLISHED npm version on the registry
+#                           packument has a matching v<version> git tag
+#                           (catches out-of-band publishes). Generalizes
+#                           molecule-mcp-server/.gitea/scripts/provenance-gate.sh.
+#   package-introspection — install the PUBLISHED package, introspect the ACTUAL
+#                           tool manifest the build registers under a given
+#                           server-mode, and assert it is a superset of the
+#                           contract's accepted capabilities (required ∪
+#                           transitional). Generalizes
+#                           molecule-core/scripts/mcp-verb-manifest-check/check-published-mcp-manifest.mjs.
+#
+# WHY A COMPOSITE ACTION AND NOT A REUSABLE WORKFLOW:
+# Gitea 1.22.6 (the prod operator host) does NOT support cross-repo
+# `uses: org/repo/.gitea/workflows/X.yml@ref`. Cross-repo reusable workflows
+# landed in Gitea 1.26.0 (Oct 2025). Composite actions resolve via the
+# actions-fetch path which works cross-repo on 1.22 against a public callee —
+# that's us. Mirrors .gitea/actions/audit-force-merge/action.yml. Re-evaluate
+# when the operator host upgrades to Gitea >= 1.26 (internal task #109); at that
+# point the adopter's clone-then-`uses:`-local shim can collapse to a direct
+# `uses:` call WITHOUT changing the emitted context name.
+#
+# FAIL-CLOSED CONTRACT (both modes): an infra error, an unreachable/unparseable
+# producer manifest, an empty required-capability set, or an incomplete result
+# NEVER yields a green. The ONLY non-fatal band is package-introspection's
+# transitional-alias WARN (see introspect-manifest.mjs).
+
+inputs:
+  mode:
+    description: 'registry-provenance | package-introspection'
+    required: true
+  package:
+    description: 'Package name, e.g. @molecule-ai/mcp-server'
+    required: true
+  registry:
+    description: 'npm registry base URL (Gitea npm registry root for the org).'
+    required: false
+    default: 'https://git.moleculesai.app/api/packages/molecule-ai/npm'
+  version:
+    description: >-
+      Pinned version or dist-tag to evaluate (package-introspection mode).
+      Evaluation is version-specific: the manifest of THIS resolved version is
+      what gets asserted. Default `latest`.
+    required: false
+    default: 'latest'
+
+  # ---- registry-provenance mode ----
+  allowlist:
+    description: >-
+      Space-separated pre-gate published versions to tolerate (FROZEN — the
+      clean alternative is to retro-tag and empty this). registry-provenance only.
+    required: false
+    default: ''
+
+  # ---- package-introspection mode ----
+  contract-path:
+    description: >-
+      Path (in the CALLER checkout) to the consumer contract JSON. The accepted
+      capability set is required_tools ∪ transitional_tool_aliases (legacy
+      singular required_tool tolerated). package-introspection only.
+    required: false
+    default: ''
+  required-caps:
+    description: >-
+      Newline/comma-separated required capabilities — an alternative to
+      contract-path for consumers without a contract file. Empty when
+      contract-path is set. package-introspection only.
+    required: false
+    default: ''
+  transitional-aliases:
+    description: >-
+      Newline/comma-separated capabilities accepted-but-WARNed (migration
+      window). Only consulted with `required-caps`; with `contract-path` the
+      aliases come from the contract. package-introspection only.
+    required: false
+    default: ''
+  server-mode:
+    description: >-
+      Producer mode env to introspect under (sets MOLECULE_MCP_MODE in the
+      child harness). package-introspection only.
+    required: false
+    default: 'management'
+  expected-server-name:
+    description: >-
+      If set, assert the introspected server name == this (fail-closed on
+      mismatch). With contract-path, defaults to contract.mcp_server_name.
+      package-introspection only.
+    required: false
+    default: ''
+
+  # ---- shared ----
+  registry-token:
+    description: >-
+      OPTIONAL read:package token. Sent as a bearer for the packument fetch
+      (registry-provenance) and written to a scoped .npmrc for the install
+      (package-introspection). The packument/registry endpoints are currently
+      public, so the token is OPTIONAL unless require-token is true.
+    required: false
+    default: ''
+  require-token:
+    description: >-
+      true => fail-closed when registry-token is empty on a TRUSTED context.
+      On an UNTRUSTED context (set is-trusted=false) a missing token soft-skips
+      (forks cannot hold secrets; the trusted post-merge/scheduled run gates
+      before any consumer provisions).
+    required: false
+    default: 'false'
+  is-trusted:
+    description: >-
+      Trust classification computed by the CALLER workflow. true for
+      push|schedule|workflow_dispatch and same-repo PRs; false for fork PRs.
+      Only consulted when require-token is true.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Run conformance gate
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        PACKAGE: ${{ inputs.package }}
+        REGISTRY: ${{ inputs.registry }}
+        VERSION: ${{ inputs.version }}
+        ALLOWLIST: ${{ inputs.allowlist }}
+        CONTRACT_PATH: ${{ inputs.contract-path }}
+        REQUIRED_CAPS: ${{ inputs.required-caps }}
+        TRANSITIONAL_ALIASES: ${{ inputs.transitional-aliases }}
+        SERVER_MODE: ${{ inputs.server-mode }}
+        EXPECTED_SERVER_NAME: ${{ inputs.expected-server-name }}
+        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+        REQUIRE_TOKEN: ${{ inputs.require-token }}
+        IS_TRUSTED: ${{ inputs.is-trusted }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh"
