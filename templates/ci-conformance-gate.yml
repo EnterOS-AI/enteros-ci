@@ -1,0 +1,92 @@
+# CANONICAL consumer caller for the reusable conformance gate —
+# molecule-ai/molecule-ci SSOT. Copy this into a CONSUMER repo as
+# .gitea/workflows/conformance-gate.yml and fill in the inputs.
+#
+# WHAT IT IS: P1 of RFC #3285 — one shared boundary-gate any consumer adopts,
+# replacing the per-repo bespoke scripts (mcp-server provenance-gate.sh +
+# core check-published-mcp-manifest.mjs). The gate is FAIL-CLOSED and evaluated
+# mode/version-specifically.
+#
+# WHY INLINE-CLONE (not `uses: molecule-ai/molecule-ci/.gitea/actions/...@v1`):
+# Gitea 1.22.6 (prod operator host) routes cross-repo fetches through
+# [actions].DEFAULT_ACTIONS_URL=github → the suspended molecule-ai org → 404. So
+# we anon-clone the PUBLIC molecule-ci SSOT at CI time and reference the
+# composite action by LOCAL path. Same single-source-of-truth (the action lives
+# in molecule-ci, fetched fresh every run), no cross-repo `uses:` dependency.
+# When the operator host upgrades to Gitea >= 1.26 (internal task #109), this
+# inline-clone step can be dropped in favour of a direct
+# `uses: molecule-ai/molecule-ci/.gitea/actions/conformance-gate@v1` WITHOUT
+# changing the emitted `conformance-gate / conformance` context name.
+#
+# ROLLOUT (soak-then-promote — the fleet pattern): ship this as a STANDALONE
+# workflow, NOT a ci.yml job, NOT in branch protection. Let the emitted context
+# `conformance-gate / conformance (pull_request)` soak GREEN, then promote it
+# into branch-protection status_check_contexts (owner-only BP edit) AFTER any
+# pre-gate cleanup lands. BP-drift trap: a BP-required context with no emitter =
+# perma-pending = permanent merge-block — only promote a name actually emitted.
+
+name: conformance-gate
+
+on:
+  pull_request:
+    # Path-filter to what affects the gate decision. Tune per consumer.
+    paths:
+      - "contracts/**"
+      - ".gitea/workflows/conformance-gate.yml"
+  push:
+    branches: [main, staging]
+  schedule:
+    # The stale-published-build failure mode is TIME-dependent, not
+    # commit-dependent — a daily run catches a producer publishing out of band.
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Pinned version or dist-tag to evaluate"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+
+      # Cross-repo `uses:` is un-resolvable on Gitea 1.22.6 → clone the SSOT,
+      # then reference the action by LOCAL path (./.molecule-ci/...).
+      - name: Fetch molecule-ci SSOT
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
+
+      # ── EXAMPLE A: package-introspection (consumer side — e.g. molecule-core)
+      # Asserts the PUBLISHED build's management manifest ⊇ the contract verbs.
+      - name: Conformance gate (published manifest ⊇ contract)
+        uses: ./.molecule-ci/.gitea/actions/conformance-gate
+        with:
+          mode: package-introspection
+          package: "@molecule-ai/mcp-server"
+          version: ${{ github.event.inputs.version || 'latest' }}
+          contract-path: contracts/mcp-plugin-delivery.contract.json
+          server-mode: management
+          # expected-server-name defaults to contract.mcp_server_name.
+          require-token: "true"
+          # Trusted for push/schedule/dispatch and same-repo PRs; fork PRs (which
+          # can't hold secrets) classify as untrusted and soft-skip.
+          is-trusted: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
+
+      # ── EXAMPLE B: registry-provenance (producer side — e.g. mcp-server)
+      # Asserts every published version has a matching v<version> git tag.
+      # Uncomment in the producer repo (and drop Example A there):
+      #
+      # - name: Conformance gate (publish provenance)
+      #   uses: ./.molecule-ci/.gitea/actions/conformance-gate
+      #   with:
+      #     mode: registry-provenance
+      #     package: "@molecule-ai/mcp-server"
+      #     allowlist: "1.6.0 1.6.1"   # FROZEN pre-gate set
+      #     registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
