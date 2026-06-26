@@ -17,10 +17,12 @@ name: bp-context-drift-gate
 # context, so when this job is later promoted to a required hard gate
 # (after a clean advisory window) it is already correct.
 #
-# To actually verify, the job needs a DRIFT_BOT_TOKEN org secret —
-# read-only repo-admin, used only for the branch_protections GET. Until
-# that secret is set, the script fails-closed (advisory, so it does not
-# block) and surfaces the auth error loudly in the job log.
+# To actually verify, the job needs a DRIFT_BOT_TOKEN — read-only
+# repo-admin, used only for the branch_protections GET. It is sourced
+# from the Infisical SSOT (/shared/drift-bot, prod) via the CI machine
+# identity (INFISICAL_CI_*). If that fetch fails, the fetch step exits
+# nonzero and the script fails-closed (advisory, so it does not block)
+# and surfaces the auth error loudly in the job log.
 #
 # Modeled on molecule-controlplane's cf-tunnel-drift-gate job
 # (cross-repo drift gate) for conventions: pinned action SHAs,
@@ -60,12 +62,58 @@ jobs:
           python-version: "3.11"
       - name: Install PyYAML
         run: pip install PyYAML==6.0.2 -q
+      # KMS migration (RFC: Gitea-Actions-secrets -> Infisical/KMS): source
+      # DRIFT_BOT_TOKEN from the Infisical SSOT via the CI machine identity
+      # instead of the duplicated Gitea Actions secret. This is the last stray
+      # consumer of the Gitea DRIFT_BOT_TOKEN secret; once this lands the Gitea
+      # secret can be retired (validate-before-delete). The value is exported to
+      # $GITHUB_ENV so the asserter step below reads it as an ordinary masked
+      # env var (GITEA_TOKEN, the name the script already consumes).
+      - name: Fetch DRIFT_BOT_TOKEN from Infisical SSOT
+        id: drift_bot_token
+        # TRUSTED-REF GATE: only the Infisical CI-identity login runs on trusted
+        # refs so an untrusted fork PR cannot trigger it and harvest
+        # INFISICAL_CI_*. workflow_dispatch is collaborator-only on Gitea; a
+        # pull_request is allowed only when it is NOT from a fork (same-repo PR
+        # head). This workflow has a pull_request trigger, so the guard matters.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "Infisical universal-auth login returned no accessToken -- failing closed" >&2
+            exit 1
+          fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          DRIFT_BOT_TOKEN=$(read_secret DRIFT_BOT_TOKEN %2Fshared%2Fdrift-bot)
+          echo "::add-mask::$DRIFT_BOT_TOKEN"
+          if [ -z "$DRIFT_BOT_TOKEN" ]; then
+            echo "Infisical returned empty for DRIFT_BOT_TOKEN at /shared/drift-bot (prod) -- failing closed" >&2
+            exit 1
+          fi
+          echo "DRIFT_BOT_TOKEN=$DRIFT_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "DRIFT_BOT_TOKEN loaded from Infisical (len=${#DRIFT_BOT_TOKEN})"
       - name: Assert BP-required contexts are all emitted
         env:
-          # DRIFT_BOT_TOKEN: read-only repo-admin org secret, used only
-          # for the branch_protections GET. Until it is set, the script
-          # fails-closed (advisory job, so it does not block the PR).
-          GITEA_TOKEN: ${{ secrets.DRIFT_BOT_TOKEN }}
+          # DRIFT_BOT_TOKEN: read-only repo-admin token, used only for the
+          # branch_protections GET. Sourced from the Infisical SSOT by the
+          # "Fetch DRIFT_BOT_TOKEN from Infisical SSOT" step above (KMS
+          # migration) and arrives here via $GITHUB_ENV. If the fetch failed
+          # (empty/404/auth) the prior step already exited nonzero, so this
+          # advisory job's script never silently runs unauthenticated.
+          GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
           BRANCH: main
