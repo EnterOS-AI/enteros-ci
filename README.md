@@ -108,6 +108,71 @@ Together they cover the full lifecycle of "auto-merge enabled → new commits ar
 
 **False-positive note:** if a CI bot pushes (dependency update, secret rotation), this also disables auto-merge. That's intentional — the operator who originally enabled auto-merge gets notified and re-engages, which is exactly the verify-after-machine-edits behavior we want.
 
+## Composite actions
+
+### conformance-gate
+
+A reusable, parameterized **conformance gate** (P1 of RFC #3285): one shared
+boundary-gate that any consumer adopts, replacing the per-repo bespoke scripts
+(mcp-server `provenance-gate.sh` + core `check-published-mcp-manifest.mjs`). It
+fetches a PRODUCER's PUBLISHED manifest for a pinned version/dist-tag and
+asserts it **satisfies** a consumer contract's required capabilities, evaluated
+**mode- and version-specifically**, and is **FAIL-CLOSED** on any error/miss.
+
+Lives at `.gitea/actions/conformance-gate/` and is a **composite action** (not a
+`workflow_call` reusable workflow) for the same reason as `audit-force-merge`:
+cross-repo `uses:` does not resolve on Gitea 1.22.6. Adopters inline-clone this
+SSOT and reference the action by local path — see `templates/ci-conformance-gate.yml`.
+
+**Two modes** (`mode:` input):
+
+| mode | generalizes | asserts |
+|---|---|---|
+| `registry-provenance` | mcp-server `provenance-gate.sh` | every PUBLISHED npm version on the registry packument has a matching `v<version>` git tag (catches out-of-band publishes) |
+| `package-introspection` | core `check-published-mcp-manifest.mjs` | the PUBLISHED build's ACTUAL tool manifest (introspected under `server-mode`) ⊇ the contract's accepted capabilities (`required_tools ∪ transitional_tool_aliases`) |
+
+**Fail-closed invariants** (both modes):
+
+| Condition | Result |
+|---|---|
+| producer manifest unreachable / non-200 / empty / unparseable | **FAIL (exit 1)** |
+| manifest parseable but zero capabilities / zero tools introspected | **FAIL (exit 1)** |
+| required-capability set empty (contract declares none / `required-caps` empty) | **FAIL (exit 1)** |
+| introspected server name != `expected-server-name` (when asserted) | **FAIL (exit 1)** |
+| producer satisfies NONE of the accepted capabilities | **FAIL (exit 1)** — the headline staging stale-build degrade catch |
+| producer satisfies ONLY a transitional alias (canonical absent) | **WARN (exit 0, `::warning::`)** — the one narrow band, keeps the migration window mergeable |
+| `require-token: true` + empty token on a **trusted** context | **FAIL (exit 1)** |
+| `require-token: true` + empty token on an **untrusted** fork PR | soft-skip (exit 0; forks can't hold secrets, the trusted run gates before any provision) |
+
+**Key inputs:** `mode` (req), `package` (req), `registry`, `version` (pinned
+version/dist-tag — evaluation is version-specific), `contract-path` *or*
+`required-caps` (+`transitional-aliases`), `server-mode`, `expected-server-name`,
+`registry-token` (OPTIONAL read:package bearer), `require-token`, `is-trusted`.
+
+**Adoption** (clone-then-`uses:`-local; full example in `templates/ci-conformance-gate.yml`):
+
+```yaml
+- run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
+- uses: ./.molecule-ci/.gitea/actions/conformance-gate
+  with:
+    mode: package-introspection
+    package: "@molecule-ai/mcp-server"
+    contract-path: contracts/mcp-plugin-delivery.contract.json
+    server-mode: management
+    require-token: "true"
+    registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
+```
+
+**Rollout** (soak-then-promote): ship the adopter caller as a STANDALONE
+workflow, NOT a `ci.yml` job, NOT in branch protection. Promote a consumer's
+emitted context into BP `status_check_contexts` (owner-only) only AFTER it soaks
+green and any pre-gate cleanup lands — and only a name actually being emitted
+(a BP-required context with no emitter = perma-pending = permanent merge-block).
+
+A self-test (`.gitea/actions/conformance-gate/test-conformance-gate.sh`, wired
+into `.gitea/workflows/conformance-gate-selftest.yml`) exercises both modes'
+fail-closed branches + the WARN band offline.
+
 ## License
 
 Business Source License 1.1 — © Molecule AI.

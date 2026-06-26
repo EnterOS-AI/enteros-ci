@@ -1,0 +1,36 @@
+# Self-test for the reusable conformance-gate composite action.
+# Runs .gitea/actions/conformance-gate/test-conformance-gate.sh, which drives
+# BOTH modes against local fixtures (no network, no real npm install) and
+# asserts every fail-closed branch + the transitional-alias WARN band.
+#
+# Additive standalone workflow — does NOT modify the repo's existing ci.yml.
+# Path-filtered to the action dir so unrelated PRs don't spend a runner on it.
+
+name: conformance-gate-selftest
+
+on:
+  pull_request:
+    paths:
+      - ".gitea/actions/conformance-gate/**"
+      - ".gitea/workflows/conformance-gate-selftest.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".gitea/actions/conformance-gate/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      - uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b  # v4
+        with:
+          node-version: "20"
+      - name: Run conformance-gate self-test
+        run: bash .gitea/actions/conformance-gate/test-conformance-gate.sh
