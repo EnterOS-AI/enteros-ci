@@ -1,0 +1,19 @@
+# Official template that INHERITS the SSOT default — no provider/model/proxy
+# pin. The controlplane resolves the LLM mode (platform vs byok) + injects the
+# proxy auth + default model at provision. This config passes `--official`.
+name: test-official-inherit
+runtime: claude-code
+template_schema_version: 1
+description: Official template fixture that inherits the SSOT default.
+tier: 2
+
+# A user-selectable model CATALOG is allowed (it is NOT a default pin) — entries
+# carry no `provider:` here so the drift gates don't reach for the manifest in
+# the hermetic CLI test. The SSOT-inheritance gate ignores the catalog entirely.
+runtime_config:
+  models:
+    - id: moonshot/kimi-k2.6
+      name: Kimi K2.6
+      required_env: []
+  required_env: []
+  timeout: 0

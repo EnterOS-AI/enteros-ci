@@ -1,0 +1,33 @@
+# Official template that WRONGLY re-pins the default provider/model AND the
+# Molecule platform LLM proxy base_url. The `--official` SSOT-inheritance gate
+# (check_no_hardcoded_provider_model) must RED this on every PR — it is exactly
+# the silent prod-routing drift the controlplane LLM-mode SSOT eliminated.
+name: test-official-repinned
+runtime: claude-code
+template_schema_version: 1
+description: Official template fixture that re-pins provider/model + proxy (must red).
+tier: 2
+
+# (1) top-level model pin
+model: moonshot/kimi-k2.6
+
+# (4) platform LLM proxy base_url pin — the CP injects this from the SSOT.
+providers:
+  - name: platform
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [moonshot/, anthropic/]
+    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic
+    auth_env: [MOLECULE_LLM_USAGE_TOKEN]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+
+runtime_config:
+  # (2) default-model pin
+  model: moonshot/kimi-k2.6
+  # (3) default-provider pin
+  provider: platform
+  models:
+    - id: moonshot/kimi-k2.6
+      name: Kimi K2.6
+      required_env: []
+  required_env: []
+  timeout: 0

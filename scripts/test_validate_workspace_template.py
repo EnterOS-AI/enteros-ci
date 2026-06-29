@@ -974,3 +974,267 @@ def test_full_providers_blank_provider_ignored(validator, tmp_path, monkeypatch)
     _setup_drift(tmp_path, monkeypatch, cfg, _full_manifest_fixture())
     validator.check_full_providers_block()
     assert validator.ERRORS == [], validator.ERRORS
+
+
+# ──────────── SSOT-inheritance enforcement gate (--official) ────────────
+#
+# check_no_hardcoded_provider_model(official, allow_self_model) is the
+# principal's "the OFFICIAL repo must ENFORCE the SSOT, not just convention"
+# gate. Under --official it ERRORs when a template config.yaml hardcodes the
+# DEFAULT provider/model or pins the Molecule platform LLM proxy base_url —
+# all of which the controlplane resolves/injects at provision from the
+# env-derived LLM-mode SSOT (llm_mode.go) + providers.yaml registry. It is
+# OFF without --official (community + un-migrated repos unaffected), and
+# --allow-self-model exempts ONLY the top-level `model:` (platform-agent,
+# core#2594).
+
+def _silent_official_config() -> str:
+    """A silent / inheriting official template: no top-level model, no
+    runtime_config.model/provider, no proxy base_url pin. A user-selectable
+    model catalog is allowed (it is not a default pin)."""
+    return (
+        "name: t\n"
+        "runtime: claude-code\n"
+        "template_schema_version: 1\n"
+        "runtime_config:\n"
+        "  models:\n"
+        "    - id: moonshot/kimi-k2.6\n"
+        "      name: Kimi K2.6\n"
+        "      required_env: []\n"
+        "  required_env: []\n"
+        "  timeout: 0\n"
+    )
+
+
+def _repinned_official_config() -> str:
+    """A re-pinned official template: hardcodes top-level model, the default
+    runtime_config.model + provider, and the platform proxy base_url."""
+    return (
+        "name: t\n"
+        "runtime: claude-code\n"
+        "template_schema_version: 1\n"
+        "model: moonshot/kimi-k2.6\n"
+        "providers:\n"
+        "  - name: platform\n"
+        "    auth_mode: third_party_anthropic_compat\n"
+        "    model_prefixes: [moonshot/]\n"
+        "    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic\n"
+        "    auth_env: [MOLECULE_LLM_USAGE_TOKEN]\n"
+        "runtime_config:\n"
+        "  model: moonshot/kimi-k2.6\n"
+        "  provider: platform\n"
+        "  models:\n"
+        "    - id: moonshot/kimi-k2.6\n"
+        "      name: Kimi K2.6\n"
+        "      required_env: []\n"
+        "  required_env: []\n"
+        "  timeout: 0\n"
+    )
+
+
+def test_official_off_by_default_does_not_fire(validator, tmp_path, monkeypatch):
+    """Without --official (official=False) the gate is a no-op even on a fully
+    re-pinned config — community + un-migrated repos stay green."""
+    _materialise(tmp_path, config_yaml=_repinned_official_config())
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=False, allow_self_model=False)
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_official_silent_template_passes(validator, tmp_path, monkeypatch):
+    """A silent / inheriting official template passes under --official."""
+    _materialise(tmp_path, config_yaml=_silent_official_config())
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_official_top_level_model_pin_errors(validator, tmp_path, monkeypatch):
+    cfg = _silent_official_config() + "model: moonshot/kimi-k2.6\n"
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("top-level" in e and "`model:`" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_runtime_config_model_pin_errors(validator, tmp_path, monkeypatch):
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  model: moonshot/kimi-k2.6\n  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("runtime_config.model" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_runtime_config_provider_pin_errors(validator, tmp_path, monkeypatch):
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  provider: platform\n  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("runtime_config.provider" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_platform_proxy_base_url_pin_errors(validator, tmp_path, monkeypatch):
+    """A providers[] entry hardcoding the platform LLM proxy base_url
+    (contains the `internal/llm/` path) must error — that endpoint is injected
+    by the CP (PlatformLLMProxyEnv), not pinned per template."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "providers:\n"
+        "  - name: platform\n"
+        "    auth_mode: third_party_anthropic_compat\n"
+        "    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic\n"
+        "    auth_env: [MOLECULE_LLM_USAGE_TOKEN]\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("proxy base_url" in e and "internal/llm" in e.lower()
+               for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_proxy_pin_under_runtime_config_providers_errors(validator, tmp_path, monkeypatch):
+    """The proxy-pin scan also covers a registry inlined under
+    runtime_config.providers when it carries dict entries with base_url."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n"
+        "  providers:\n"
+        "    - name: platform\n"
+        "      base_url: https://api.moleculesai.app/api/v1/internal/llm/openai/v1\n"
+        "  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("proxy base_url" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_third_party_base_url_not_flagged(validator, tmp_path, monkeypatch):
+    """A non-platform third-party base_url (api.kimi.com, api.minimax.io) is
+    NOT the platform proxy and must not be false-flagged as a proxy pin."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "providers:\n"
+        "  - name: kimi-coding\n"
+        "    base_url: https://api.kimi.com/coding/\n"
+        "  - name: minimax\n"
+        "    base_url: https://api.minimax.io/anthropic\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_official_full_repin_errors_on_all_four(validator, tmp_path, monkeypatch):
+    """The fully re-pinned official config trips all four error classes."""
+    _materialise(tmp_path, config_yaml=_repinned_official_config())
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    joined = " || ".join(validator.ERRORS)
+    assert "top-level" in joined and "`model:`" in joined, validator.ERRORS
+    assert "runtime_config.model" in joined, validator.ERRORS
+    assert "runtime_config.provider" in joined, validator.ERRORS
+    assert "proxy base_url" in joined, validator.ERRORS
+
+
+def test_official_allow_self_model_exempts_top_level_only(validator, tmp_path, monkeypatch):
+    """--allow-self-model (platform-agent, core#2594) exempts ONLY the
+    top-level `model:`. A top-level-model-only config passes; but the other
+    pins are still flagged even with the exemption."""
+    # top-level model only -> exempt -> passes
+    cfg_ok = _silent_official_config() + "model: moonshot/kimi-k2.6\n"
+    _materialise(tmp_path, config_yaml=cfg_ok)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=True)
+    assert validator.ERRORS == [], validator.ERRORS
+
+    # but a runtime_config.model pin still errors even with the exemption
+    validator.ERRORS.clear()
+    cfg_bad = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "model: moonshot/kimi-k2.6\n"
+        "runtime_config:\n  model: moonshot/kimi-k2.6\n  required_env: []\n"
+    )
+    p2 = tmp_path / "bad"
+    p2.mkdir()
+    (p2 / "config.yaml").write_text(cfg_bad)
+    monkeypatch.chdir(p2)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=True)
+    assert any("runtime_config.model" in e for e in validator.ERRORS), validator.ERRORS
+    assert not any("top-level" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_empty_model_value_not_flagged(validator, tmp_path, monkeypatch):
+    """A `model:` key present but blank/None is 'unset', not a pin."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "model:\n"  # None value
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+# ── End-to-end CLI: the real validator process against committed fixtures ──
+#
+# These exercise the actual `python3 validate-workspace-template.py
+# --official --static-only` entrypoint (real argv parse, real exit code)
+# against scripts/fixtures/official-{inherit,repinned}/ — the strongest proof
+# that "the lint reds on a re-pinned official template fixture" and passes on a
+# silent one. --static-only so the run needs neither the runtime wheel nor a
+# Docker daemon.
+
+import subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_FIXTURES = VALIDATOR_PATH.parent / "fixtures"
+
+
+def _run_validator_cli(fixture_dir, *flags):
+    # sys.executable, not a bare "python3": portable across the CI runner
+    # (ubuntu python3) and a Windows dev box (where `python3` is a store stub).
+    import os as _os
+    env = dict(_os.environ)
+    # Hermetic + fast + cross-platform:
+    #  - PYTHONUTF8/PYTHONIOENCODING: the validator prints a "✓" (U+2713);
+    #    a Windows cp1252 stdout would UnicodeEncodeError on it. Force UTF-8.
+    #  - PROVIDERS_MANIFEST_FILE -> a nonexistent path so check_full_providers_block
+    #    short-circuits to a warn-skip instead of attempting a 60s network clone
+    #    of the (private) controlplane repo. This isolates the test to the
+    #    --official SSOT-inheritance gate under exercise.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PROVIDERS_MANIFEST_FILE"] = str(_FIXTURES / "_no_such_manifest.yaml")
+    return subprocess.run(
+        [_sys.executable, str(VALIDATOR_PATH), "--static-only", *flags],
+        cwd=str(_FIXTURES / fixture_dir),
+        capture_output=True, text=True, env=env,
+    )
+
+
+def test_official_lint_cli_reds_on_repinned_fixture():
+    r = _run_validator_cli("official-repinned", "--official")
+    assert r.returncode == 1, f"expected red exit, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "::error::" in r.stdout
+    assert "model" in r.stdout and "proxy base_url" in r.stdout, r.stdout
+
+
+def test_official_lint_cli_passes_on_inherit_fixture():
+    r = _run_validator_cli("official-inherit", "--official")
+    assert r.returncode == 0, f"expected green exit, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "official SSOT-inheritance" in r.stdout, r.stdout
+
+
+def test_official_lint_cli_repinned_passes_without_official_flag():
+    """The same re-pinned fixture is GREEN without --official — the gate is
+    strictly opt-in, so it can never break a community / un-migrated repo."""
+    r = _run_validator_cli("official-repinned")
+    assert r.returncode == 0, f"expected green without --official, got {r.returncode}\n{r.stdout}\n{r.stderr}"

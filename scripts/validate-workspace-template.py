@@ -697,6 +697,153 @@ def check_full_providers_block() -> None:
         print(f"✓ full providers block ⊆ manifest native (provider, model) matrix for `{runtime}` ({len(flat)} model id(s))")
 
 
+# ─────────────────── SSOT-inheritance enforcement (official templates) ───────────
+#
+# The principal's rule: the OFFICIAL repo must ENFORCE the SSOT, not merely
+# rely on convention. An official-plugin workspace template MUST NOT hardcode
+# the DEFAULT provider/model, nor pin the Molecule platform LLM proxy base_url,
+# in its config.yaml. Those are resolved at PROVISION time by the controlplane:
+#
+#   • the LLM routing mode (platform vs byok) is derived from the env-identity
+#     SSOT — molecule-controlplane internal/provisioner/llm_mode.go
+#     (ResolveLLMMode + LLMModeForEnv): production/staging/e2e → platform,
+#     dev → byok;
+#   • the platform proxy endpoint + usage-token auth are INJECTED by the CP
+#     (PlatformLLMProxyEnv → MOLECULE_LLM_*/ANTHROPIC_BASE_URL/…), never pinned
+#     per template;
+#   • the default model comes from the providers.yaml registry SSOT.
+#
+# A template that RE-PINS any of these re-introduces exactly the silent
+# prod-routing drift the CP SSOT eliminated — the "Not logged in" /
+# unservable-option class (a workspace whose pinned model→provider has no
+# usable auth on SaaS). So we gate it here, per-PR.
+#
+# OFF by default: this gate only fires under --official, so community templates
+# (which legitimately bring their own provider/model/base_url) are unaffected,
+# and un-migrated repos that don't pass --official stay green.
+#
+# --allow-self-model exempts ONLY the top-level `model:` key. It exists for the
+# platform-agent (Org Concierge) template whose OWN declared model IS its
+# identity per core#2594 — that top-level `model:` is the load-bearing,
+# provision-validated concierge model, NOT a user-workspace default. Every
+# OTHER pin (runtime_config.model / runtime_config.provider / proxy base_url)
+# is still flagged even under --allow-self-model.
+#
+# What it does NOT flag: a `runtime_config.models` CATALOG (the user-selectable
+# menu + per-entry required_env). That catalog is the legitimate per-template
+# surface and is already kept ⊆ the registry SSOT by check_full_providers_block
+# / check_platform_models. Only a DEFAULT pin (model/provider/proxy) is the
+# SSOT-inheritance violation this gate exists to catch.
+
+# Substring identifying the Molecule platform-managed LLM proxy in a provider
+# base_url. The CP builds these as "<cp>/api/v1/internal/llm/anthropic" and
+# "<cp>/api/v1/internal/llm/openai/v1" (PlatformLLMProxyEnv). A template config
+# carrying this literal has PINNED the proxy instead of letting the CP inject it
+# from the env-derived SSOT. Third-party provider base_urls (api.kimi.com/…,
+# api.minimax.io/…) do NOT contain this path, so they are not false-flagged.
+_PLATFORM_PROXY_PATH_MARK = "internal/llm/"
+
+
+def _is_set(v) -> bool:
+    """A config value counts as a PIN only when it's a non-None, non-blank
+    scalar. `model:` with no value (None) or an empty string is treated as
+    'unset' so a stray-but-empty key isn't flagged as a hardcoded default."""
+    if v is None:
+        return False
+    if isinstance(v, str) and v.strip() == "":
+        return False
+    return True
+
+
+def _iter_provider_base_urls(config: dict):
+    """Yield (where, name, base_url) for every provider entry declaring a
+    base_url, across the top-level `providers:` registry AND a
+    `runtime_config.providers` list when it carries dict entries (some
+    templates inline the registry under runtime_config)."""
+    def _scan(block, where):
+        if not isinstance(block, list):
+            return
+        for entry in block:
+            if isinstance(entry, dict) and _is_set(entry.get("base_url")):
+                yield where, entry.get("name"), str(entry["base_url"])
+    yield from _scan(config.get("providers"), "providers")
+    rc = config.get("runtime_config")
+    if isinstance(rc, dict):
+        yield from _scan(rc.get("providers"), "runtime_config.providers")
+
+
+def check_no_hardcoded_provider_model(official: bool, allow_self_model: bool) -> None:
+    """--official SSOT-inheritance gate — ERROR on a re-pinned official
+    template; pass when the template is silent / inherits. See header above."""
+    if not official:
+        return  # gate is opt-in; community + un-migrated templates unaffected
+    if not os.path.isfile("config.yaml"):
+        return  # check_config_yaml already errored
+    before = len(ERRORS)
+    try:
+        with open("config.yaml") as f:
+            config = yaml.safe_load(f)
+    except Exception:
+        return  # check_config_yaml already errored on the parse
+    if not isinstance(config, dict):
+        return
+
+    # 1. top-level `model:` pin (exempt only with --allow-self-model)
+    if _is_set(config.get("model")):
+        if allow_self_model:
+            print(
+                "::notice::--allow-self-model: top-level `model:` exempt "
+                "(platform-agent self-declared concierge model, core#2594)"
+            )
+        else:
+            err(
+                "config.yaml: official templates must NOT hardcode a top-level "
+                "`model:` — the controlplane resolves the default model from the "
+                "env-derived LLM-mode SSOT + providers.yaml registry at provision. "
+                "Remove it so the workspace inherits the SSOT default. (For the "
+                "platform-agent concierge whose own model is its identity per "
+                "core#2594, run the lint with --allow-self-model.)"
+            )
+
+    rc = config.get("runtime_config")
+    if isinstance(rc, dict):
+        # 2. default-model pin
+        if _is_set(rc.get("model")):
+            err(
+                "config.yaml: official templates must NOT pin `runtime_config.model` "
+                "(the default model). The CP injects MODEL_PROVIDER=platform + the "
+                "providers.yaml SSOT default at provision; a re-pin here re-introduces "
+                "the prod-routing drift (the 'Not logged in' class). Drop it and let "
+                "the runtime inherit the SSOT default."
+            )
+        # 3. default-provider pin
+        if _is_set(rc.get("provider")):
+            err(
+                "config.yaml: official templates must NOT pin `runtime_config.provider` "
+                "(the default provider). Provider selection (platform vs byok) is "
+                "resolved by the CP from the env-derived LLM-mode SSOT "
+                "(ResolveLLMMode/LLMModeForEnv). Drop it and inherit."
+            )
+
+    # 4. platform-proxy base_url pin
+    pinned = []
+    for where, name, base_url in _iter_provider_base_urls(config):
+        if _PLATFORM_PROXY_PATH_MARK in base_url.lower():
+            pinned.append(f"{where}[{name}].base_url={base_url}")
+    if pinned:
+        err(
+            "config.yaml: official templates must NOT hardcode the Molecule platform "
+            "LLM proxy base_url — that endpoint + its MOLECULE_LLM_USAGE_TOKEN auth "
+            "are injected by the controlplane (PlatformLLMProxyEnv) from the "
+            f"env-derived SSOT, not pinned per template. Pinned proxy base_url(s): "
+            f"{sorted(pinned)}. Deliver the provider registry as the SSOT artifact and "
+            "drop the hardcoded proxy base_url."
+        )
+
+    if len(ERRORS) == before:
+        print("✓ official SSOT-inheritance: no hardcoded provider/model/proxy pin")
+
+
 def main() -> None:
     # --static-only skips check_adapter_runtime_load(), which calls
     # importlib's exec_module() on the template's adapter.py. That's
@@ -704,11 +851,19 @@ def main() -> None:
     # unsafe on external fork PRs (#135). Static checks (file presence,
     # YAML parse, regex/AST inspection) stay enabled in static mode.
     static_only = "--static-only" in sys.argv
+    # --official turns on the SSOT-inheritance enforcement gate
+    # (check_no_hardcoded_provider_model). It is purely static (config.yaml
+    # inspection, no code execution), so it runs in BOTH --static-only and
+    # full modes — fork PRs on official templates are gated too.
+    official = "--official" in sys.argv
+    # --allow-self-model exempts ONLY the top-level `model:` (platform-agent).
+    allow_self_model = "--allow-self-model" in sys.argv
 
     check_dockerfile()
     check_config_yaml()
     check_platform_models()
     check_full_providers_block()
+    check_no_hardcoded_provider_model(official, allow_self_model)
     check_requirements()
     check_adapter()
     if not static_only:

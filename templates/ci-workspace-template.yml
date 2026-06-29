@@ -67,11 +67,31 @@ jobs:
       # no code execution; the most important security check).
       - name: Check for secrets
         run: python3 .molecule-ci/.molecule-ci/scripts/check-secrets.py
+      # Official-template SSOT enforcement is OPT-IN via a committed `.official`
+      # marker (dynamic — no hardcoded repo allowlist). When present the
+      # validator runs with --official so check_no_hardcoded_provider_model ERRORs
+      # on a re-pinned default provider/model or a pinned platform LLM proxy
+      # base_url. A `.official` containing `allow-self-model` also passes
+      # --allow-self-model (platform-agent's top-level `model:`, core#2594).
+      # NON-official templates (no marker) are unaffected — the gate never fires.
+      - name: Detect official-template SSOT enforcement
+        id: official
+        run: |
+          FLAGS=""
+          if [ -f .official ]; then
+            FLAGS="--official"
+            if grep -qi 'allow-self-model' .official 2>/dev/null; then
+              FLAGS="$FLAGS --allow-self-model"
+            fi
+            echo "::notice::Official template (.official marker) — enforcing SSOT-inheritance lint: $FLAGS"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
       # On external fork PRs: STATIC-ONLY validation (no pip install of the
       # template's requirements.txt, no adapter.py import). Untrusted code.
+      # The SSOT-inheritance gate is purely static, so it runs here too.
       - name: Validate workspace-template contract (static-only, fork PR)
         if: github.event.pull_request.head.repo.fork == true
-        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py --static-only
+        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py --static-only ${{ steps.official.outputs.flags }}
       # Internal PRs and pushes: FULL runtime validation. Install the
       # template's own runtime deps so the validator can import adapter.py
       # the same way the workspace container does at boot.
@@ -81,4 +101,4 @@ jobs:
         run: pip install -q molecule-ai-workspace-runtime
       - name: Validate workspace-template contract (full)
         if: github.event.pull_request.head.repo.fork != true
-        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py
+        run: python3 .molecule-ci/.molecule-ci/scripts/validate-workspace-template.py ${{ steps.official.outputs.flags }}

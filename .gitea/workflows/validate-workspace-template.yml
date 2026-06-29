@@ -131,7 +131,27 @@ jobs:
       # AST inspection of adapter.py (no import). Doesn't execute
       # any third-party code; safe on fork PRs.
       - run: pip install pyyaml -q
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+      # Official-template SSOT enforcement is OPT-IN via a committed `.official`
+      # marker in the template repo (dynamic — no hardcoded repo allowlist). When
+      # present, the validator runs with --official so check_no_hardcoded_provider_model
+      # ERRORs on a re-pinned default provider/model or a pinned platform LLM proxy
+      # base_url (the drift the controlplane env-derived LLM-mode SSOT eliminated).
+      # A `.official` whose contents include `allow-self-model` also passes
+      # --allow-self-model (platform-agent's top-level `model:`, core#2594).
+      # Community + un-migrated repos (no marker) are unaffected.
+      - name: Detect official-template SSOT enforcement
+        id: official
+        run: |
+          FLAGS=""
+          if [ -f .official ]; then
+            FLAGS="--official"
+            if grep -qi 'allow-self-model' .official 2>/dev/null; then
+              FLAGS="$FLAGS --allow-self-model"
+            fi
+            echo "::notice::Official template (.official marker) — enforcing SSOT-inheritance lint: $FLAGS"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only ${{ steps.official.outputs.flags }}
 
   validate-runtime:
     name: Template validation (runtime)
@@ -175,8 +195,22 @@ jobs:
         run: pip install -q -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
         run: pip install -q molecule-ai-workspace-runtime
+      # Same opt-in `.official` SSOT-enforcement detection as the static job
+      # (separate job → its own detection step).
+      - name: Detect official-template SSOT enforcement
+        id: official
+        run: |
+          FLAGS=""
+          if [ -f .official ]; then
+            FLAGS="--official"
+            if grep -qi 'allow-self-model' .official 2>/dev/null; then
+              FLAGS="$FLAGS --allow-self-model"
+            fi
+            echo "::notice::Official template (.official marker) — enforcing SSOT-inheritance lint: $FLAGS"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
       # Full validator — includes adapter.py import (exec_module).
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py ${{ steps.official.outputs.flags }}
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |

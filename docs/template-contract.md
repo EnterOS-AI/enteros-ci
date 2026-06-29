@@ -33,6 +33,29 @@ The contract exists because the 8 template repos were extracted from a single mo
 
 Unknown top-level keys produce a warning (not an error) so accidental drift is visible without blocking.
 
+### Official-template SSOT inheritance (the `--official` gate)
+
+The principal's rule: the OFFICIAL repo must **enforce** the SSOT, not just rely on convention. An **official** workspace template MUST NOT hardcode the *default* provider/model or pin the Molecule platform LLM proxy, because the controlplane resolves and injects those at provision time:
+
+- the LLM routing mode (`platform` vs `byok`) is derived from the env-identity SSOT — `molecule-controlplane internal/provisioner/llm_mode.go` (`ResolveLLMMode` / `LLMModeForEnv`): `production`/`staging`/`e2e` → `platform`, `dev` → `byok`;
+- the platform proxy endpoint + `MOLECULE_LLM_USAGE_TOKEN` auth are injected by the CP (`PlatformLLMProxyEnv` → `MOLECULE_LLM_*` / `ANTHROPIC_BASE_URL` / …), never pinned per template;
+- the default model comes from the `providers.yaml` registry SSOT.
+
+A template that **re-pins** any of these re-introduces the silent prod-routing drift the CP SSOT eliminated — the "Not logged in" / unservable-option class.
+
+`check_no_hardcoded_provider_model` ERRORs (under `--official`) on:
+
+| Flagged | Why |
+|---|---|
+| top-level `model:` | a hardcoded model default (exempt only with `--allow-self-model`) |
+| `runtime_config.model` | the default-model pin |
+| `runtime_config.provider` | the default-provider pin |
+| any `providers[*].base_url` containing `internal/llm/` | a pinned platform LLM proxy (CP injects it) |
+
+It does **not** flag a `runtime_config.models` *catalog* (the user-selectable menu + per-entry `required_env`) — that is kept ⊆ the registry SSOT by the separate platform-model / full-providers drift gates.
+
+**Activation is opt-in and dynamic** — no hardcoded repo allowlist. A template repo declares itself official by committing a `.official` marker file; the CI (`templates/ci-workspace-template.yml` and the reusable `validate-workspace-template.yml`) then runs the validator with `--official`. If `.official` contains the token `allow-self-model`, `--allow-self-model` is also passed — this exempts **only** the top-level `model:` for the platform-agent (Org Concierge) template whose own declared model IS its identity per core#2594. Community and un-migrated templates (no marker) are unaffected; the gate never fires for them.
+
 ## adapter.py
 
 Optional. When present, `adapter.py` should:
