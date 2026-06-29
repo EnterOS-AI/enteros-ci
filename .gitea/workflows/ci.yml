@@ -12,9 +12,8 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    # Daily smoke to keep the CI badge green even on quiet days.
-    - cron: "0 0 * * *"
+  # No `schedule:` cron (no-nightly/no-cron CI policy). CI runs per-PR and on
+  # push:main; the daily badge-keeper cron is not a gate and is removed.
   workflow_dispatch: {}
 
 permissions:
