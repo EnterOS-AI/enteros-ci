@@ -1320,6 +1320,34 @@ def test_official_lint_cli_repinned_passes_without_official_flag():
     assert r.returncode == 0, f"expected green without --official, got {r.returncode}\n{r.stdout}\n{r.stderr}"
 
 
+def test_ssot_inheritance_only_passes_config_overlay_platform_route():
+    """--ssot-inheritance-only runs JUST the model/provider/proxy gate, skipping
+    the Dockerfile/adapter/template_schema_version structural checks. The
+    config-overlay platform-agent (no Dockerfile/adapter) passes with
+    --allow-platform-route — this is exactly how the concierge template's CI gates
+    a re-pin without adopting the full runtime-template contract."""
+    r = _run_validator_cli("official-platform-route", "--ssot-inheritance-only", "--allow-platform-route")
+    assert r.returncode == 0, f"expected green, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "SSOT-inheritance gate passed" in r.stdout, r.stdout
+
+
+def test_ssot_inheritance_only_gates_model_repin(tmp_path):
+    """--ssot-inheritance-only still REDs a re-introduced model pin (even with
+    --allow-platform-route) — the config-overlay re-pin gate."""
+    import shutil, os as _os
+    repin = tmp_path / "overlay-repinned"
+    shutil.copytree(_FIXTURES / "official-platform-route", repin)
+    cfg = repin / "config.yaml"
+    cfg.write_text(cfg.read_text() + "\nmodel: minimax/MiniMax-M2.7\n")
+    env = dict(_os.environ); env["PYTHONUTF8"] = "1"; env["PYTHONIOENCODING"] = "utf-8"
+    r = subprocess.run(
+        [_sys.executable, str(VALIDATOR_PATH), "--ssot-inheritance-only", "--allow-platform-route"],
+        cwd=str(repin), capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, f"expected red on model re-pin, got {r.returncode}\n{r.stdout}"
+    assert "`model:`" in r.stdout, r.stdout
+
+
 def test_official_lint_cli_platform_route_passes_with_flag():
     """The REAL de-pinned platform-agent (Org Concierge) shape — no model pin but
     the platform CP-proxy route kept — PASSES `--official --allow-platform-route`.

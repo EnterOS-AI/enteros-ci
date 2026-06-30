@@ -915,6 +915,24 @@ def main() -> None:
     # platform route is not a vendor pin). It does NOT exempt a model pin.
     allow_platform_route = "--allow-platform-route" in sys.argv
 
+    # --ssot-inheritance-only runs JUST the SSOT-inheritance gate
+    # (check_no_hardcoded_provider_model), skipping the Dockerfile / adapter.py /
+    # requirements / providers-manifest structural checks. It exists for OFFICIAL
+    # CONFIG-OVERLAY templates that are NOT standard runtime images — notably the
+    # platform-agent (Org Concierge), which ships only config.yaml + prompts (no
+    # Dockerfile / adapter.py / template_schema_version). Those repos still want
+    # the model-re-pin gate without being forced into the full runtime-template
+    # contract. Implies --official (the gate is the whole point here).
+    ssot_only = "--ssot-inheritance-only" in sys.argv
+    if ssot_only:
+        check_no_hardcoded_provider_model(True, allow_self_model, allow_platform_route)
+        for e in ERRORS:
+            print(f"::error::{e}")
+        if ERRORS:
+            sys.exit(1)
+        print("✓ SSOT-inheritance gate passed (config-overlay official template)")
+        return
+
     check_dockerfile()
     check_config_yaml()
     check_platform_models()
