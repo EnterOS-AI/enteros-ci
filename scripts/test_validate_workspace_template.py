@@ -1008,7 +1008,9 @@ def _silent_official_config() -> str:
 
 def _repinned_official_config() -> str:
     """A re-pinned official template: hardcodes top-level model, the default
-    runtime_config.model + provider, and the platform proxy base_url."""
+    runtime_config.model + a VENDOR provider, and the platform proxy base_url.
+    (runtime_config.provider is a VENDOR name — `platform` is the allowed proxy
+    route, so only a vendor pin trips the default-provider class.)"""
     return (
         "name: t\n"
         "runtime: claude-code\n"
@@ -1022,7 +1024,7 @@ def _repinned_official_config() -> str:
         "    auth_env: [MOLECULE_LLM_USAGE_TOKEN]\n"
         "runtime_config:\n"
         "  model: moonshot/kimi-k2.6\n"
-        "  provider: platform\n"
+        "  provider: moonshot\n"
         "  models:\n"
         "    - id: moonshot/kimi-k2.6\n"
         "      name: Kimi K2.6\n"
@@ -1069,14 +1071,92 @@ def test_official_runtime_config_model_pin_errors(validator, tmp_path, monkeypat
 
 
 def test_official_runtime_config_provider_pin_errors(validator, tmp_path, monkeypatch):
+    """A VENDOR `runtime_config.provider` (minimax/moonshot/openai/...) is the
+    drift the gate catches — provider selection is the CP's, not the template's."""
     cfg = (
         "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
-        "runtime_config:\n  provider: platform\n  required_env: []\n"
+        "runtime_config:\n  provider: minimax\n  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
+    assert any("runtime_config.provider" in e and "VENDOR" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_provider_platform_route_gated_without_flag(validator, tmp_path, monkeypatch):
+    """`runtime_config.provider: platform` is still GATED for a generic official
+    template (it forces the platform route even where the CP would pick byok).
+    Only the platform-agent opts out via --allow-platform-route."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  provider: platform\n  models: []\n  required_env: []\n"
     )
     _materialise(tmp_path, config_yaml=cfg)
     monkeypatch.chdir(tmp_path)
     validator.check_no_hardcoded_provider_model(official=True, allow_self_model=False)
     assert any("runtime_config.provider" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_allow_platform_route_exempts_provider_platform(validator, tmp_path, monkeypatch):
+    """--allow-platform-route exempts the platform-agent (Org Concierge) CP-proxy
+    ROUTE: `runtime_config.provider: platform` is the route, NOT a vendor pin
+    (principal Rule #13). The de-pinned platform-agent config keeps it deliberately."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  provider: platform\n  models: []\n  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(
+        official=True, allow_self_model=False, allow_platform_route=True)
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_official_allow_platform_route_still_flags_vendor_provider(validator, tmp_path, monkeypatch):
+    """--allow-platform-route exempts ONLY `platform`; a VENDOR provider pin is
+    still the drift and is flagged even with the flag."""
+    cfg = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "runtime_config:\n  provider: minimax\n  required_env: []\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(
+        official=True, allow_self_model=False, allow_platform_route=True)
+    assert any("runtime_config.provider" in e and "VENDOR" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_official_allow_platform_route_exempts_platform_proxy_base_url(validator, tmp_path, monkeypatch):
+    """--allow-platform-route also exempts a `platform`-named provider entry's
+    Molecule-proxy base_url (the platform-agent's structural CP-proxy registry),
+    while still flagging a proxy base_url on a NON-platform entry."""
+    # platform-named proxy entry → exempt under the flag
+    cfg_ok = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "providers:\n"
+        "  - name: platform\n"
+        "    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic\n"
+        "    auth_env: [MOLECULE_LLM_USAGE_TOKEN]\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg_ok)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(
+        official=True, allow_self_model=False, allow_platform_route=True)
+    assert validator.ERRORS == [], validator.ERRORS
+
+    # same proxy path on a NON-platform-named entry → still flagged
+    validator.ERRORS.clear()
+    cfg_bad = (
+        "name: t\nruntime: claude-code\ntemplate_schema_version: 1\n"
+        "providers:\n"
+        "  - name: sneaky\n"
+        "    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic\n"
+    )
+    _materialise(tmp_path, config_yaml=cfg_bad)
+    monkeypatch.chdir(tmp_path)
+    validator.check_no_hardcoded_provider_model(
+        official=True, allow_self_model=False, allow_platform_route=True)
+    assert any("proxy base_url" in e for e in validator.ERRORS), validator.ERRORS
 
 
 def test_official_platform_proxy_base_url_pin_errors(validator, tmp_path, monkeypatch):
@@ -1238,3 +1318,70 @@ def test_official_lint_cli_repinned_passes_without_official_flag():
     strictly opt-in, so it can never break a community / un-migrated repo."""
     r = _run_validator_cli("official-repinned")
     assert r.returncode == 0, f"expected green without --official, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+
+
+def test_ssot_inheritance_only_passes_config_overlay_platform_route():
+    """--ssot-inheritance-only runs JUST the model/provider/proxy gate, skipping
+    the Dockerfile/adapter/template_schema_version structural checks. The
+    config-overlay platform-agent (no Dockerfile/adapter) passes with
+    --allow-platform-route — this is exactly how the concierge template's CI gates
+    a re-pin without adopting the full runtime-template contract."""
+    r = _run_validator_cli("official-platform-route", "--ssot-inheritance-only", "--allow-platform-route")
+    assert r.returncode == 0, f"expected green, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "SSOT-inheritance gate passed" in r.stdout, r.stdout
+
+
+def test_ssot_inheritance_only_gates_model_repin(tmp_path):
+    """--ssot-inheritance-only still REDs a re-introduced model pin (even with
+    --allow-platform-route) — the config-overlay re-pin gate."""
+    import shutil, os as _os
+    repin = tmp_path / "overlay-repinned"
+    shutil.copytree(_FIXTURES / "official-platform-route", repin)
+    cfg = repin / "config.yaml"
+    cfg.write_text(cfg.read_text() + "\nmodel: minimax/MiniMax-M2.7\n")
+    env = dict(_os.environ); env["PYTHONUTF8"] = "1"; env["PYTHONIOENCODING"] = "utf-8"
+    r = subprocess.run(
+        [_sys.executable, str(VALIDATOR_PATH), "--ssot-inheritance-only", "--allow-platform-route"],
+        cwd=str(repin), capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, f"expected red on model re-pin, got {r.returncode}\n{r.stdout}"
+    assert "`model:`" in r.stdout, r.stdout
+
+
+def test_official_lint_cli_platform_route_passes_with_flag():
+    """The REAL de-pinned platform-agent (Org Concierge) shape — no model pin but
+    the platform CP-proxy route kept — PASSES `--official --allow-platform-route`.
+    This is the proof that wiring the gate on the concierge template is green."""
+    r = _run_validator_cli("official-platform-route", "--official", "--allow-platform-route")
+    assert r.returncode == 0, f"expected green, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "official SSOT-inheritance" in r.stdout, r.stdout
+
+
+def test_official_lint_cli_platform_route_reds_without_route_flag():
+    """Without --allow-platform-route the concierge's platform route declarations
+    are gated — proves the flag is load-bearing (not a silent always-pass)."""
+    r = _run_validator_cli("official-platform-route", "--official")
+    assert r.returncode == 1, f"expected red, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "runtime_config.provider" in r.stdout and "proxy base_url" in r.stdout, r.stdout
+
+
+def test_official_lint_cli_gates_model_repin_on_platform_agent(tmp_path):
+    """THE re-pin gate: a re-introduced model pin on the de-pinned platform-agent
+    is RED even WITH --allow-platform-route (the flag exempts the platform route,
+    never a model). This is the lint that gates a template model re-pin."""
+    import shutil
+    repin = tmp_path / "official-platform-route-repinned"
+    shutil.copytree(_FIXTURES / "official-platform-route", repin)
+    cfg = repin / "config.yaml"
+    cfg.write_text(cfg.read_text() + "\n# RE-PIN (the violation this gate catches):\nmodel: minimax/MiniMax-M2.7\n")
+    import os as _os
+    env = dict(_os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PROVIDERS_MANIFEST_FILE"] = str(_FIXTURES / "_no_such_manifest.yaml")
+    r = subprocess.run(
+        [_sys.executable, str(VALIDATOR_PATH), "--static-only", "--official", "--allow-platform-route"],
+        cwd=str(repin), capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 1, f"expected red on model re-pin, got {r.returncode}\n{r.stdout}\n{r.stderr}"
+    assert "top-level" in r.stdout and "`model:`" in r.stdout, r.stdout

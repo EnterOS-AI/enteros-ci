@@ -1,0 +1,38 @@
+# Faithful (trimmed) copy of the DE-PINNED platform-agent (Org Concierge)
+# config — the real molecule-ai-workspace-template-platform-agent main shape.
+# It declares NO model / runtime_config.model and `models: []` (inherits the
+# SSOT default), but DELIBERATELY keeps the platform CP-proxy ROUTE:
+#   • runtime_config.provider: platform
+#   • a `platform`-named provider entry carrying the Molecule LLM proxy base_url
+# Those are the proxy ROUTE (Rule #13), not a vendor pin. This fixture MUST pass
+# `--official --allow-platform-route` and MUST red if a model is re-pinned.
+name: test-official-platform-route
+runtime: claude-code
+template_schema_version: 1
+description: De-pinned platform-agent concierge — inherits the SSOT model, keeps the platform route.
+tier: 2
+
+# Top-level provider route (allowed — it is the platform proxy route).
+provider: platform
+
+providers:
+  - name: anthropic-oauth
+    auth_mode: oauth
+    model_prefixes: []
+    model_aliases: [sonnet, opus, haiku]
+    base_url: null
+    auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+  - name: platform
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [moonshot/, anthropic/, minimax/]
+    model_aliases: []
+    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic
+    auth_env: [MOLECULE_LLM_USAGE_TOKEN]
+    auth_token_env: ANTHROPIC_AUTH_TOKEN
+
+runtime_config:
+  # Model — INTENTIONALLY ABSENT (inherits the SSOT default via seeded env).
+  provider: platform
+  models: []
+  required_env: []
+  timeout: 0
