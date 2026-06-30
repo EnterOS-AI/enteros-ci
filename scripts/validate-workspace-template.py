@@ -729,6 +729,17 @@ def check_full_providers_block() -> None:
 # OTHER pin (runtime_config.model / runtime_config.provider / proxy base_url)
 # is still flagged even under --allow-self-model.
 #
+# --allow-platform-route exempts the platform-agent's CP-proxy ROUTE: a
+# `runtime_config.provider: platform` default AND a `platform`-named provider
+# entry's Molecule proxy base_url. The concierge is ALWAYS platform-managed
+# (every turn routes through the CP proxy for billing/audit), so those are the
+# proxy ROUTE, not a vendor lock-in (principal Rule #13 forbids VENDOR pins, not
+# the platform route). The CURRENT de-pinned concierge template inherits its
+# MODEL from the SSOT (no model pin) but keeps this route, so the gate runs with
+# --allow-platform-route (NOT --allow-self-model — a re-pinned concierge model is
+# STILL gated). A VENDOR provider, or a proxy base_url on a non-`platform` entry,
+# is flagged regardless of the flag.
+#
 # What it does NOT flag: a `runtime_config.models` CATALOG (the user-selectable
 # menu + per-entry required_env). That catalog is the legitimate per-template
 # surface and is already kept ⊆ the registry SSOT by check_full_providers_block
@@ -772,9 +783,19 @@ def _iter_provider_base_urls(config: dict):
         yield from _scan(rc.get("providers"), "runtime_config.providers")
 
 
-def check_no_hardcoded_provider_model(official: bool, allow_self_model: bool) -> None:
+def check_no_hardcoded_provider_model(official: bool, allow_self_model: bool,
+                                      allow_platform_route: bool = False) -> None:
     """--official SSOT-inheritance gate — ERROR on a re-pinned official
-    template; pass when the template is silent / inherits. See header above."""
+    template; pass when the template is silent / inherits. See header above.
+
+    allow_platform_route (--allow-platform-route) exempts the platform-agent
+    (Org Concierge) template's LEGITIMATE platform-proxy ROUTE declarations:
+    `runtime_config.provider: platform` AND a `platform`-named provider entry's
+    Molecule-proxy base_url. The concierge is ALWAYS platform-managed (it routes
+    every turn through the CP proxy for billing/audit), so those are the proxy
+    ROUTE, not a vendor lock-in (principal Rule #13 forbids VENDOR pins, not the
+    platform route). It does NOT exempt a model pin — a re-pinned concierge model
+    is still gated, which is the whole point."""
     if not official:
         return  # gate is opt-in; community + un-migrated templates unaffected
     if not os.path.isfile("config.yaml"):
@@ -816,19 +837,48 @@ def check_no_hardcoded_provider_model(official: bool, allow_self_model: bool) ->
                 "the prod-routing drift (the 'Not logged in' class). Drop it and let "
                 "the runtime inherit the SSOT default."
             )
-        # 3. default-provider pin
-        if _is_set(rc.get("provider")):
-            err(
-                "config.yaml: official templates must NOT pin `runtime_config.provider` "
-                "(the default provider). Provider selection (platform vs byok) is "
-                "resolved by the CP from the env-derived LLM-mode SSOT "
-                "(ResolveLLMMode/LLMModeForEnv). Drop it and inherit."
-            )
+        # 3. default-provider pin. Provider selection (platform vs byok) is the
+        #    CP's call (ResolveLLMMode/LLMModeForEnv), so a generic official
+        #    template must NOT pin it. EXCEPTION (--allow-platform-route): the
+        #    platform-agent (Org Concierge) is ALWAYS platform-managed and keeps
+        #    `runtime_config.provider: platform` deliberately — that is the
+        #    CP-proxy ROUTE, not a vendor lock-in (Rule #13). A VENDOR name
+        #    (minimax/moonshot/openai/...) is ALWAYS the drift and is flagged
+        #    regardless of the flag.
+        rc_provider = rc.get("provider")
+        if _is_set(rc_provider):
+            prov = str(rc_provider).strip()
+            if prov.lower() == "platform" and allow_platform_route:
+                print(
+                    "::notice::--allow-platform-route: `runtime_config.provider: platform` "
+                    "exempt (platform-agent CP-proxy route, Rule #13)"
+                )
+            else:
+                kind = "a VENDOR" if prov.lower() != "platform" else "the"
+                hint = (
+                    " (the platform PROXY ROUTE is allowed for the platform-agent "
+                    "concierge via --allow-platform-route)"
+                    if prov.lower() == "platform" else ""
+                )
+                err(
+                    f"config.yaml: official templates must NOT pin {kind} "
+                    f"`runtime_config.provider` (got {prov!r}). Provider selection "
+                    "(platform vs byok) is resolved by the CP from the env-derived "
+                    f"LLM-mode SSOT (ResolveLLMMode/LLMModeForEnv). Drop it and inherit.{hint}"
+                )
 
-    # 4. platform-proxy base_url pin
+    # 4. platform-proxy base_url pin. The CP injects the proxy endpoint +
+    #    MOLECULE_LLM_USAGE_TOKEN auth (PlatformLLMProxyEnv), so a generic
+    #    template must NOT hardcode it. EXCEPTION (--allow-platform-route): a
+    #    `platform`-named provider entry in the platform-agent's own registry
+    #    legitimately carries the proxy base_url (its structural CP-proxy route,
+    #    overridden by the CP at provision on SaaS, used as-is on self-host). A
+    #    proxy base_url on any NON-`platform` entry is still flagged.
     pinned = []
     for where, name, base_url in _iter_provider_base_urls(config):
         if _PLATFORM_PROXY_PATH_MARK in base_url.lower():
+            if allow_platform_route and str(name).strip().lower() == "platform":
+                continue  # platform-agent's legitimate platform-route registry entry
             pinned.append(f"{where}[{name}].base_url={base_url}")
     if pinned:
         err(
@@ -837,7 +887,8 @@ def check_no_hardcoded_provider_model(official: bool, allow_self_model: bool) ->
             "are injected by the controlplane (PlatformLLMProxyEnv) from the "
             f"env-derived SSOT, not pinned per template. Pinned proxy base_url(s): "
             f"{sorted(pinned)}. Deliver the provider registry as the SSOT artifact and "
-            "drop the hardcoded proxy base_url."
+            "drop the hardcoded proxy base_url. (The platform-agent concierge's own "
+            "`platform`-named registry entry is exempt via --allow-platform-route.)"
         )
 
     if len(ERRORS) == before:
@@ -858,12 +909,17 @@ def main() -> None:
     official = "--official" in sys.argv
     # --allow-self-model exempts ONLY the top-level `model:` (platform-agent).
     allow_self_model = "--allow-self-model" in sys.argv
+    # --allow-platform-route exempts the platform-agent (Org Concierge) template's
+    # CP-proxy ROUTE declarations: `runtime_config.provider: platform` and a
+    # `platform`-named provider entry's Molecule-proxy base_url (Rule #13: the
+    # platform route is not a vendor pin). It does NOT exempt a model pin.
+    allow_platform_route = "--allow-platform-route" in sys.argv
 
     check_dockerfile()
     check_config_yaml()
     check_platform_models()
     check_full_providers_block()
-    check_no_hardcoded_provider_model(official, allow_self_model)
+    check_no_hardcoded_provider_model(official, allow_self_model, allow_platform_route)
     check_requirements()
     check_adapter()
     if not static_only:

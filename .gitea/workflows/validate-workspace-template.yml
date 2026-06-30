@@ -148,6 +148,13 @@ jobs:
             if grep -qi 'allow-self-model' .official 2>/dev/null; then
               FLAGS="$FLAGS --allow-self-model"
             fi
+            # allow-platform-route: exempt the platform-agent (Org Concierge)
+            # CP-proxy ROUTE — `runtime_config.provider: platform` + a
+            # `platform`-named provider entry's Molecule proxy base_url (Rule #13:
+            # the platform route is not a vendor pin). A model re-pin is STILL gated.
+            if grep -qi 'allow-platform-route' .official 2>/dev/null; then
+              FLAGS="$FLAGS --allow-platform-route"
+            fi
             echo "::notice::Official template (.official marker) — enforcing SSOT-inheritance lint: $FLAGS"
           fi
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
@@ -205,6 +212,13 @@ jobs:
             FLAGS="--official"
             if grep -qi 'allow-self-model' .official 2>/dev/null; then
               FLAGS="$FLAGS --allow-self-model"
+            fi
+            # allow-platform-route: exempt the platform-agent (Org Concierge)
+            # CP-proxy ROUTE — `runtime_config.provider: platform` + a
+            # `platform`-named provider entry's Molecule proxy base_url (Rule #13:
+            # the platform route is not a vendor pin). A model re-pin is STILL gated.
+            if grep -qi 'allow-platform-route' .official 2>/dev/null; then
+              FLAGS="$FLAGS --allow-platform-route"
             fi
             echo "::notice::Official template (.official marker) — enforcing SSOT-inheritance lint: $FLAGS"
           fi

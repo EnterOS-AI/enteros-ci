@@ -23,8 +23,9 @@ providers:
 runtime_config:
   # (2) default-model pin
   model: moonshot/kimi-k2.6
-  # (3) default-provider pin
-  provider: platform
+  # (3) default-provider pin — a VENDOR name (the platform proxy ROUTE
+  # `provider: platform` is allowed; only a vendor lock-in trips this class).
+  provider: moonshot
   models:
     - id: moonshot/kimi-k2.6
       name: Kimi K2.6
