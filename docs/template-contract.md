@@ -103,7 +103,7 @@ fi
 
 ## Adding a new runtime
 
-1. Add the runtime name to `KNOWN_RUNTIMES` in `scripts/validate-workspace-template.py`.
+1. Add the runtime name to the canonical `runtimes` enum in the marketplace workspace-template schema (`molecule-contracts/workspace-template/workspace-template.schema.json`) — that schema is the SSOT the validator enforces. Then re-vendor it into `molecule-ci/schemas/` (see `schemas/PROVENANCE.md`); `scripts/validate-workspace-template.py` validates against the vendored copy. (The hand-rolled `KNOWN_RUNTIMES` set was retired in the SSOT switch, RFC molecule-core#3285.)
 2. Add the runtime + image ref to `RuntimeImages` in `molecule-core/workspace-server/internal/provisioner/provisioner.go`.
 3. Stand up the `molecule-ai-workspace-template-<runtime>` repo from the existing template-of-templates pattern (issue #105 covers this).
 4. Confirm CI green on the new repo before opening it for general use.

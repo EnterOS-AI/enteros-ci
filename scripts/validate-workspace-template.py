@@ -6,10 +6,24 @@ Dockerfile + config.yaml + requirements.txt against the canonical
 contract. Replaces the existing soft-warnings-only validator at
 molecule-ci/scripts/validate-workspace-template.py.
 """
+import json
 import os
 import re
 import sys
+from pathlib import Path
+
 import yaml
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(
+        "::error::jsonschema not installed — validate-workspace-template.py "
+        "validates config.yaml against the vendored molecule-contracts schema "
+        "and needs `pip install jsonschema`. (CI installs it; see the "
+        "validate-workspace-template workflow.)"
+    )
+    sys.exit(1)
 
 ERRORS: list[str] = []
 WARNINGS: list[str] = []
@@ -19,6 +33,33 @@ def err(msg: str) -> None:
 
 def warn(msg: str) -> None:
     WARNINGS.append(msg)
+
+
+def _find_schema(name: str) -> Path | None:
+    """Locate a vendored schema by walking up from this script to the repo
+    root's schemas/ dir."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        cand = parent / "schemas" / name
+        if cand.is_file():
+            return cand
+    err(f"vendored schema not found: schemas/{name} (looked up from {here})")
+    return None
+
+
+_WORKSPACE_SCHEMA = None
+
+def _workspace_schema() -> dict | None:
+    """Load + cache the vendored marketplace workspace-template JSON-Schema
+    (SSOT, from molecule-contracts). This is the authority for the config.yaml
+    field / required-key / runtime-enum / type shape — see _check_schema_v1."""
+    global _WORKSPACE_SCHEMA
+    if _WORKSPACE_SCHEMA is None:
+        path = _find_schema("workspace-template.schema.json")
+        if path is None:
+            return None
+        _WORKSPACE_SCHEMA = json.loads(path.read_text())
+    return _WORKSPACE_SCHEMA
 
 
 # ───────────────────────────────────────────────────────────── Dockerfile
@@ -93,17 +134,14 @@ def check_dockerfile() -> None:
 
 # ───────────────────────────────────────────────────────────── config.yaml
 
-KNOWN_RUNTIMES = {
-    "langgraph",
-    "claude-code",
-    "crewai",
-    "autogen",
-    "deepagents",
-    "hermes",
-    "gemini-cli",
-    "google-adk",
-    "openclaw",
-}
+# NOTE (SSOT switch, RFC molecule-core#3285): the former hand-rolled
+# KNOWN_RUNTIMES set and the per-key required/optional validation of config.yaml
+# have been RETIRED. The canonical runtimes enum + the required/type field shape
+# now live in the marketplace workspace-template JSON-Schema vendored from
+# molecule-contracts (schemas/workspace-template.schema.json), and _check_schema_v1
+# validates against it. The schema-version DISPATCH machinery below stays — which
+# contract version is current / deprecated / unknown is molecule-ci migration
+# policy that the JSON-Schema (a single-version shape) does not express.
 
 # ──────────────────────────────────────────── schema versioning
 #
@@ -111,9 +149,12 @@ KNOWN_RUNTIMES = {
 # which contract this validator enforces. Versions are FROZEN once
 # shipped — never edit a SCHEMA_V* constant in place. To bump:
 #
-#   1. Add `SCHEMA_V<N+1>_REQUIRED_KEYS` / `SCHEMA_V<N+1>_OPTIONAL_KEYS`
-#      describing the new contract.
-#   2. Add `_check_schema_v<N+1>(config)` that enforces it.
+#   1. Add the v<N+1> shape to the marketplace workspace-template schema in
+#      molecule-contracts and re-vendor it (see schemas/PROVENANCE.md). The
+#      schema — not a hand-maintained key list — is the field/required/enum SSOT.
+#   2. Add `_check_schema_v<N+1>(config)` that validates against that schema
+#      (mirror `_check_schema_v1`; if contracts ships per-version schema files,
+#      point it at the v<N+1> file).
 #   3. Add the entry to SCHEMA_CHECKS below.
 #   4. Move version N from KNOWN_SCHEMA_VERSIONS to
 #      DEPRECATED_SCHEMA_VERSIONS so existing v<N> templates warn but
@@ -132,55 +173,58 @@ KNOWN_RUNTIMES = {
 KNOWN_SCHEMA_VERSIONS: set[int] = {1}
 DEPRECATED_SCHEMA_VERSIONS: set[int] = set()
 
-# `template_schema_version` is part of the v1 contract and listed
-# here for documentation, but the top-level `check_config_yaml`
-# already verifies it's present and is an int before dispatching
-# here — `_check_schema_v1` does NOT re-check it (would be dead
-# defensive code). The key DOES need to appear in the union of
-# required + optional so it isn't flagged as unknown drift in the
-# `unknown top-level keys` warning at the end of `_check_schema_v1`.
-SCHEMA_V1_REQUIRED_KEYS = ["name", "runtime", "template_schema_version"]
-SCHEMA_V1_OPTIONAL_KEYS = [
-    "description",
-    "version",
-    "tier",
-    "model",
-    "models",
-    "runtime_config",
-    "env",
-    "skills",
-    "tools",
-    "a2a",
-    "delegation",
-    "prompt_files",
-    "bridge",
-    "governance",
-]
-
-
 def _check_schema_v1(config: dict) -> None:
-    """v1 contract — the keys frozen as of monorepo task #90's Phase 2.
-    Currently every production template runs this version. Do NOT edit
-    in place; add v2 instead and migrate consumers (see header)."""
-    for key in SCHEMA_V1_REQUIRED_KEYS:
-        if key == "template_schema_version":
-            # Already verified present + int by the dispatcher; skip
-            # to avoid emitting a duplicate or contradictory error.
-            continue
-        if key not in config:
-            err(f"config.yaml: missing required key `{key}`")
-    runtime = config.get("runtime")
-    if runtime and runtime not in KNOWN_RUNTIMES:
-        warn(
-            f"config.yaml: runtime `{runtime}` not in known set "
-            f"{sorted(KNOWN_RUNTIMES)} — OK for custom runtimes; "
-            f"if canonical, add it to KNOWN_RUNTIMES in validate-workspace-template.py"
-        )
-    unknown = set(config.keys()) - set(SCHEMA_V1_REQUIRED_KEYS) - set(SCHEMA_V1_OPTIONAL_KEYS)
+    """v1 contract — validated against the marketplace workspace-template
+    JSON-Schema vendored from molecule-contracts (the SSOT). This REPLACES the
+    former hand-rolled required-key list + KNOWN_RUNTIMES set: the schema is now
+    the authority for which keys are required, which types are allowed, and the
+    canonical `runtime` enum.
+
+    `template_schema_version` is verified present + int by the dispatcher before
+    we get here; the schema also requires it (integer), which is consistent — a
+    present int satisfies both, so there is no duplicate/contradictory error.
+
+    Errors are formatted into molecule-ci's own actionable messages (the schema
+    drives WHAT is wrong; this function reports it in a stable voice):
+      * a `required` violation  -> config.yaml: missing required key `X`
+      * a `runtime` enum failure -> a runtime-not-canonical error (the schema is
+        now authoritative; an unrecognised runtime is a HARD error, not a warn).
+    Unknown top-level keys are TOLERATED by the schema (additionalProperties:true,
+    forward-compat) but still surfaced as a drift WARNING, with the known-key set
+    derived from the schema's own `properties` (no hand-maintained list)."""
+    schema = _workspace_schema()
+    if schema is None:
+        return  # _find_schema already recorded the missing-schema error
+
+    for e in sorted(Draft202012Validator(schema).iter_errors(config),
+                    key=lambda e: list(e.path)):
+        if e.validator == "required":
+            for key in schema.get("required", []):
+                if key == "template_schema_version":
+                    # Already verified by the dispatcher; don't double-report.
+                    continue
+                if key not in config and f"'{key}'" in e.message:
+                    err(f"config.yaml: missing required key `{key}`")
+        elif e.validator == "enum" and list(e.path) == ["runtime"]:
+            err(
+                f"config.yaml: runtime `{e.instance}` is not a canonical runtime "
+                f"— the marketplace workspace-template contract (molecule-contracts) "
+                f"is the SSOT for the runtimes enum; allowed: {e.validator_value}. "
+                f"Add a new runtime to that schema first."
+            )
+        else:
+            loc = "/".join(str(p) for p in e.path) or "(root)"
+            err(f"config.yaml schema violation at `{loc}`: {e.message}")
+
+    # Unknown top-level keys: not a schema error (forward-compat), but a useful
+    # drift signal. Known keys come from the schema's declared properties (SSOT).
+    known = set(schema.get("properties", {}).keys())
+    unknown = set(config.keys()) - known
     if unknown:
         warn(
             f"config.yaml: unknown top-level keys {sorted(unknown)} — "
-            f"may be drift. If intentional, add them to SCHEMA_V1_OPTIONAL_KEYS."
+            f"may be drift. If intentional, add them to the workspace-template "
+            f"schema in molecule-contracts."
         )
 
 

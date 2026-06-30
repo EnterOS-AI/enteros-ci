@@ -1,0 +1,48 @@
+# schema-sync — keep the vendored marketplace-artifact JSON-Schemas in
+# schemas/ byte-identical to their molecule-contracts SSOT originals.
+#
+# The validate-plugin / validate-workspace-template / validate-org-template
+# scripts now validate real artifact manifests against schemas/*.schema.json
+# (vendored from molecule-contracts). This gate re-fetches each schema from
+# molecule-contracts main and diffs it against the vendored copy, failing the
+# build on drift. Mirrors molecule-ai-workspace-runtime#196's vendored-schema
+# drift gate. See schemas/PROVENANCE.md.
+#
+# Soft-skips (exit 2) on a fetch failure so a transient git.* TLS stall does
+# not paint PRs red; a real byte difference (exit 1) always fails.
+
+name: Schema Sync
+
+on:
+  pull_request:
+    paths:
+      - "schemas/**"
+      - "scripts/check-schemas-in-sync.sh"
+      - ".gitea/workflows/schema-sync.yml"
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  schema-sync:
+    name: Vendored schemas in sync with molecule-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      - name: Check vendored schemas against molecule-contracts main
+        run: |
+          set +e
+          bash scripts/check-schemas-in-sync.sh
+          rc=$?
+          set -e
+          # rc 2 = fetch could not complete (network/infra). Soft-skip so a
+          # transient git.* stall isn't a false red; rc 1 (real drift) fails.
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::schema-sync soft-skipped (could not fetch contracts main)."
+            exit 0
+          fi
+          exit "$rc"
