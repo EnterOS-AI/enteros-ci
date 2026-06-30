@@ -1,12 +1,59 @@
 #!/usr/bin/env python3
-"""Validate a Molecule AI plugin repo."""
+"""Validate a Molecule AI plugin repo.
+
+SSOT switch (RFC molecule-core#3285): the field / required-key / version /
+runtimes-shape / runtime-enum checks are NO LONGER hand-rolled here — they are
+delegated to the marketplace plugin-manifest JSON-Schema (draft 2020-12)
+vendored from molecule-contracts at schemas/plugin-manifest.schema.json. That
+schema is the real authority for the manifest shape; this script just loads
+plugin.yaml, validates it against the schema, and reports the violations in
+molecule-ci's own (test-stable) voice.
+
+What stays hand-rolled because the schema CANNOT express it (out-of-band,
+filesystem-level checks):
+
+  * plugin.yaml existence at the repo root.
+  * Content presence — at least one of SKILL.md / hooks/ / skills/ / rules/
+    on disk, OR (for a code-class plugin, e.g. kind: env-mutator) a go.mod +
+    a declared entrypoint. This is a filesystem check (does the repo actually
+    ship content?), not a manifest-shape check.
+  * The SKILL.md markdown-heading formatting nudge.
+"""
+import json
 import os
 import sys
+from pathlib import Path
+
 import yaml
 
-errors = []
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(
+        "::error::jsonschema not installed — validate-plugin.py validates "
+        "plugin.yaml against the vendored molecule-contracts schema and needs "
+        "`pip install jsonschema`. (CI installs it; see the validate-plugin "
+        "workflow.)"
+    )
+    sys.exit(1)
 
-# 1. plugin.yaml exists
+
+def _find_schema(name: str) -> Path:
+    """Locate a vendored schema by walking up from this script to the repo
+    root's schemas/ dir. Works whether this file is invoked as
+    scripts/validate-plugin.py or .molecule-ci/scripts/validate-plugin.py."""
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        cand = parent / "schemas" / name
+        if cand.is_file():
+            return cand
+    print(f"::error::vendored schema not found: schemas/{name} (looked up from {here})")
+    sys.exit(1)
+
+
+errors: list[str] = []
+
+# 1. plugin.yaml exists (filesystem — schema can't express this).
 if not os.path.isfile("plugin.yaml"):
     print("::error::plugin.yaml not found at repo root")
     sys.exit(1)
@@ -14,44 +61,47 @@ if not os.path.isfile("plugin.yaml"):
 with open("plugin.yaml") as f:
     plugin = yaml.safe_load(f)
 
-# 2. Required fields
-for field in ["name", "version", "description"]:
-    if not plugin.get(field):
-        errors.append(f"Missing required field: {field}")
+if not isinstance(plugin, dict):
+    print("::error::plugin.yaml must be a mapping at the top level")
+    sys.exit(1)
 
-# 3. Version format
-v = str(plugin.get("version", ""))
-if v and not all(c in "0123456789." for c in v):
-    errors.append(f"Invalid version format: {v}")
+# 2-4. Manifest-shape validation against the molecule-contracts SSOT schema.
+#      Replaces the former hand-rolled required-field / version-format /
+#      runtimes-must-be-a-list checks AND adds the canonical runtimes enum the
+#      hand-rolled validator never enforced. Violations are formatted into the
+#      pre-existing message strings so the gate stays actionable + stable.
+schema = json.loads(_find_schema("plugin-manifest.schema.json").read_text())
+for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: list(e.path)):
+    if e.validator == "required":
+        # Map the schema-required violation to the legacy per-field message for
+        # each top-level required prop actually missing.
+        for prop in schema.get("required", []):
+            if prop not in plugin and f"'{prop}'" in e.message:
+                errors.append(f"Missing required field: {prop}")
+    elif e.validator == "pattern" and list(e.path) == ["version"]:
+        errors.append(f"Invalid version format: {e.instance}")
+    elif e.validator == "type" and list(e.path) == ["runtimes"]:
+        got = type(e.instance).__name__
+        errors.append(f"runtimes must be a list, got {got}")
+    elif e.validator == "enum" and len(e.path) == 2 and e.path[0] == "runtimes":
+        errors.append(
+            f"runtimes[{e.path[1]}]: `{e.instance}` is not a canonical runtime — "
+            f"allowed (molecule-contracts plugin-manifest enum): {e.validator_value}"
+        )
+    else:
+        loc = "/".join(str(p) for p in e.path) or "(root)"
+        errors.append(f"plugin.yaml schema violation at `{loc}`: {e.message}")
 
-# 4. Runtimes type
-runtimes = plugin.get("runtimes")
-if runtimes is not None and not isinstance(runtimes, list):
-    errors.append(f"runtimes must be a list, got {type(runtimes).__name__}")
-
-# 5. Has content — kind-aware.
+# 5. Content presence — kind-aware. FILESYSTEM check (out-of-band; the schema
+#    governs the manifest, not what files the repo ships).
 #
-# Two plugin content classes exist in the ecosystem:
-#
-#   * Skill-class plugins (the default, kind unset or one of the skill
-#     kinds below): their content is declarative — SKILL.md / hooks/ /
-#     skills/ / rules/. At least one MUST be present or the plugin is
-#     empty.
-#
-#   * Code-class plugins (e.g. kind: env-mutator): their content is
-#     compiled source — a Go module (go.mod) wired through a declared
-#     `entrypoint` (e.g. pluginloader.BuildRegistry) — not any of the
-#     skill markers. Requiring SKILL.md/hooks/skills/rules of these is a
-#     false positive (the validator previously red-flagged the
-#     legitimate molecule-gh-identity env-mutator plugin, which has no
-#     skill markers by design). For these, the Go content + entrypoint
+#   * Skill-class plugins (kind unset or a skill kind): content is declarative
+#     — SKILL.md / hooks/ / skills/ / rules/. At least one MUST be present.
+#   * Code-class plugins (e.g. kind: env-mutator): content is compiled source —
+#     a Go module (go.mod) wired through a declared `entrypoint`. Requiring the
+#     skill markers of these is a false positive (it red-flagged the legitimate
+#     molecule-gh-identity env-mutator plugin). For these, go.mod + entrypoint
 #     IS the content.
-#
-# We recognize a code-class plugin by an explicit `kind` that is not a
-# skill kind. Such a plugin satisfies the content requirement when it
-# ships compiled-source content (a go.mod) and declares an entrypoint —
-# both required so an empty repo can't escape the check just by setting
-# `kind:`.
 SKILL_KINDS = {"", "skill", "agent-skill", "claude-skill"}
 SKILL_CONTENT_PATHS = ["SKILL.md", "hooks", "skills", "rules"]
 
@@ -78,7 +128,7 @@ elif kind not in SKILL_KINDS:
 else:
     errors.append("Plugin must contain at least one of: SKILL.md, hooks/, skills/, rules/")
 
-# 6. SKILL.md formatting check
+# 6. SKILL.md formatting check (out-of-band nudge).
 if os.path.isfile("SKILL.md"):
     with open("SKILL.md") as f:
         first_line = f.readline().strip()
@@ -95,5 +145,6 @@ if found:
     print(f"  Content: {', '.join(found)}")
 elif kind not in SKILL_KINDS:
     print(f"  Content: go.mod + entrypoint ({plugin.get('entrypoint')}) [kind: {kind}]")
+runtimes = plugin.get("runtimes")
 if runtimes:
     print(f"  Runtimes: {', '.join(runtimes)}")

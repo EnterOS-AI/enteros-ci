@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/org-template/org-template.schema.json",
+  "title": "Marketplace Org-Template Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace org-template artifact — the publishable shape of an org-template `org.yaml` (+ per-agent `workspace.yaml`) (molecule-ai-org-template-* repos). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-org-template-molecule-dev/org.yaml (+ community-manager/workspace.yaml), gemini-growth-team, mock-bigorg, validated by validate-org-template.py (required: name; must have at least `workspaces` or `defaults`; each workspace needs `name`; `plugins` must be a list; recurses `children`). TWO COMPOSITION STYLES are tolerated, exactly as the real templates use them: (1) INLINE — `workspaces` is a LIST of recursive workspace nodes with `children[]` (gemini-growth-team, mock-bigorg); (2) FOLDER-TREE — `org.yaml` references per-agent `workspace.yaml` files via custom YAML tags (`!include`, `!external`) that resolve at platform load time to workspace nodes (molecule-dev). Those custom tags are a YAML-load concern (validate-org-template.py parses past them): `!include x.yaml` loads as a plain path STRING and `!external {repo,ref,path}` loads as a plain MAP. `workspaces` therefore accepts BOTH a LIST and a MAP (name->node), and each LIST item is one of THREE forms: a resolved inline workspaceNode, an UNRESOLVED `!external` ref object (`$defs/unresolvedExternalRef`), or an UNRESOLVED `!include` path string. The two unresolved forms are PRE-RESOLUTION refs that core's `!include`/`!external` resolver expands into workspace nodes at platform load time; modelling them lets the real folder-tree templates (molecule-dev, molecule-production) validate as-authored, not only post-resolution. Modelled permissively (additionalProperties:true) because org templates carry heterogeneous per-org config (category_routing, idle-loop knobs, initial prompts).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["name"],
+  "anyOf": [
+    { "required": ["workspaces"] },
+    { "required": ["defaults"] }
+  ],
+  "properties": {
+    "name": { "type": "string", "minLength": 1, "description": "Org template name (required by validate-org-template.py)." },
+    "description": { "type": "string", "description": "Optional human-readable description." },
+    "template_schema_version": { "type": "integer", "description": "Optional org template schema version (`template_schema_version: 1`)." },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present."
+    },
+    "workspaces": {
+      "description": "The workspace tree. Accepts BOTH a LIST of workspace items (inline composition — gemini-growth-team/mock-bigorg) AND a MAP of name->node. In the FOLDER-TREE style (molecule-dev, molecule-production) the real org.yaml does NOT inline the nodes: it lists per-agent references via custom YAML tags — `!include teams/x.yaml` (a path string after YAML load) and `!external {repo, ref, path}` (a map after YAML load). core's `!include`/`!external` resolver EXPANDS these to full workspace nodes at platform load time; they are PRE-RESOLUTION refs, not resolved nodes. So each LIST item is one of THREE forms: (1) a resolved inline workspaceNode; (2) an unresolved `!external` ref object `{repo, ref, path}`; (3) an unresolved `!include` path STRING. The MAP branch carries the resolved name->node style.",
+      "oneOf": [
+        {
+          "type": "array",
+          "description": "List of workspace items. Each item is EITHER a resolved inline workspaceNode, OR an unresolved pre-resolution ref: an `!external` object `{repo, ref, path}` or an `!include` path string (both expanded by core's resolver at load time).",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/workspaceNode" },
+              { "$ref": "#/$defs/unresolvedExternalRef" },
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "Unresolved `!include` ref — the path (relative to the template repo root) of a per-agent `workspace.yaml`/`teams/*.yaml`. The custom `!include` YAML tag is stripped at load (the scalar value remains a plain string); core's resolver reads the file and expands it into a workspaceNode."
+              }
+            ]
+          }
+        },
+        {
+          "type": "object",
+          "description": "Map of workspace name -> workspace node.",
+          "additionalProperties": { "$ref": "#/$defs/workspaceNode" }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "unresolvedExternalRef": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repo", "ref", "path"],
+      "description": "An UNRESOLVED `!external` workspace reference, as it appears in a folder-tree org.yaml AFTER the custom `!external` YAML tag is stripped at load time (molecule-dev pins the dev department, molecule-core#105 / internal#77). core's gitops resolver fetches `repo` at `ref` and expands `path` into a workspaceNode at platform import time; this object is the PRE-RESOLUTION ref, not the resolved node. Distinct oneOf branch from workspaceNode (which requires `name`, absent here).",
+      "properties": {
+        "repo": { "type": "string", "minLength": 1, "description": "Source repo holding the external workspace, e.g. `molecule-ai/molecule-dev-department`." },
+        "ref": { "type": "string", "minLength": 1, "description": "Pinned git ref (tag/branch/sha), e.g. `v1.0.0`." },
+        "path": { "type": "string", "minLength": 1, "description": "Path within `repo`@`ref` to the agent's `workspace.yaml`, e.g. `dev-lead/workspace.yaml`." }
+      }
+    },
+    "workspaceNode": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "description": "A single workspace (agent) node. Recursive via `children[]`. Fields derived from the inline nodes (gemini-growth-team) and the folder-tree workspace.yaml (molecule-dev/community-manager). `name` is the only field validate-org-template.py requires; `plugins` must be a list when present.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Workspace/agent name (required)." },
+        "role": { "type": "string", "description": "Free-text role description for the agent." },
+        "runtime": { "$ref": "#/$defs/runtimeId", "description": "Optional per-workspace runtime override (else inherits `defaults.runtime`). Canonical hyphen form." },
+        "tier": { "type": "integer", "minimum": 1, "maximum": 4, "description": "Optional per-workspace tier override." },
+        "model": { "type": "string", "description": "Optional per-workspace model override (e.g. `vertex:gemini-2.5-pro`)." },
+        "files_dir": { "type": "string", "description": "Directory under the template repo holding this agent's files (prompts, schedules)." },
+        "plugins": {
+          "type": "array",
+          "description": "Per-workspace plugins (UNIONed with defaults.plugins). Must be a list (validate-org-template.py enforces). Bare names or source-contract strings; prefix `!`/`-` to opt a default OUT.",
+          "items": { "type": "string", "description": "A plugin name or source-contract string (optionally `!`/`-` prefixed to opt out a default)." }
+        },
+        "channels": {
+          "type": "array",
+          "description": "External channel bindings (e.g. a Discord channel the agent owns).",
+          "items": { "$ref": "#/$defs/channel" }
+        },
+        "schedules": {
+          "type": "array",
+          "description": "Per-workspace schedule grid (same family as the workspace-template schedule shape).",
+          "items": { "$ref": "#/$defs/schedule" }
+        },
+        "initial_prompt": { "type": "string", "description": "Inline prompt run once on first boot (not on restart). Keep local — no A2A sends." },
+        "initial_prompt_file": { "type": "string", "description": "Path to the first-boot prompt file (alternative to inline `initial_prompt`)." },
+        "idle_prompt": { "type": "string", "description": "Inline idle-loop reflection prompt (self-sent while heartbeat.active_tasks == 0). Empty disables the idle loop." },
+        "idle_prompt_file": { "type": "string", "description": "Path to the idle-loop prompt file (alternative to inline `idle_prompt`)." },
+        "idle_interval_seconds": { "type": "integer", "description": "Idle-loop interval in seconds (ignored when idle prompt is empty)." },
+        "canvas": { "$ref": "#/$defs/canvas", "description": "Canvas placement coordinates for the org graph UI." },
+        "children": {
+          "type": "array",
+          "description": "Child workspace nodes (recursive). The tree depth/fan-out is unbounded (mock-bigorg nests deeply).",
+          "items": { "$ref": "#/$defs/workspaceNode" }
+        }
+      }
+    },
+    "runtimeId": {
+      "type": "string",
+      "description": "Canonical runtime identifier (hyphen form). Same SSOT enum as plugin-manifest.schema.json; underscore aliases accepted.",
+      "enum": [
+        "claude-code",
+        "codex",
+        "hermes",
+        "openclaw",
+        "langgraph",
+        "autogen",
+        "crewai",
+        "deepagents",
+        "gemini-cli",
+        "google-adk",
+        "external",
+        "claude_code",
+        "gemini_cli"
+      ]
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["type"],
+      "description": "A channel binding (e.g. Discord).",
+      "properties": {
+        "type": { "type": "string", "minLength": 1, "description": "Channel type (e.g. `discord`)." },
+        "config": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Channel-specific config (open object; e.g. `{ webhook_url: ${DISCORD_WEBHOOK_URL} }`)."
+        },
+        "enabled": { "type": "boolean", "description": "Whether the channel is enabled." }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name"],
+      "description": "A per-workspace schedule entry.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "description": "Schedule name." },
+        "cron_expr": { "type": "string", "description": "Cron expression (5-field)." },
+        "enabled": { "type": "boolean", "description": "Whether the schedule is enabled." },
+        "prompt": { "type": "string", "description": "Inline prompt run on the cron tick." },
+        "prompt_file": { "type": "string", "description": "Path to a prompt file run on the cron tick." }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Canvas placement coordinates.",
+      "properties": {
+        "x": { "type": "number", "description": "X coordinate." },
+        "y": { "type": "number", "description": "Y coordinate." }
+      }
+    }
+  }
+}

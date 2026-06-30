@@ -130,7 +130,7 @@ jobs:
       # Static-only validator — file existence checks, YAML parse,
       # AST inspection of adapter.py (no import). Doesn't execute
       # any third-party code; safe on fork PRs.
-      - run: pip install pyyaml -q
+      - run: pip install pyyaml jsonschema -q
       # Official-template SSOT enforcement is OPT-IN via a committed `.official`
       # marker in the template repo (dynamic — no hardcoded repo allowlist). When
       # present, the validator runs with --official so check_no_hardcoded_provider_model
@@ -190,7 +190,7 @@ jobs:
           # added a heavy dep like crewai.
           cache: "pip"
           cache-dependency-path: requirements.txt
-      - run: pip install pyyaml -q
+      - run: pip install pyyaml jsonschema -q
       # Install the template's runtime dependencies so the validator's
       # `check_adapter_runtime_load()` can import adapter.py the same way
       # the workspace container does at boot. Without this, a

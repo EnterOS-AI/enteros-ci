@@ -248,14 +248,19 @@ def test_string_template_schema_version_errors(validator, tmp_path, monkeypatch)
     assert any("template_schema_version must be int" in e for e in validator.ERRORS)
 
 
-def test_unknown_runtime_warns_not_errors(validator, tmp_path, monkeypatch):
+def test_unknown_runtime_errors(validator, tmp_path, monkeypatch):
+    """SSOT switch (molecule-core#3285): the canonical `runtime` enum now lives
+    in the molecule-contracts workspace-template schema, and validation runs
+    against that vendored schema. A runtime outside the enum is therefore a HARD
+    error (the schema is authoritative) — not the old soft warning. To add a new
+    runtime, widen the schema in molecule-contracts."""
     cfg = _good_config_yaml().replace("claude-code", "my-experimental-runtime")
     _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
                  requirements=_good_requirements_txt())
     monkeypatch.chdir(tmp_path)
     validator.check_config_yaml()
-    assert any("not in known set" in w for w in validator.WARNINGS)
-    assert validator.ERRORS == []  # custom runtimes are allowed
+    assert any("my-experimental-runtime" in e and "canonical runtime" in e
+               for e in validator.ERRORS), validator.ERRORS
 
 
 def test_unknown_top_level_keys_warn(validator, tmp_path, monkeypatch):
