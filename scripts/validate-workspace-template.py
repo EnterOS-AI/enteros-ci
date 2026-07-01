@@ -28,6 +28,13 @@ except ImportError:
 ERRORS: list[str] = []
 WARNINGS: list[str] = []
 
+# Accepted pip/distribution names for the shared workspace runtime. The current
+# name is `molecules-workspace-runtime`; the legacy `molecule-ai-workspace-runtime`
+# was renamed to close a dependency-confusion hole (the legacy name is squatted on
+# public PyPI) and is still accepted so not-yet-migrated templates keep passing
+# during the transition. The import package `molecule_runtime` is unchanged.
+_RUNTIME_DIST_NAMES = ("molecules-workspace-runtime", "molecule-ai-workspace-runtime")
+
 def err(msg: str) -> None:
     ERRORS.append(msg)
 
@@ -81,17 +88,31 @@ def check_dockerfile() -> None:
             "the previous runtime (cache trap observed 2026-04-27, 5x in a row)."
         )
 
-    if "molecule-ai-workspace-runtime" not in df and not (
-        os.path.isfile("requirements.txt")
-        and "molecule-ai-workspace-runtime" in open("requirements.txt").read()
+    # Accept either the current runtime dist name `molecules-workspace-runtime`
+    # or the legacy `molecule-ai-workspace-runtime`. The dist name was renamed to
+    # close a dependency-confusion hole (the legacy name is squatted on public
+    # PyPI); the legacy name is still accepted so templates that have not yet
+    # migrated keep passing during the transition. The import package
+    # `molecule_runtime` is unchanged. The two names are distinct substrings, so
+    # `any(... in ...)` matches whichever the template actually uses.
+    _reqs_for_runtime = (
+        open("requirements.txt").read() if os.path.isfile("requirements.txt") else ""
+    )
+    if not any(
+        (name in df) or (name in _reqs_for_runtime)
+        for name in _RUNTIME_DIST_NAMES
     ):
-        err("Dockerfile + requirements.txt: must install `molecule-ai-workspace-runtime`")
+        err(
+            "Dockerfile + requirements.txt: must install the runtime dist "
+            "`molecules-workspace-runtime` (legacy `molecule-ai-workspace-runtime` "
+            "still accepted)"
+        )
 
     if "${RUNTIME_VERSION}" not in df and "$RUNTIME_VERSION" not in df:
         err(
             "Dockerfile: must reference `${RUNTIME_VERSION}` in a pip install RUN block. "
             'Pattern: `if [ -n "${RUNTIME_VERSION}" ]; then '
-            'pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; fi`'
+            'pip install --no-cache-dir --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; fi`'
         )
 
     if not re.search(r"useradd[^\n]*\bagent\b", df):
@@ -289,8 +310,11 @@ def check_requirements() -> None:
         warn("no requirements.txt — Dockerfile must install runtime by other means")
         return
     reqs = open("requirements.txt").read()
-    if "molecule-ai-workspace-runtime" not in reqs:
-        err("requirements.txt: must declare `molecule-ai-workspace-runtime` as a dependency")
+    if not any(name in reqs for name in _RUNTIME_DIST_NAMES):
+        err(
+            "requirements.txt: must declare `molecules-workspace-runtime` "
+            "(legacy `molecule-ai-workspace-runtime` still accepted) as a dependency"
+        )
 
 
 # ───────────────────────────────────────────────────────────── adapter.py
