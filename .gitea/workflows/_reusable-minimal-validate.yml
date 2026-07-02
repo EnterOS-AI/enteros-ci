@@ -1,0 +1,227 @@
+# _reusable-minimal-validate — shared baseline-hygiene gate for satellite /
+# channel / misc repos (the ones that don't carry a full plugin/template
+# contract). Call it from a consumer repo with:
+#
+#   jobs:
+#     minimal-validate:
+#       uses: molecule-ai/molecule-ci/.gitea/workflows/_reusable-minimal-validate.yml@main
+#       permissions:
+#         contents: write   # Gitea: the ephemeral token needs repo write to post
+#         statuses: write   # a commit status; contents:write is what unlocks it
+#                           # here (statuses:write alone is a no-op on this Gitea),
+#                           # statuses:write keeps it portable to GitHub.
+#
+# What it asserts (MEANINGFUL — it fails a genuinely-broken repo, and is quiet
+# on a healthy one; build/vendor/fixture dirs are skipped so intentionally
+# malformed test fixtures never cause a false red):
+#   1. every *.yml / *.yaml parses as YAML (all documents)
+#   2. every *.json parses as JSON  (tsconfig*/*.jsonc/devcontainer tolerated)
+#   3. every *.toml parses          (pyproject / bunfig / railway, via tomllib)
+#   4. a README exists at the repo root
+#   5. if a plugin / manifest file is present it parses AND declares a
+#      non-empty string `name` (light schema assertion)
+#
+# It posts a stable commit-status context ("minimal-validate" by default) on the
+# head commit so branch protection / the PR checks tab can gate on it, and the
+# job itself also exits non-zero on failure (belt-and-suspenders — the gate does
+# not silently pass if the status API call is unavailable).
+
+name: reusable-minimal-validate
+
+on:
+  workflow_call:
+    inputs:
+      context_name:
+        description: "Commit-status context to post on the head commit."
+        required: false
+        type: string
+        default: "minimal-validate"
+      readme_required:
+        description: "Fail if no README exists at the repo root."
+        required: false
+        type: boolean
+        default: true
+
+# contents:write is required for the ephemeral github.token to create a commit
+# status on this Gitea (statuses:write alone returns 403 here); statuses:write is
+# also declared so the same workflow is portable to GitHub. The token is only
+# used to POST the status — this workflow never writes repo contents.
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  minimal-validate:
+    name: minimal-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.11"
+      - name: Install parser deps
+        run: pip install pyyaml -q
+
+      - name: Run minimal-validate
+        id: validate
+        continue-on-error: true
+        env:
+          README_REQUIRED: ${{ inputs.readme_required }}
+        run: |
+          python3 - "$GITHUB_WORKSPACE" << 'PYEOF'
+          import json, os, re, sys
+          from pathlib import Path
+          try:
+              import yaml
+          except ImportError:
+              print("::error::pyyaml not installed"); sys.exit(3)
+          try:
+              import tomllib  # py3.11+
+          except ImportError:
+              tomllib = None
+
+          SKIP_DIRS = {
+              ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env",
+              "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+              "dist", "build", "target", ".next", ".turbo", ".cache", "coverage",
+              "htmlcov", ".molecule-ci", ".molecule-ci-canonical", "vendor",
+              "fixtures", "testdata", "test-data", "__fixtures__", "__snapshots__",
+              ".gradle", ".idea", ".vscode-test", "site-packages",
+          }
+          README_NAMES = {"readme", "readme.md", "readme.rst", "readme.txt", "readme.markdown"}
+          JSONC_HINTS = re.compile(r"(^|/)(tsconfig[^/]*\.json|devcontainer\.json|.*\.jsonc)$", re.I)
+
+          readme_required = os.environ.get("README_REQUIRED", "true").strip().lower() != "false"
+          errors, warnings = [], []
+          checked = {"yaml": 0, "json": 0, "toml": 0, "manifest": 0}
+
+          def strip_jsonc(t):
+              t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+              t = re.sub(r"(^|\s)//[^\n]*", r"\1", t)
+              t = re.sub(r",(\s*[}\]])", r"\1", t)
+              return t
+
+          def rel(root, p):
+              try: return str(p.relative_to(root))
+              except ValueError: return str(p)
+
+          root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+          for dirpath, dirnames, filenames in os.walk(root):
+              # Skip only exact SKIP_DIRS. Do NOT blanket-skip dotdirs: .gitea /
+              # .github (workflow YAMLs), .claude-plugin (plugin.json) and
+              # .devcontainer are exactly the config we most want to validate.
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for fn in filenames:
+                  p = Path(dirpath) / fn
+                  suf = p.suffix.lower()
+                  r = rel(root, p)
+                  if suf in (".yml", ".yaml"):
+                      checked["yaml"] += 1
+                      try:
+                          with open(p, "rb") as f:
+                              list(yaml.safe_load_all(f))
+                      except yaml.YAMLError as e:
+                          errors.append(f"YAML parse error: {r}: {str(e).splitlines()[0]}")
+                  elif suf == ".json":
+                      checked["json"] += 1
+                      raw = p.read_text(encoding="utf-8", errors="replace")
+                      try:
+                          json.loads(raw)
+                      except json.JSONDecodeError as e:
+                          if JSONC_HINTS.search(r.replace(os.sep, "/")):
+                              try:
+                                  json.loads(strip_jsonc(raw))
+                                  warnings.append(f"JSONC tolerated (comments/trailing commas): {r}")
+                              except json.JSONDecodeError as e2:
+                                  warnings.append(f"JSONC still unparseable, not failing: {r}: {e2}")
+                          else:
+                              errors.append(f"JSON parse error: {r}: {e}")
+                  elif suf == ".toml" and tomllib is not None:
+                      checked["toml"] += 1
+                      try:
+                          with open(p, "rb") as f:
+                              tomllib.load(f)
+                      except Exception as e:
+                          errors.append(f"TOML parse error: {r}: {str(e).splitlines()[0]}")
+
+          root_files = {c.name.lower() for c in root.iterdir() if c.is_file()}
+          if readme_required and not (root_files & README_NAMES):
+              errors.append("No README at repo root (expected README.md / README.rst / README.txt / README)")
+
+          candidates = []
+          for cand in ("plugin.yaml", "plugin.yml", "plugin.json",
+                       "manifest.yaml", "manifest.yml", "manifest.json"):
+              pp = root / cand
+              if pp.is_file():
+                  candidates.append(pp)
+          cp = root / ".claude-plugin" / "plugin.json"
+          if cp.is_file():
+              candidates.append(cp)
+          for mp in candidates:
+              checked["manifest"] += 1
+              r = rel(root, mp)
+              try:
+                  if mp.suffix.lower() == ".json":
+                      obj = json.loads(mp.read_text(encoding="utf-8", errors="replace"))
+                  else:
+                      obj = yaml.safe_load(mp.read_bytes())
+              except Exception as e:
+                  errors.append(f"Manifest unparseable: {r}: {str(e).splitlines()[0]}")
+                  continue
+              if not isinstance(obj, dict):
+                  errors.append(f"Manifest is not a mapping/object: {r}")
+                  continue
+              name = obj.get("name")
+              if not (isinstance(name, str) and name.strip()):
+                  errors.append(f"Manifest missing non-empty string 'name': {r}")
+
+          print(f"minimal-validate: checked yaml={checked['yaml']} json={checked['json']} "
+                f"toml={checked['toml']} manifest={checked['manifest']}")
+          for w in warnings:
+              print(f"  ::warning:: {w}")
+          if errors:
+              for e in errors:
+                  print(f"  ::error:: {e}")
+              print(f"minimal-validate FAILED with {len(errors)} problem(s).")
+              sys.exit(1)
+          print("minimal-validate PASSED.")
+          PYEOF
+
+      - name: Post commit status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CTX: ${{ inputs.context_name }}
+          OUTCOME: ${{ steps.validate.outcome }}
+        run: |
+          API="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ "$OUTCOME" = "success" ]; then
+            STATE=success; DESC="baseline hygiene OK"
+          else
+            STATE=failure; DESC="baseline hygiene failed"
+          fi
+          BODY=$(printf '{"state":"%s","context":"%s","description":"%s","target_url":"%s"}' \
+            "$STATE" "$CTX" "$DESC" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          code=$(curl -s -o /tmp/minival_status.json -w '%{http_code}' -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$API/repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -d "$BODY")
+          echo "commit-status POST ($CTX=$STATE) -> HTTP $code"
+          cat /tmp/minival_status.json 2>/dev/null || true
+          echo
+          if [ "$code" -ge 300 ]; then
+            echo "::warning::could not post '$CTX' commit status (HTTP $code); job conclusion still enforces the result"
+          fi
+
+      - name: Enforce result
+        if: always()
+        run: |
+          if [ "${{ steps.validate.outcome }}" != "success" ]; then
+            echo "::error::minimal-validate failed — see the 'Run minimal-validate' step log"
+            exit 1
+          fi
+          echo "minimal-validate passed"
