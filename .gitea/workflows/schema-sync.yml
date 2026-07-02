@@ -1,10 +1,10 @@
 # schema-sync — keep the vendored marketplace-artifact JSON-Schemas in
-# schemas/ byte-identical to their molecule-contracts SSOT originals.
+# schemas/ byte-identical to their molecule-ai-sdk (contracts/) SSOT originals.
 #
 # The validate-plugin / validate-workspace-template / validate-org-template
 # scripts now validate real artifact manifests against schemas/*.schema.json
-# (vendored from molecule-contracts). This gate re-fetches each schema from
-# molecule-contracts main and diffs it against the vendored copy, failing the
+# (vendored from molecule-ai-sdk contracts/). This gate re-fetches each schema from
+# molecule-ai-sdk (contracts/) main and diffs it against the vendored copy, failing the
 # build on drift. Mirrors molecule-ai-workspace-runtime#196's vendored-schema
 # drift gate. See schemas/PROVENANCE.md.
 #
@@ -42,7 +42,7 @@ jobs:
           # rc 2 = fetch could not complete (network/infra). Soft-skip so a
           # transient git.* stall isn't a false red; rc 1 (real drift) fails.
           if [ "$rc" -eq 2 ]; then
-            echo "::warning::schema-sync soft-skipped (could not fetch contracts main)."
+            echo "::warning::schema-sync soft-skipped (could not fetch molecule-ai-sdk contracts main)."
             exit 0
           fi
           exit "$rc"

@@ -1,17 +1,19 @@
 # Vendored marketplace-artifact JSON-Schemas (SSOT mirror)
 
 These `*.schema.json` files are **byte-for-byte copies** of the SSOT contract
-schemas that live in the [`molecule-contracts`](https://git.moleculesai.app/molecule-ai/molecule-contracts)
+schemas that live in the [`molecule-ai-sdk (contracts/)`](https://git.moleculesai.app/molecule-ai/molecule-ai-sdk)
 repository (the marketplace-catalog contract family, RFC
 [molecule-core#3285](https://git.moleculesai.app/molecule-ai/molecule-core/issues/3285)).
 
-| Vendored copy | Source path in `molecule-contracts` | Source commit |
+| Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `plugin-manifest/plugin-manifest.schema.json`       | `afa509bfbbfb7a1169662a52f72708239f9d80ed` |
-| `workspace-template.schema.json` | `workspace-template/workspace-template.schema.json` | `afa509bfbbfb7a1169662a52f72708239f9d80ed` |
-| `org-template.schema.json`       | `org-template/org-template.schema.json`             | `cef11de620ab010928dd057a101338798e11ebe5` |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
+| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
 
-`molecule-contracts` main at vendoring time: `057c7b3ba5499c99fb3f767d755bb61fa4fd62bd`.
+`molecule-ai-sdk` main at repoint time: `8aedf2bc8f820d79de8534e07e0d482ac1c43f4e`. (Source commits above are
+`molecule-ai-sdk` history — the contracts were folded in from the retired
+`molecule-contracts` repo, whose pre-fold history is preserved there read-only.)
 
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 
@@ -22,28 +24,32 @@ IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 (`plugin.yaml` / `config.yaml` / `org.yaml`) against these schemas with
 `jsonschema`'s `Draft202012Validator`. The validators run inside each artifact
 repo's CI **offline** (anonymous `git clone` of `molecule-ci` only — no
-authenticated cross-repo fetch of `molecule-contracts`), so the schemas are
+authenticated cross-repo fetch of `molecule-ai-sdk (contracts/)`), so the schemas are
 vendored here rather than pulled at validate time.
 
 These copies are the **SSOT mirror, not a fork**. They MUST stay byte-identical
-to the `molecule-contracts` originals. Two things keep them honest:
+to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
 
 1. `scripts/check-schemas-in-sync.sh` re-fetches each schema from
-   `molecule-contracts` **main** and `diff`s it against the vendored copy,
+   `molecule-ai-sdk (contracts/)` **main** and `diff`s it against the vendored copy,
    failing if they have drifted. It runs in CI via
    `.gitea/workflows/schema-sync.yml`.
-2. The `$id` inside each schema points at the canonical `molecule-contracts`
-   URL — a tripwire against silent edits.
+2. The `$id` inside each schema still carries the URL of the retired
+   `molecule-contracts` repo — inherited byte-for-byte from the fold-in
+   (molecule-ai-sdk deliberately did not rewrite it, and this mirror must
+   stay byte-identical to the SSOT, so it is NOT rewritten here either).
+   If the SSOT ever updates the `$id`s, the byte-diff gate above goes red
+   until this mirror is re-vendored — that is the intended tripwire.
 
 ## How to update
 
 When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
-# from a molecule-ci checkout, with molecule-contracts main cloned alongside
+# from a molecule-ci checkout, with molecule-ai-sdk (contracts/) main cloned alongside
 for s in plugin-manifest workspace-template org-template; do
   curl -fsS -A "curl/8.4.0" \
-    "https://git.moleculesai.app/molecule-ai/molecule-contracts/raw/branch/main/$s/$s.schema.json" \
+    "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/$s/$s.schema.json" \
     -o "schemas/$s.schema.json"
 done
 # then bump the source-commit SHAs in the table above
@@ -51,5 +57,5 @@ bash scripts/check-schemas-in-sync.sh   # must pass
 ```
 
 If re-vendoring would make a currently-conforming artifact fail, that is a
-**schema gap** — widen the schema in `molecule-contracts` first (open a PR
+**schema gap** — widen the schema in `molecule-ai-sdk (contracts/)` first (open a PR
 there), then re-vendor. NEVER loosen the validator to paper over it.
