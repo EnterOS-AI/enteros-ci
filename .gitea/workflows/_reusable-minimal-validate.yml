@@ -61,7 +61,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install parser deps
-        run: pip install pyyaml -q
+        run: pip install --break-system-packages pyyaml -q
 
       - name: Run minimal-validate
         id: validate
