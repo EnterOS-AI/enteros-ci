@@ -150,7 +150,10 @@ jobs:
 
           RUNTIME_MODULES=""
           mkdir -p /tmp/runtime-wheel
-          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
+          # HERMETIC + no dependency-confusion: pin the private index (--index-url) and
+          # the CURRENT dist name; the legacy molecule-ai-workspace-runtime is
+          # squatted on public PyPI (0.1.999999). --no-deps ⇒ private-only is safe.
+          if pip download --quiet --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecules-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
             WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
             if [ -n "$WHEEL" ]; then
               # Pull both top_level + subpackage names; both can be bare-imported.
@@ -160,7 +163,7 @@ jobs:
           fi
 
           if [ -n "$RUNTIME_MODULES" ]; then
-            echo "::notice::lint module list pulled from molecule-ai-workspace-runtime wheel manifest"
+            echo "::notice::lint module list pulled from molecules-workspace-runtime wheel manifest"
           else
             RUNTIME_MODULES="$FALLBACK_MODULES"
             echo "::warning::could not read _runtime_modules.json from PyPI wheel — using inline fallback list"
@@ -321,7 +324,7 @@ jobs:
           HAS_SMOKE_MODE=$(docker run --rm --entrypoint sh "${IMAGE}" -c \
             'python3 -c "import molecule_runtime.smoke_mode" >/dev/null 2>&1 && echo yes || echo no')
           if [ "${HAS_SMOKE_MODE}" = "no" ]; then
-            echo "::warning::installed runtime predates molecule-core#2275 (no molecule_runtime.smoke_mode); skipping boot smoke. Bump requirements.txt to molecule-ai-workspace-runtime>=0.1.60 to enable."
+            echo "::warning::installed runtime predates molecule-core#2275 (no molecule_runtime.smoke_mode); skipping boot smoke. Bump requirements.txt to molecules-workspace-runtime>=0.3.70 to enable."
             exit 0
           fi
 
