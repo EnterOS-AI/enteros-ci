@@ -73,6 +73,18 @@ on:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # REGISTRY SSOT SEAM — the image prefix derives from the container-registry
+  # SSOT (molecule-ai-sdk contracts/registry.yaml) via the org/repo Actions
+  # variable MOLECULE_REGISTRY. The literal fallback is the current ECR prefix
+  # (== "${ECR_REGISTRY}/molecule-ai"), so an UNSET var is byte-identical to
+  # prior behavior. Switching registries (ECR <-> our registry <-> GHCR) is a
+  # ONE-LINE change: set the org var MOLECULE_REGISTRY to the new prefix. NOTE:
+  # pointing it at a NON-ECR host also needs the docker-login step swapped from
+  # aws-ecr-login to that registry's auth (the SSOT `registry.auth` shape) —
+  # tracked as the auth follow-up; this seam parameterizes the HOST only.
+  REGISTRY_PREFIX: ${{ vars.MOLECULE_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai' }}
+  # ECR host for the aws-ecr-login + describe/create-repository steps (the ECR
+  # auth path). Load-bearing only while REGISTRY_PREFIX resolves to an ECR host.
   ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
   AWS_DEFAULT_REGION: us-east-2
 
@@ -111,7 +123,7 @@ jobs:
                 ;;
             esac
           fi
-          IMAGE="${ECR_REGISTRY}/molecule-ai/workspace-template-${RUNTIME}"
+          IMAGE="${REGISTRY_PREFIX}/workspace-template-${RUNTIME}"
           SHA="${GITHUB_SHA::7}"
           echo "runtime=${RUNTIME}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}"     >> "$GITHUB_OUTPUT"
