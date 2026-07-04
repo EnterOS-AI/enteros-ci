@@ -523,3 +523,71 @@ def test_invalid_mode_fails_closed(envset, monkeypatch, capsys):
     _stub_api(monkeypatch, m, ("ok", {"status_check_contexts": []}))
     rc = m.run()
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# GLOB semantics — Gitea matches status_check_contexts entries as globs.
+# The `*` wildcard ("require every posted check" gate model,
+# status_check_contexts=['*']) is satisfied by ANY emitter it matches and can
+# NEVER be a phantom perma-pending context, so it must NOT be flagged as an
+# orphan. Regression for the molecule-ci drift-gate going red on BP=['*'].
+# ---------------------------------------------------------------------------
+def test_bp_wildcard_star_satisfied_by_any_emitter(envset, monkeypatch, capsys):
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    m = _import_lint()
+    _stub_api(monkeypatch, m, ("ok", {"status_check_contexts": ["*"]}))
+    rc = m.run()
+    assert rc == 0
+
+
+def test_assert_mode_wildcard_star_exits_0(envset, monkeypatch, capsys):
+    """The `*` wildcard must be clean in MODE=assert (the PR-time gate) too."""
+    monkeypatch.setenv("MODE", "assert")
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    m = _import_lint()
+    _stub_api(monkeypatch, m, ("ok", {"status_check_contexts": ["*"]}))
+    rc = m.run()
+    assert rc == 0
+
+
+def test_bp_prefix_glob_matches_emitter(envset, monkeypatch, capsys):
+    """A partial glob like `CI / *` is satisfied by any matching emitter."""
+    _write_wf(
+        envset,
+        "ci.yml",
+        "name: CI\non:\n  pull_request:\n    branches: [main]\njobs:\n"
+        "  all-required:\n    runs-on: x\n    steps:\n      - run: echo hi\n",
+    )
+    m = _import_lint()
+    _stub_api(
+        monkeypatch,
+        m,
+        ("ok", {"status_check_contexts": ["CI / * (pull_request)"]}),
+    )
+    rc = m.run()
+    assert rc == 0
+
+
+def test_bp_wildcard_star_still_orphan_when_no_emitter(envset, monkeypatch, capsys):
+    """A `*` wildcard with NOTHING emitted has nothing to match -> orphan.
+
+    Guards against the glob path turning into an unconditional fail-open: if a
+    repo has zero emitters, even `*` is unsatisfied and must be flagged.
+    """
+    monkeypatch.setenv("MODE", "assert")
+    # Workflows dir exists but contains no context-emitting workflow.
+    _write_wf(envset, "empty.yml", "name: Empty\non: {}\njobs: {}\n")
+    m = _import_lint()
+    _stub_api(monkeypatch, m, ("ok", {"status_check_contexts": ["*"]}))
+    rc = m.run()
+    assert rc == 1

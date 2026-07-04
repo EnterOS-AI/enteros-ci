@@ -85,6 +85,7 @@ Memory cross-links
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -271,6 +272,33 @@ def parse_context(ctx: str) -> tuple[str, str, str] | None:
     if not m:
         return None
     return (m.group("workflow"), m.group("job"), m.group("event"))
+
+
+def _is_glob(pattern: str) -> bool:
+    """True if a BP status_check_contexts entry uses glob metacharacters.
+
+    Gitea matches `status_check_contexts` entries as globs (gobwas/glob), so
+    entries containing `*`, `?`, `[` or `{` are PATTERNS, not literal context
+    names. Normal context names (`Workflow / Job (event)`) carry none of these,
+    so they are treated as literals — preserving exact-match phantom detection.
+    """
+    return any(ch in pattern for ch in "*?[{")
+
+
+def _pattern_matches(pattern: str, ctx: str) -> bool:
+    """Does a BP-required entry `pattern` match an emitted context `ctx`?
+
+    Literal entries (no glob metachars) match by exact equality — this keeps
+    the phantom-required-check detection for named contexts unchanged. Glob
+    entries match via `fnmatch`, mirroring Gitea's glob semantics. In
+    particular the `*` wildcard (the "require every posted check" gate model,
+    `status_check_contexts: ['*']`) is satisfied by ANY emitter it matches and
+    can NEVER be a phantom perma-pending context, so it must not be flagged as
+    an orphan.
+    """
+    if _is_glob(pattern):
+        return fnmatch.fnmatchcase(ctx, pattern)
+    return pattern == ctx
 
 
 def _iter_workflow_files(wf_dir: Path) -> list[Path]:
@@ -509,11 +537,28 @@ def run() -> int:
     bp_set = set(bp_contexts)
 
     # 3. Find orphans (BP-side: required but no emitter).
-    bp_orphans = sorted(bp_set - all_emitter)
+    #
+    # Glob-aware (Gitea matches status_check_contexts as globs). A literal
+    # (non-glob) entry is an orphan iff no emitter equals it — the
+    # phantom-required-check case. A glob entry — notably the `*` wildcard used
+    # by the "require every posted check" gate model — is satisfied by ANY
+    # emitter it matches and therefore can never be a phantom perma-pending
+    # context; it is an orphan only if NOTHING it could match is emitted.
+    bp_orphans = sorted(
+        ctx
+        for ctx in bp_set
+        if not any(_pattern_matches(ctx, e) for e in all_emitter)
+    )
 
-    # Informational: workflow emits but BP doesn't list. Tier 2g
-    # territory at PR-time. We list these as NOTICE only.
-    emitter_orphans = sorted(all_emitter - bp_set)
+    # Informational: workflow emits but BP doesn't cover it. Tier 2g
+    # territory at PR-time. We list these as NOTICE only. An emitter is
+    # "not in BP" only when NO BP entry (literal or glob) matches it — so a
+    # `*` wildcard BP covers every emitter and this list is empty.
+    emitter_orphans = sorted(
+        e
+        for e in all_emitter
+        if not any(_pattern_matches(ctx, e) for ctx in bp_set)
+    )
 
     if bp_orphans:
         print(
