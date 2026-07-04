@@ -66,11 +66,29 @@ jobs:
       # DRIFT_BOT_TOKEN from the Infisical SSOT via the CI machine identity
       # instead of the duplicated Gitea Actions secret. This is the last stray
       # consumer of the Gitea DRIFT_BOT_TOKEN secret; once this lands the Gitea
-      # secret can be retired (validate-before-delete). The value is exported to
-      # $GITHUB_ENV so the asserter step below reads it as an ordinary masked
-      # env var (GITEA_TOKEN, the name the script already consumes).
-      - name: Fetch DRIFT_BOT_TOKEN from Infisical SSOT
-        id: drift_bot_token
+      # secret can be retired (validate-before-delete).
+      #
+      # act masked-secret-substitution fix (root cause a542ba98):
+      #   The token is fetched AND the asserter is run IN THIS SAME step, and
+      #   the token is handed to the script as a DIRECT process env var
+      #   (`GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 ...`). It is NEVER written to
+      #   $GITHUB_ENV and NEVER re-read through a `${{ env.* }}` expression.
+      #
+      #   The previous shape fetched the token in one step, `::add-mask::`-ed
+      #   it, wrote it to $GITHUB_ENV, and a SECOND step re-read it via
+      #   `GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}`. Under `act` (the runner) a
+      #   masked value read back through a `${{ }}` expression is substituted
+      #   with the literal mask `***`, so the script sent
+      #   `Authorization: token ***` -> Gitea 401/403 reqToken -> the gate went
+      #   red even though the token and the mc-drift-bot repo-admin grant were
+      #   both valid. Keeping the token in-process (shell var -> direct env on
+      #   the python invocation) never evaluates it through `${{ }}`, so it
+      #   stays intact. `::add-mask::` is retained purely for log hygiene -- it
+      #   was the $GITHUB_ENV round-trip, not the mask itself, that corrupted
+      #   the value. Same "flaky == a deterministic bug" class as our other
+      #   act-substitution fixes.
+      - name: Assert BP-required contexts are all emitted (token fetched in-step)
+        id: bp_drift_assert
         # TRUSTED-REF GATE: only the Infisical CI-identity login runs on trusted
         # refs so an untrusted fork PR cannot trigger it and harvest
         # INFISICAL_CI_*. workflow_dispatch is collaborator-only on Gitea; a
@@ -81,6 +99,14 @@ jobs:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
           INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          # GITEA_TOKEN is intentionally NOT set here: it is passed as a direct
+          # process env var on the python invocation below so the masked secret
+          # never round-trips through $GITHUB_ENV / a `${{ }}` expression.
+          GITEA_HOST: git.moleculesai.app
+          REPO: ${{ github.repository }}
+          BRANCH: main
+          WORKFLOWS_DIR: .gitea/workflows
+          MODE: assert
         run: |
           set -uo pipefail
           BASE="https://key.moleculesai.app"
@@ -103,20 +129,8 @@ jobs:
             echo "Infisical returned empty for DRIFT_BOT_TOKEN at /shared/drift-bot (prod) -- failing closed" >&2
             exit 1
           fi
-          echo "DRIFT_BOT_TOKEN=$DRIFT_BOT_TOKEN" >> "$GITHUB_ENV"
           echo "DRIFT_BOT_TOKEN loaded from Infisical (len=${#DRIFT_BOT_TOKEN})"
-      - name: Assert BP-required contexts are all emitted
-        env:
-          # DRIFT_BOT_TOKEN: read-only repo-admin token, used only for the
-          # branch_protections GET. Sourced from the Infisical SSOT by the
-          # "Fetch DRIFT_BOT_TOKEN from Infisical SSOT" step above (KMS
-          # migration) and arrives here via $GITHUB_ENV. If the fetch failed
-          # (empty/404/auth) the prior step already exited nonzero, so this
-          # advisory job's script never silently runs unauthenticated.
-          GITEA_TOKEN: ${{ env.DRIFT_BOT_TOKEN }}
-          GITEA_HOST: git.moleculesai.app
-          REPO: ${{ github.repository }}
-          BRANCH: main
-          WORKFLOWS_DIR: .gitea/workflows
-          MODE: assert
-        run: python3 .molecule-ci/scripts/lint_bp_context_emit_match.py
+          # Hand the token to the asserter as a DIRECT process env var. This is
+          # the fix: it is never written to $GITHUB_ENV and never re-read via a
+          # `${{ env.* }}` expression, so `act` cannot substitute it with `***`.
+          GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 .molecule-ci/scripts/lint_bp_context_emit_match.py
