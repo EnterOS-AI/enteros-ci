@@ -130,7 +130,7 @@ jobs:
       # Static-only validator — file existence checks, YAML parse,
       # AST inspection of adapter.py (no import). Doesn't execute
       # any third-party code; safe on fork PRs.
-      - run: pip install pyyaml jsonschema -q
+      - run: pip install --break-system-packages pyyaml jsonschema -q
       # Official-template SSOT enforcement is OPT-IN via a committed `.official`
       # marker in the template repo (dynamic — no hardcoded repo allowlist). When
       # present, the validator runs with --official so check_no_hardcoded_provider_model
@@ -190,7 +190,7 @@ jobs:
           # added a heavy dep like crewai.
           cache: "pip"
           cache-dependency-path: requirements.txt
-      - run: pip install pyyaml jsonschema -q
+      - run: pip install --break-system-packages pyyaml jsonschema -q
       # Install the template's runtime dependencies so the validator's
       # `check_adapter_runtime_load()` can import adapter.py the same way
       # the workspace container does at boot. Without this, a
@@ -199,9 +199,15 @@ jobs:
       # The fallback (no requirements.txt) installs the runtime alone so
       # BaseAdapter is at least importable for the class-discovery check.
       - if: hashFiles('requirements.txt') != ''
-        run: pip install -q -r requirements.txt
+        # HERMETIC: molecules-workspace-runtime is private-only (absent from
+        # public PyPI → no dependency-confusion); its public deps resolve from
+        # the default index. Private index added as EXTRA (not PIP_INDEX_URL).
+        run: pip install --break-system-packages -q --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
-        run: pip install -q molecule-ai-workspace-runtime
+        # HERMETIC + no dependency-confusion: install the CURRENT dist name
+        # molecules-workspace-runtime from the private index (the legacy name
+        # molecule-ai-workspace-runtime is squatted on public PyPI at 0.1.999999).
+        run: pip install --break-system-packages -q --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecules-workspace-runtime
       # Same opt-in `.official` SSOT-enforcement detection as the static job
       # (separate job → its own detection step).
       - name: Detect official-template SSOT enforcement

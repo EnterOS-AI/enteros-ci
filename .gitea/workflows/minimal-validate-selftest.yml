@@ -1,0 +1,35 @@
+# Self-test for the reusable _reusable-minimal-validate workflow.
+#
+# Calls the reusable against molecule-ci itself (which carries valid workflow
+# YAMLs + JSON schemas + a README) so a green run proves BOTH that the reusable
+# still loads/parses and that its baseline check passes on a healthy repo. It
+# also posts the stable "minimal-validate" commit-status context, letting us
+# confirm the context name/state end-to-end.
+#
+# Additive + path-filtered: only spends a runner when the reusable or this
+# self-test changes. Does not modify the repo's existing ci.yml.
+
+name: minimal-validate-selftest
+
+on:
+  pull_request:
+    paths:
+      - ".gitea/workflows/_reusable-minimal-validate.yml"
+      - ".gitea/workflows/minimal-validate-selftest.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".gitea/workflows/_reusable-minimal-validate.yml"
+      - ".gitea/workflows/minimal-validate-selftest.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  selftest:
+    uses: ./.gitea/workflows/_reusable-minimal-validate.yml
+    permissions:
+      contents: write
+      statuses: write

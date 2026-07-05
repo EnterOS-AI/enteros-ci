@@ -87,7 +87,7 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/requirements.txt
       - name: Install test deps
-        run: pip install -r scripts/requirements.txt -q
+        run: pip install --break-system-packages -r scripts/requirements.txt -q
       - name: Run validator test suites
         # The scripts/test_*.py suites pin the drift contract for the
         # validate-*/migrate-template validators and runners-restart-safe.sh.
@@ -112,5 +112,5 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: scripts/requirements.txt
-      - run: pip install pyyaml -q
+      - run: pip install --break-system-packages pyyaml -q
       - run: python3 scripts/check-secrets.py

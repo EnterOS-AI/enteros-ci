@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-template/workspace-template.schema.json",
   "title": "Marketplace Workspace-Template Contract",
-  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace workspace-template artifact — the publishable shape of a workspace-template `config.yaml` (molecule-ai-workspace-template-* repos). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-workspace-template-claude-code/config.yaml, google-adk, seo-agent, platform-agent, validated by validate-workspace-template.py (required: name, runtime, template_schema_version; runtime warns if outside the known set {langgraph, claude-code, crewai, autogen, deepagents, hermes, gemini-cli, openclaw}). DELIBERATELY TOLERANT (additionalProperties:true at the top and on nested objects): the real configs are SHAPE-INCONSISTENT about where the model lives — google-adk has top-level `models[]` + `runtime_config.model`; claude-code/seo-agent have `runtime_config.models[]` + top-level `model`; platform-agent has top-level `provider`; some have none. This schema models every observed location WITHOUT forcing one, so a real config in any of those styles validates. The two `providers` shapes are also inconsistent and are typed separately by path: top-level `providers[]` is a list of provider OBJECTS (name/auth_mode/model_prefixes/...); `runtime_config.providers[]` is a list of provider-name STRINGS. `runtime` uses the CANONICAL hyphen form (see plugin-manifest.schema.json for the runtimes SSOT reconciliation).",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace workspace-template artifact — the publishable shape of a workspace-template `config.yaml` (molecule-ai-workspace-template-* repos). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-workspace-template-claude-code/config.yaml, google-adk, seo-agent, platform-agent, validated by validate-workspace-template.py (required: name, runtime, template_schema_version; runtime warns if outside the known set {claude-code, codex, crewai, google-adk, hermes, openclaw}). DELIBERATELY TOLERANT (additionalProperties:true at the top and on nested objects): the real configs are SHAPE-INCONSISTENT about where the model lives — google-adk has top-level `models[]` + `runtime_config.model`; claude-code/seo-agent have `runtime_config.models[]` + top-level `model`; platform-agent has top-level `provider`; some have none. This schema models every observed location WITHOUT forcing one, so a real config in any of those styles validates. The two `providers` shapes are also inconsistent and are typed separately by path: top-level `providers[]` is a list of provider OBJECTS (name/auth_mode/model_prefixes/...); `runtime_config.providers[]` is a list of provider-name STRINGS. `runtime` uses the CANONICAL hyphen form (see plugin-manifest.schema.json for the runtimes SSOT reconciliation).",
   "type": "object",
   "additionalProperties": true,
   "required": ["name", "runtime", "template_schema_version"],
@@ -22,7 +22,7 @@
     },
     "models": {
       "type": "array",
-      "description": "Top-level `models[]` — the authoritative servability list for langgraph/google-adk-style runtimes (google-adk). The registry projection is a subset of this.",
+      "description": "Top-level `models[]` — the authoritative servability list for google-adk-style runtimes (google-adk). The registry projection is a subset of this.",
       "items": { "$ref": "#/$defs/model" }
     },
     "prompt_files": {
@@ -92,15 +92,10 @@
         "codex",
         "hermes",
         "openclaw",
-        "langgraph",
-        "autogen",
         "crewai",
-        "deepagents",
-        "gemini-cli",
         "google-adk",
         "external",
-        "claude_code",
-        "gemini_cli"
+        "claude_code"
       ]
     },
     "provider": {
