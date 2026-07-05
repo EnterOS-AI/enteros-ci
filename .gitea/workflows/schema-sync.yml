@@ -28,12 +28,12 @@ permissions:
 
 jobs:
   schema-sync:
-    name: Vendored schemas in sync with molecule-contracts
+    name: Vendored schemas in sync with molecule-ai-sdk
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
-      - name: Check vendored schemas against molecule-contracts main
+      - name: Check vendored schemas against molecule-ai-sdk (contracts/) main
         run: |
           set +e
           bash scripts/check-schemas-in-sync.sh

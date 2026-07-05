@@ -105,15 +105,10 @@
         "codex",
         "hermes",
         "openclaw",
-        "langgraph",
-        "autogen",
         "crewai",
-        "deepagents",
-        "gemini-cli",
         "google-adk",
         "external",
-        "claude_code",
-        "gemini_cli"
+        "claude_code"
       ]
     },
     "channel": {

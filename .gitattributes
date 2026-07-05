@@ -1,0 +1,7 @@
+# The vendored marketplace-artifact JSON-Schemas are a BYTE-FOR-BYTE mirror of
+# the molecule-ai-sdk (contracts/) SSOT, enforced by scripts/check-schemas-in-sync.sh
+# (see schemas/PROVENANCE.md). The SSOT is served LF over the raw endpoint, so the
+# vendored copies MUST stay LF on every platform — pin them so an autocrlf=true
+# (Windows) checkout can't smudge them to CRLF and trip the byte-identical gate.
+schemas/*.schema.json text eol=lf
+scripts/check-schemas-in-sync.sh text eol=lf
