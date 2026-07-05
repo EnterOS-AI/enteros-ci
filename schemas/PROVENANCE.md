@@ -7,11 +7,11 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
-| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `20d47232a9f7ee95a56f1014e3ac06cc5ccf6dcc` |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
+| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
 
-`molecule-ai-sdk` main at repoint time: `8aedf2bc8f820d79de8534e07e0d482ac1c43f4e`. (Source commits above are
+`molecule-ai-sdk` main at repoint time: `423469623a1e071f5b74e9d28a3d8a8211408823`. (Source commits above are
 `molecule-ai-sdk` history — the contracts were folded in from the retired
 `molecule-contracts` repo, whose pre-fold history is preserved there read-only.)
 

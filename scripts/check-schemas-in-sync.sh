@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-schemas-in-sync.sh — fail if the vendored marketplace-artifact
-# JSON-Schemas in schemas/ have drifted from molecule-contracts main.
+# JSON-Schemas in schemas/ have drifted from molecule-ai-sdk (contracts/) main.
 #
 # The schemas under schemas/ are a byte-for-byte SSOT mirror of the
 # molecule-ai-sdk contracts/ originals (see schemas/PROVENANCE.md). The validators
