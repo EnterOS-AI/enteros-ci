@@ -1,0 +1,39 @@
+# scripts-sync — keep the frozen public `.molecule-ci/scripts/` mirror
+# byte-identical to its canonical SSOT in `scripts/`.
+#
+# `scripts/` is the canonical location for every validator/lint script (the
+# meta-CI router and molecule-ci's own ci.yml run `scripts/...`). Several
+# external org-template and plugin repos, however, clone molecule-ci and pin
+# `.molecule-ci-canonical/.molecule-ci/scripts/validate-*.py`, so the mirror
+# directory is a public interface that must stay byte-identical to canonical.
+#
+# Two byte-identical copies with no guard WILL diverge silently (they already
+# had: a lost `pytest` pin + a mirror-only lint script). This gate fails on any
+# drift. Purely local diff — no network fetch, so no soft-skip: a red here is
+# always a real, actionable drift. See scripts/check-scripts-in-sync.sh.
+
+name: Scripts Sync
+
+on:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".molecule-ci/scripts/**"
+      - "scripts/check-scripts-in-sync.sh"
+      - ".gitea/workflows/scripts-sync.yml"
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scripts-sync:
+    name: Vendored .molecule-ci/scripts in sync with canonical scripts/
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      - name: Check .molecule-ci/scripts against canonical scripts/
+        run: bash scripts/check-scripts-in-sync.sh

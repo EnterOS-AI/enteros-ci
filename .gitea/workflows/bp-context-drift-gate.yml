@@ -12,7 +12,7 @@ name: bp-context-drift-gate
 #
 # ADVISORY for now: this job is `continue-on-error: true`, so it NEVER
 # blocks a merge yet. The SCRIPT it runs
-# (.molecule-ci/scripts/lint_bp_context_emit_match.py, MODE=assert) is
+# (scripts/lint_bp_context_emit_match.py, MODE=assert) is
 # FAIL-CLOSED: it exits nonzero on auth failure / missing token / orphan
 # context, so when this job is later promoted to a required hard gate
 # (after a clean advisory window) it is already correct.
@@ -133,4 +133,4 @@ jobs:
           # Hand the token to the asserter as a DIRECT process env var. This is
           # the fix: it is never written to $GITHUB_ENV and never re-read via a
           # `${{ env.* }}` expression, so `act` cannot substitute it with `***`.
-          GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 .molecule-ci/scripts/lint_bp_context_emit_match.py
+          GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 scripts/lint_bp_context_emit_match.py
