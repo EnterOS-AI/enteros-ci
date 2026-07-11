@@ -1,4 +1,7 @@
-"""Tests for `.molecule-ci/scripts/lint_bp_context_emit_match.py`.
+"""Tests for `scripts/lint_bp_context_emit_match.py` (the canonical copy).
+
+The byte-identical `.molecule-ci/scripts/` mirror is enforced by
+check-scripts-in-sync.sh; this suite imports the canonical `scripts/` copy.
 
 Ported from molecule-core's `tests/test_lint_bp_context_emit_match.py`
 (Tier 2f, internal#350). Structural enforcement of the BP⊆emitted
@@ -37,9 +40,7 @@ import pytest
 
 
 SCRIPT_PATH = (
-    Path(__file__).resolve().parent.parent
-    / ".molecule-ci"
-    / "scripts"
+    Path(__file__).resolve().parent
     / "lint_bp_context_emit_match.py"
 )
 
