@@ -79,6 +79,15 @@ def _source_project_name(value: str) -> str | None:
         return None
 
 
+def _redacted_source(value: str) -> str:
+    """Describe an untrusted source without echoing credentials or paths."""
+    parsed = urlparse(value)
+    if parsed.hostname:
+        scheme = parsed.scheme or "source"
+        return f"{scheme}://{parsed.hostname}"
+    return "<redacted>"
+
+
 def inspect_requirements(
     path: Path,
     *,
@@ -117,7 +126,7 @@ def inspect_requirements(
             else:
                 errors.append(
                     f"{where}: unsupported direct, VCS, local, editable, or invalid "
-                    f"requirement {raw!r}"
+                    "requirement"
                 )
             return
 
@@ -197,7 +206,10 @@ def inspect_requirements(
                     continue
                 parsed = urlparse(value)
                 if parsed.scheme or parsed.netloc:
-                    errors.append(f"{where}: remote requirements include is not allowed: {value}")
+                    errors.append(
+                        f"{where}: remote requirements include is not allowed "
+                        f"(source {_redacted_source(value)})"
+                    )
                     continue
                 visit(
                     resolved.parent / value,
@@ -216,17 +228,20 @@ def inspect_requirements(
                     errors.append(str(exc))
                     continue
                 if value.rstrip("/") != PRIVATE_INDEX_URL.rstrip("/"):
-                    errors.append(f"{where}: untrusted package source: {value}")
+                    errors.append(
+                        f"{where}: untrusted package source "
+                        f"({_redacted_source(value)})"
+                    )
                 continue
 
             if line.startswith(_SOURCE_OPTIONS):
-                errors.append(f"{where}: unsupported package source option: {line}")
+                errors.append(f"{where}: unsupported package source option")
                 continue
             if line.startswith(("-e ", "--editable ", "-e=", "--editable=")):
-                errors.append(f"{where}: unsupported editable requirement: {line}")
+                errors.append(f"{where}: unsupported editable requirement")
                 continue
             if line.startswith("-"):
-                errors.append(f"{where}: unsupported pip requirement option: {line}")
+                errors.append(f"{where}: unsupported pip requirement option")
                 continue
             record_requirement(
                 line,

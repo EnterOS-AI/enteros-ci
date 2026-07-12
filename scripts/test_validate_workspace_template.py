@@ -54,15 +54,18 @@ def _good_dockerfile() -> str:
         "RUN useradd -u 1000 -m -s /bin/bash agent\n"
         "WORKDIR /app\n"
         "COPY requirements.txt .\n"
-        'RUN runtime_requirement="molecules-workspace-runtime"; \\\n'
-        '    if [ -n "${RUNTIME_VERSION}" ]; then \\\n'
-        '      runtime_requirement="${runtime_requirement}==${RUNTIME_VERSION}"; \\\n'
-        '    fi; \\\n'
+        'RUN runtime_project="molecules-workspace-runtime"; \\\n'
+        '    runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \\\n'
+        '      requirements.txt /tmp/template-requirements.txt \\\n'
+        '      --runtime-version "${RUNTIME_VERSION}")"; \\\n'
+        '    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \\\n'
+        '    rm -rf /tmp/molecule-runtime; \\\n'
         '    mkdir -p /tmp/molecule-runtime; \\\n'
         '    pip download --isolated --only-binary=:all: --no-deps \\\n'
         '      --index-url "${MOLECULE_RUNTIME_INDEX}" \\\n'
         '      --dest /tmp/molecule-runtime "${runtime_requirement}"; \\\n'
-        '    pip install --isolated -r requirements.txt \\\n'
+        '    test "$(find /tmp/molecule-runtime -maxdepth 1 -name \'*.whl\' | wc -l)" -eq 1; \\\n'
+        '    pip install --isolated -r /tmp/template-requirements.txt \\\n'
         '      /tmp/molecule-runtime/*.whl; \\\n'
         '    rm -rf /tmp/molecule-runtime\n'
         'ENTRYPOINT ["molecule-runtime"]\n'
@@ -179,9 +182,79 @@ def test_runtime_must_install_from_local_wheel(
 
     validator.check_dockerfile()
 
-    assert any("source-pinned local wheel" in e for e in validator.ERRORS), (
+    assert any("source-pinned canonical local wheel" in e for e in validator.ERRORS), (
         validator.ERRORS
     )
+
+
+def test_runtime_download_and_install_decoys_do_not_satisfy_contract(
+    validator, tmp_path, monkeypatch
+):
+    dockerfile = _good_dockerfile().replace(
+        '      --dest /tmp/molecule-runtime "${runtime_requirement}";',
+        "      --dest /tmp/molecule-runtime other-project;",
+    ).replace(
+        "/tmp/molecule-runtime/*.whl;",
+        "Molecule_AI.Workspace_Runtime;",
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("must target only the canonical runtime" in e for e in validator.ERRORS)
+    assert any("retired runtime distribution" in e for e in validator.ERRORS)
+
+
+def test_unfiltered_solve_is_rejected_when_runtime_versions_can_conflict(
+    validator, tmp_path, monkeypatch
+):
+    dockerfile = _good_dockerfile().replace(
+        "ARG RUNTIME_VERSION=\n",
+        "ARG RUNTIME_VERSION=0.3.126\n",
+    ).replace(
+        "-r /tmp/template-requirements.txt",
+        "-r requirements.txt",
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements="molecules-workspace-runtime==0.3.125\n",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("/tmp/template-requirements.txt" in e for e in validator.ERRORS)
+
+
+@pytest.mark.parametrize(
+    "removed",
+    (
+        "    rm -rf /tmp/molecule-runtime; \\\n",
+        '    test "$(find /tmp/molecule-runtime -maxdepth 1 -name \'*.whl\' | wc -l)" -eq 1; \\\n',
+    ),
+)
+def test_runtime_acquisition_requires_clean_directory_and_one_wheel_guard(
+    validator, tmp_path, monkeypatch, removed
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile().replace(removed, ""),
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("exactly one wheel" in e for e in validator.ERRORS)
 
 
 def test_runtime_private_index_arg_is_required(
@@ -449,8 +522,9 @@ def test_retired_runtime_distribution_in_dockerfile_errors(
     validator, tmp_path, monkeypatch
 ):
     dockerfile = _good_dockerfile().replace(
-        "pip install --isolated -r requirements.txt",
-        "pip install --isolated -r requirements.txt molecule-ai-workspace-runtime",
+        "pip install --isolated -r /tmp/template-requirements.txt",
+        "pip install --isolated -r /tmp/template-requirements.txt "
+        "molecule-ai-workspace-runtime",
     )
     _materialise(
         tmp_path,

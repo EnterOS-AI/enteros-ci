@@ -140,6 +140,28 @@ def test_rejects_untrusted_package_source_option(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "entry",
+    (
+        "--extra-index-url https://ci-user:credential-sentinel@example.invalid/simple/",
+        "--requirement=https://ci-user:credential-sentinel@example.invalid/req.txt",
+        "other-project @ https://ci-user:credential-sentinel@example.invalid/other.whl",
+        "https://ci-user:credential-sentinel@example.invalid/not-a-wheel",
+    ),
+)
+def test_rejected_sources_redact_embedded_credentials(tmp_path, entry):
+    with pytest.raises(RequirementsContractError) as caught:
+        _inspect(
+            tmp_path,
+            f"{entry}\nmolecules-workspace-runtime>=0.3\n",
+        )
+
+    message = str(caught.value)
+    assert "credential-sentinel" not in message
+    assert "ci-user" not in message
+    assert "example.invalid" in message or "unsupported" in message
+
+
 def test_rejects_duplicate_runtime_declarations(tmp_path):
     with pytest.raises(RequirementsContractError, match="exactly once"):
         _inspect(

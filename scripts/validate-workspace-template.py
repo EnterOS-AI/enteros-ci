@@ -7,10 +7,13 @@ config.yaml, requirements, adapter loading, and SDK-backed schema boundaries.
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from requirements_contract import (
     PRIVATE_INDEX_URL,
     RETIRED_RUNTIME_PROJECT,
@@ -90,19 +93,77 @@ def _logical_dockerfile_instructions(content: str) -> list[str]:
     return instructions
 
 
+def _shell_commands(run_instruction: str) -> list[list[str]]:
+    """Split a shell-form Docker RUN into argv-like command segments."""
+    lexer = shlex.shlex(
+        re.sub(r"^RUN\s+", "", run_instruction, count=1, flags=re.IGNORECASE),
+        posix=True,
+        punctuation_chars=";&|",
+    )
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token and all(char in ";&|" for char in token):
+            if current:
+                commands.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _pip_args(command: list[str], action: str) -> list[str] | None:
+    if len(command) >= 2 and command[0] in {"pip", "pip3"}:
+        return command[2:] if command[1] == action else None
+    if (
+        len(command) >= 4
+        and command[1:3] == ["-m", "pip"]
+        and command[3] == action
+        and re.fullmatch(r"python(?:3(?:\.\d+)?)?", command[0])
+    ):
+        return command[4:]
+    return None
+
+
+def _option_values(args: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    for index, token in enumerate(args):
+        if token == option and index + 1 < len(args):
+            values.append(args[index + 1])
+        elif token.startswith(f"{option}="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+
+def _literal_requirement_name(value: str) -> str | None:
+    try:
+        return canonicalize_name(Requirement(value).name)
+    except InvalidRequirement:
+        return None
+
+
 def _check_private_runtime_wheel_install(dockerfile: str) -> None:
     """Require private-only wheel acquisition before public dependency solve."""
     instructions = _logical_dockerfile_instructions(dockerfile)
-    run_instructions = [
-        instruction
+    run_commands = [
+        (instruction, _shell_commands(instruction))
         for instruction in instructions
         if instruction.upper().startswith("RUN ")
     ]
     downloads = [
-        instruction
-        for instruction in run_instructions
-        if re.search(r"\bpip(?:3)?\s+download\b", instruction)
-        and RUNTIME_PROJECT in instruction
+        (instruction, commands, position, command, args)
+        for instruction, commands in run_commands
+        for position, command in enumerate(commands)
+        if (args := _pip_args(command, "download")) is not None
     ]
     expected_arg = f"ARG MOLECULE_RUNTIME_INDEX={PRIVATE_INDEX_URL}"
     if expected_arg not in instructions:
@@ -115,52 +176,181 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
             "Dockerfile: private-only runtime wheel acquisition must use exactly "
             f"one `pip download` for `{RUNTIME_PROJECT}`"
         )
-    else:
-        download = downloads[0]
-        required_tokens = (
-            "--isolated",
-            "--only-binary=:all:",
-            "--no-deps",
-            "--index-url",
-            "MOLECULE_RUNTIME_INDEX",
-        )
-        missing = [token for token in required_tokens if token not in download]
-        if missing or "--extra-index-url" in download:
-            err(
-                "Dockerfile: private-only runtime wheel acquisition is incomplete; "
-                f"missing={missing}, extra-index={('--extra-index-url' in download)}"
-            )
+        return
 
-    download_instruction = downloads[0] if len(downloads) == 1 else ""
-    has_local_solve = (
-        bool(re.search(r"\bpip(?:3)?\s+install\b", download_instruction))
-        and "--isolated" in download_instruction
-        and ".whl" in download_instruction
-        and bool(
-            re.search(
-                r"(?:^|\s)-r\s+(?:requirements\.txt|/tmp/template-requirements\.txt)"
-                r"(?=\s|;|$)",
-                download_instruction,
-            )
+    _, commands, download_position, _, download_args = downloads[0]
+    pre_download_commands = commands[:download_position]
+    index_values = _option_values(download_args, "--index-url")
+    required_flags = {"--isolated", "--only-binary=:all:", "--no-deps"}
+    missing = sorted(required_flags.difference(download_args))
+    destination = _option_values(download_args, "--dest")
+    if (
+        missing
+        or index_values
+        not in (
+            [PRIVATE_INDEX_URL],
+            ["$MOLECULE_RUNTIME_INDEX"],
+            ["${MOLECULE_RUNTIME_INDEX}"],
         )
-    )
-    if not has_local_solve:
+        or destination != ["/tmp/molecule-runtime"]
+        or any(arg == "--extra-index-url" or arg.startswith("--extra-index-url=") for arg in download_args)
+    ):
         err(
-            "Dockerfile: install the source-pinned local runtime `.whl` in the "
-            "same isolated RUN and dependency solve"
+            "Dockerfile: private-only runtime wheel acquisition is incomplete; "
+            "require isolated/no-deps/binary-only download, the exact Gitea index, "
+            "and `/tmp/molecule-runtime` destination"
         )
 
-    for instruction in run_instructions:
-        for match in re.finditer(
-            r"\bpip(?:3)?\s+install\b(?P<args>.*?)(?=(?:&&|;|\|\||$))",
-            instruction,
+    target = download_args[-1] if download_args else ""
+    variable_targets = {"$runtime_requirement", "${runtime_requirement}"}
+    if target in variable_targets:
+        has_project_assignment = any(
+            "runtime_project=molecules-workspace-runtime" in token
+            for command in pre_download_commands
+            for token in command
+        )
+        has_runtime_guard = any(
+            (
+                command
+                and command[0] == "case"
+                and any("runtime_requirement" in token for token in command)
+                and any("runtime_project" in token for token in command)
+            )
+            or any(
+                "runtime_requirement#" in token and "runtime_project" in token
+                for token in command
+            )
+            for command in pre_download_commands
+        )
+        has_filtered_helper = any(
+            "runtime_requirement=$(" in token
+            and "prepare" in token
+            and "runtime_requirements.py" in token.replace("-", "_")
+            and "/tmp/template-requirements.txt" in token
+            and "RUNTIME_VERSION" in token
+            for command in pre_download_commands
+            for token in command
+        )
+        if not (has_project_assignment and has_runtime_guard and has_filtered_helper):
+            err(
+                "Dockerfile: runtime download variable must come from the filtered "
+                "requirements helper and be guarded by the canonical runtime project"
+            )
+    else:
+        try:
+            requirement = Requirement(target)
+        except InvalidRequirement:
+            requirement = None
+        if (
+            requirement is None
+            or canonicalize_name(requirement.name) != canonicalize_name(RUNTIME_PROJECT)
+            or requirement.url
+            or requirement.extras
+            or requirement.marker
         ):
-            args = match.group("args")
-            if RUNTIME_PROJECT in args and ".whl" not in args:
+            err(
+                "Dockerfile: `pip download` must target only the canonical runtime "
+                "requirement"
+            )
+
+    install_commands = [
+        (position, args)
+        for position, command in enumerate(commands)
+        if (args := _pip_args(command, "install")) is not None
+    ]
+    clears_download_directory = any(
+        command[:2] == ["rm", "-rf"]
+        and "/tmp/molecule-runtime" in command[2:]
+        for command in pre_download_commands
+    )
+    first_install_position = min(
+        (position for position, _ in install_commands),
+        default=len(commands),
+    )
+    acquisition_commands = commands[download_position + 1 : first_install_position]
+    sets_wheel_glob = any(
+        command[:2] == ["set", "--"]
+        and "/tmp/molecule-runtime/*.whl" in command[2:]
+        for command in acquisition_commands
+    )
+    enforces_one_wheel = any(
+        (
+            command
+            and command[0] == "test"
+            and "-eq" in command
+            and "1" in command
+            and any(
+                "wheel_count" in token or "/tmp/molecule-runtime" in token
+                for token in command
+            )
+        )
+        or (
+            any(token == "$#" for token in command)
+            and "-ne" in command
+            and "1" in command
+            and sets_wheel_glob
+        )
+        for command in acquisition_commands
+    )
+    if not (clears_download_directory and enforces_one_wheel):
+        err(
+            "Dockerfile: runtime acquisition must clear the download directory "
+            "and enforce exactly one wheel before installation"
+        )
+
+    local_solves = []
+    canonical_wheel_glob = "molecules_workspace_runtime-*.whl"
+    for install_position, install_args in install_commands:
+        requirement_files = _option_values(install_args, "-r")
+        variable_wheel = any(
+            token in {"$runtime_wheel", "${runtime_wheel}"}
+            for token in install_args
+        )
+        direct_wheel = any(
+            token == "/tmp/molecule-runtime/*.whl"
+            or token
+            == f"/tmp/molecule-runtime/{canonical_wheel_glob}"
+            for token in install_args
+        )
+        commands_before_install = " ".join(
+            token
+            for command in commands[download_position + 1 : install_position]
+            for token in command
+        )
+        has_canonical_wheel = direct_wheel or (
+            variable_wheel and canonical_wheel_glob in commands_before_install
+        )
+        has_index_override = any(
+            token in {"--index-url", "--extra-index-url"}
+            or token.startswith(("--index-url=", "--extra-index-url="))
+            for token in install_args
+        )
+        if (
+            "--isolated" in install_args
+            and install_position > download_position
+            and requirement_files == ["/tmp/template-requirements.txt"]
+            and has_canonical_wheel
+            and not has_index_override
+        ):
+            local_solves.append(install_args)
+
+        for token in install_args:
+            project = _literal_requirement_name(token)
+            if project == canonicalize_name(RETIRED_RUNTIME_PROJECT):
                 err(
-                    "Dockerfile: must not install the private runtime by project "
-                    "name; install the source-pinned local wheel"
+                    "Dockerfile: retired runtime distribution must not be installed"
                 )
+            elif project == canonicalize_name(RUNTIME_PROJECT):
+                err(
+                    "Dockerfile: must not install a runtime distribution by project "
+                    "name; install the source-pinned canonical local wheel"
+                )
+
+    if len(local_solves) != 1:
+        err(
+            "Dockerfile: install the source-pinned canonical runtime `.whl` with "
+            "`-r /tmp/template-requirements.txt` in the same isolated RUN"
+        )
 
 
 def check_dockerfile() -> None:
