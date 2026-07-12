@@ -1,1 +1,1 @@
-molecule-ai-workspace-runtime>=0.1.0
+molecules-workspace-runtime>=0.1.0

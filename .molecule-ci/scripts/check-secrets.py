@@ -33,7 +33,13 @@ PATTERNS = [
 EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
 
 # Directories to skip entirely
-SKIP_DIRS = {'.molecule-ci', '.git', 'node_modules', '__pycache__'}
+SKIP_DIRS = {
+    '.molecule-ci',
+    '.molecule-ci-canonical',
+    '.git',
+    'node_modules',
+    '__pycache__',
+}
 
 
 def is_false_positive(line: str, match: str) -> bool:
@@ -60,11 +66,12 @@ def check_file(path: Path) -> list[str]:
         return warnings
 
     for lineno, line in enumerate(lines, 1):
-        for pattern in PATTERNS:
+        for rule_number, pattern in enumerate(PATTERNS, 1):
             for match in pattern.finditer(line):
                 if not is_false_positive(line, match.group(0)):
                     warnings.append(
-                        f"  {path}:{lineno}: {match.group(0)[:40]}..."
+                        f"  {path}:{lineno}: credential-shaped value "
+                        f"(rule {rule_number})"
                     )
     return warnings
 

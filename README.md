@@ -1,60 +1,22 @@
 # molecule-ci
 
-Shared CI workflows for the Molecule AI ecosystem. Every plugin, workspace template, and org template repo calls these reusable workflows to enforce a standard validation gate.
+Shared CI contracts for the Molecule AI ecosystem. Canonical consumer templates enforce the same validation gate across plugin, workspace-template, and org-template repositories.
 
 ## Usage
 
-### Plugin repos (`molecule-ai-plugin-*`)
+Cross-repository `workflow_call` is not supported by the current Gitea deployment. Install the matching canonical template as `.gitea/workflows/ci.yml` in the consumer repository:
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-  validate:
-    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-plugin.yml@v1
-```
+| Consumer | Canonical template |
+|---|---|
+| `molecule-ai-plugin-*` | [`templates/ci-plugin.yml`](templates/ci-plugin.yml) |
+| `molecule-ai-workspace-template-*` | [`templates/ci-workspace-template.yml`](templates/ci-workspace-template.yml) |
+| `molecule-ai-org-template-*` | [`templates/ci-org-template.yml`](templates/ci-org-template.yml) |
 
-### Workspace template repos (`molecule-ai-workspace-template-*`)
-
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-  validate:
-    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@v1
-```
-
-### Org template repos (`molecule-ai-org-template-*`)
-
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-  validate:
-    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-org-template.yml@v1
-```
+The inline templates clone `molecule-ci` from `git.moleculesai.app` and execute the canonical validators from `scripts/`, so validator logic remains centralized without a cross-repository action fetch.
 
 ### Any repo with auto-merge enabled
 
-PR-time guards (currently: disable auto-merge on follow-up push). Consume from a thin caller:
-
-```yaml
-# .github/workflows/pr-guards.yml
-name: pr-guards
-on:
-  pull_request:
-    types: [synchronize]
-permissions:
-  pull-requests: write
-jobs:
-  disable-auto-merge-on-push:
-    uses: molecule-ai/molecule-ci/.gitea/workflows/disable-auto-merge-on-push.yml@v1
-```
-
-When the team lands more PR-time guards in this repo, add them as additional jobs in the same caller — keeps each consuming repo's footprint to one file.
+The reusable `disable-auto-merge-on-push.yml` definition is retained for the point when cross-repository `workflow_call` is supported. Do not install a thin cross-repository caller before that capability is enabled; it will not resolve on the current deployment.
 
 ## What each workflow validates
 
@@ -76,10 +38,10 @@ When the team lands more PR-time guards in this repo, add them as additional job
 | `config.yaml` exists | Error | Missing config |
 | Required fields (name, runtime) | Error | Incomplete template |
 | `template_schema_version: 1` | Error | Missing version contract |
-| Known runtime check | Warning | Typo in runtime name |
-| `adapter.py` imports molecule_runtime | Warning | Legacy imports |
+| RuntimeId shape (open, bounded, path-safe) | Error | Unsafe or malformed runtime ID |
+| `adapter.py` imports legacy `molecule_ai` | Warning | Pre-runtime-package imports |
 | Dockerfile builds | Error | Broken image |
-| molecule-ai-workspace-runtime dependency | Warning | Missing base package |
+| Source-pinned `molecules-workspace-runtime` wheel | Error | Missing, retired, or public-index runtime package |
 | No committed secrets | Error | Leaked API keys |
 
 ### validate-org-template
@@ -88,9 +50,8 @@ When the team lands more PR-time guards in this repo, add them as additional job
 |---|---|---|
 | `org.yaml` exists | Error | Missing org definition |
 | Required fields (name) | Error | Incomplete template |
-| Workspace structure valid | Error | Malformed hierarchy |
-| `files_dir` references exist | Warning | Broken system-prompt paths |
-| `template_schema_version` present | Warning | Missing version contract |
+| SDK org schema | Error | Malformed workspace tree, defaults, plugins, or RuntimeIds |
+| Direct-workspace count | Notice | Resolved inline workspace inventory |
 | No committed secrets | Error | Leaked API keys |
 
 ### disable-auto-merge-on-push

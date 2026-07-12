@@ -2,9 +2,9 @@
 """Validate a Molecule AI plugin repo.
 
 SSOT switch (RFC molecule-core#3285): the field / required-key / version /
-runtimes-shape / runtime-enum checks are NO LONGER hand-rolled here — they are
+runtimes-shape / RuntimeId checks are NO LONGER hand-rolled here — they are
 delegated to the marketplace plugin-manifest JSON-Schema (draft 2020-12)
-vendored from molecule-contracts at schemas/plugin-manifest.schema.json. That
+vendored from molecule-ai-sdk at schemas/plugin-manifest.schema.json. That
 schema is the real authority for the manifest shape; this script just loads
 plugin.yaml, validates it against the schema, and reports the violations in
 molecule-ci's own (test-stable) voice.
@@ -31,7 +31,7 @@ try:
 except ImportError:
     print(
         "::error::jsonschema not installed — validate-plugin.py validates "
-        "plugin.yaml against the vendored molecule-contracts schema and needs "
+        "plugin.yaml against the vendored molecule-ai-sdk schema and needs "
         "`pip install jsonschema`. (CI installs it; see the validate-plugin "
         "workflow.)"
     )
@@ -65,10 +65,10 @@ if not isinstance(plugin, dict):
     print("::error::plugin.yaml must be a mapping at the top level")
     sys.exit(1)
 
-# 2-4. Manifest-shape validation against the molecule-contracts SSOT schema.
+# 2-4. Manifest-shape validation against the molecule-ai-sdk SSOT schema.
 #      Replaces the former hand-rolled required-field / version-format /
-#      runtimes-must-be-a-list checks AND adds the canonical runtimes enum the
-#      hand-rolled validator never enforced. Violations are formatted into the
+#      runtimes-must-be-a-list checks AND enforces the open, bounded/path-safe
+#      RuntimeId contract. Violations are formatted into the
 #      pre-existing message strings so the gate stays actionable + stable.
 schema = json.loads(_find_schema("plugin-manifest.schema.json").read_text())
 for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: list(e.path)):
@@ -83,11 +83,6 @@ for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: 
     elif e.validator == "type" and list(e.path) == ["runtimes"]:
         got = type(e.instance).__name__
         errors.append(f"runtimes must be a list, got {got}")
-    elif e.validator == "enum" and len(e.path) == 2 and e.path[0] == "runtimes":
-        errors.append(
-            f"runtimes[{e.path[1]}]: `{e.instance}` is not a canonical runtime — "
-            f"allowed (molecule-contracts plugin-manifest enum): {e.validator_value}"
-        )
     else:
         loc = "/".join(str(p) for p in e.path) or "(root)"
         errors.append(f"plugin.yaml schema violation at `{loc}`: {e.message}")

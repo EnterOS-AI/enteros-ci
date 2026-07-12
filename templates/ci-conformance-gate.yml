@@ -8,12 +8,12 @@
 # mode/version-specifically.
 #
 # WHY INLINE-CLONE (not `uses: molecule-ai/molecule-ci/.gitea/actions/...@v1`):
-# Gitea 1.22.6 (prod operator host) routes cross-repo fetches through
+# The current Gitea deployment routes cross-repo fetches through
 # [actions].DEFAULT_ACTIONS_URL=github → the suspended molecule-ai org → 404. So
 # we anon-clone the PUBLIC molecule-ci SSOT at CI time and reference the
 # composite action by LOCAL path. Same single-source-of-truth (the action lives
 # in molecule-ci, fetched fresh every run), no cross-repo `uses:` dependency.
-# When the operator host upgrades to Gitea >= 1.26 (internal task #109), this
+# When the Gitea deployment supports cross-repo local actions, this
 # inline-clone step can be dropped in favour of a direct
 # `uses: molecule-ai/molecule-ci/.gitea/actions/conformance-gate@v1` WITHOUT
 # changing the emitted `conformance-gate / conformance` context name.

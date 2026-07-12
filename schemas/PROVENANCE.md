@@ -7,13 +7,13 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
-| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `56f7248455ee1a1b6a5e9f7885800d03f8f2493b` |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
+| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 
-`molecule-ai-sdk` main at repoint time: `423469623a1e071f5b74e9d28a3d8a8211408823`. (Source commits above are
-`molecule-ai-sdk` history — the contracts were folded in from the retired
-`molecule-contracts` repo, whose pre-fold history is preserved there read-only.)
+`molecule-ai-sdk` main at re-vendor time: `c58c6697b2455540c515c9a3c6656a34ab286e66`
+(SDK PR #92). The source commit above is the reviewed PR head contained by that
+merge commit.
 
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 
@@ -34,19 +34,16 @@ to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
    `molecule-ai-sdk (contracts/)` **main** and `diff`s it against the vendored copy,
    failing if they have drifted. It runs in CI via
    `.gitea/workflows/schema-sync.yml`.
-2. The `$id` inside each schema still carries the URL of the retired
-   `molecule-contracts` repo — inherited byte-for-byte from the fold-in
-   (molecule-ai-sdk deliberately did not rewrite it, and this mirror must
-   stay byte-identical to the SSOT, so it is NOT rewritten here either).
-   If the SSOT ever updates the `$id`s, the byte-diff gate above goes red
-   until this mirror is re-vendored — that is the intended tripwire.
+2. Each `$id` points to its canonical path in `molecule-ai-sdk`. The value is
+   copied byte-for-byte with the rest of the schema; a one-sided `$id` edit
+   therefore reds the drift gate like any other contract change.
 
 ## How to update
 
 When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
-# from a molecule-ci checkout, with molecule-ai-sdk (contracts/) main cloned alongside
+# from a molecule-ci checkout, with molecule-ai-sdk main cloned alongside
 for s in plugin-manifest workspace-template org-template; do
   curl -fsS -A "curl/8.4.0" \
     "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/$s/$s.schema.json" \

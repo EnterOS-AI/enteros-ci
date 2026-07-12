@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/workspace-template/workspace-template.schema.json",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/workspace-template/workspace-template.schema.json",
   "title": "Marketplace Workspace-Template Contract",
-  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace workspace-template artifact — the publishable shape of a workspace-template `config.yaml` (molecule-ai-workspace-template-* repos). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-workspace-template-claude-code/config.yaml, google-adk, seo-agent, platform-agent, validated by validate-workspace-template.py (required: name, runtime, template_schema_version; runtime warns if outside the known set {claude-code, codex, crewai, google-adk, hermes, openclaw}). DELIBERATELY TOLERANT (additionalProperties:true at the top and on nested objects): the real configs are SHAPE-INCONSISTENT about where the model lives — google-adk has top-level `models[]` + `runtime_config.model`; claude-code/seo-agent have `runtime_config.models[]` + top-level `model`; platform-agent has top-level `provider`; some have none. This schema models every observed location WITHOUT forcing one, so a real config in any of those styles validates. The two `providers` shapes are also inconsistent and are typed separately by path: top-level `providers[]` is a list of provider OBJECTS (name/auth_mode/model_prefixes/...); `runtime_config.providers[]` is a list of provider-name STRINGS. `runtime` uses the CANONICAL hyphen form (see plugin-manifest.schema.json for the runtimes SSOT reconciliation).",
+  "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace workspace-template artifact — the publishable shape of a workspace-template `config.yaml`. RuntimeId is an open bounded/path-safe slug; official first-party support is discovered separately. The schema is deliberately tolerant of the real configs' different model/provider locations while retaining their typed shapes.",
   "type": "object",
   "additionalProperties": true,
   "required": ["name", "runtime", "template_schema_version"],
   "properties": {
     "name": { "type": "string", "minLength": 1, "description": "Template display name (required by validate-workspace-template.py). E.g. `Claude Code Agent`, `SEO Agent`." },
-    "runtime": { "$ref": "#/$defs/runtimeId", "description": "Runtime this template targets (required). Canonical hyphen form; the validator warns (does not reject) on values outside its known set." },
+    "runtime": { "$ref": "#/$defs/runtimeId", "description": "Open RuntimeId this template targets (required)." },
     "template_schema_version": { "type": "integer", "description": "Template schema version (required; validate-workspace-template.py errors if missing — `template_schema_version: 1`)." },
     "description": { "type": "string", "description": "Optional human-readable description." },
     "version": { "type": "string", "description": "Optional template version (e.g. `1.0.0`, `0.2.1`)." },
@@ -22,7 +22,7 @@
     },
     "models": {
       "type": "array",
-      "description": "Top-level `models[]` — the authoritative servability list for google-adk-style runtimes (google-adk). The registry projection is a subset of this.",
+      "description": "Top-level `models[]` — the authoritative servability list for templates that publish model choices outside `runtime_config.models`. The registry projection is a subset of this.",
       "items": { "$ref": "#/$defs/model" }
     },
     "prompt_files": {
@@ -86,17 +86,13 @@
   "$defs": {
     "runtimeId": {
       "type": "string",
-      "description": "Canonical runtime identifier (hyphen form). Same SSOT enum as plugin-manifest.schema.json; underscore aliases accepted.",
-      "enum": [
-        "claude-code",
-        "codex",
-        "hermes",
-        "openclaw",
-        "crewai",
-        "google-adk",
-        "external",
-        "claude_code"
-      ]
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+([-_][a-z0-9]+)*$",
+      "not": {
+        "pattern": "[^a-z0-9_-]"
+      },
+      "description": "Open, bounded, path-safe runtime identifier. Official first-party support is discovered separately; known aliases normalize without restricting third-party IDs."
     },
     "provider": {
       "type": "object",

@@ -1,18 +1,7 @@
-# Gitea Actions port of .github/workflows/validate-workspace-template.yml
-# Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
-# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
-#
-# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
-# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
-# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
-# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
-# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
-# not a switch-on. Until the operator-host server-side flip lands (task #109
-# actions/* mirror) consumers calling this via `uses:` will continue to no-op
-# /404 even after switching to the .gitea/ path. Land this PR first; flip the
-# server config + consumers in a follow-up batch.
+# Reusable workspace-template validation definition for this repository.
+# Cross-repository workflow_call is not supported by the current Gitea
+# deployment, so consumers install templates/ci-workspace-template.yml instead.
+# Both paths execute the same canonical scripts from molecule-ci.
 
 name: Validate Workspace Template
 on:
@@ -79,58 +68,11 @@ jobs:
           python-version: "3.11"
       # Secret scan — the most important check. Always runs.
       - name: Check for secrets
-        run: |
-          python3 - << 'PYEOF'
-          import os, re, sys
-          from pathlib import Path
-
-          PATTERNS = [
-              re.compile(r'''["']sk-ant-[a-zA-Z0-9]{50,}["']'''),
-              re.compile(r'''["']ghp_[a-zA-Z0-9]{36,}["']'''),
-              re.compile(r'''["']AKIA[A-Z0-9]{16}["']'''),
-              re.compile(r'''["'][a-zA-Z0-9/+=]{40}["']'''),
-              re.compile(r'''["']sk_test_[a-zA-Z0-9]{24,}["']'''),
-              re.compile(r'''["']Bearer\s+[a-zA-Z0-9_.-]{20,}["']'''),
-              re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
-              re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
-          ]
-          SKIP_DIRS = {'.molecule-ci', '.git', 'node_modules', '__pycache__'}
-          EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
-
-          def is_false_positive(line):
-              ctx = line.lower()
-              return '...' in ctx or '<example' in ctx or '</example' in ctx
-
-          root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
-          warnings = []
-          for dirpath, dirnames, filenames in os.walk(root):
-              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-              for filename in filenames:
-                  if Path(filename).suffix not in EXTENSIONS:
-                      continue
-                  filepath = Path(dirpath) / filename
-                  try:
-                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                          for lineno, line in enumerate(f.readlines(), 1):
-                              for pattern in PATTERNS:
-                                  for match in pattern.finditer(line):
-                                      if not is_false_positive(line):
-                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
-                  except Exception:
-                      pass
-
-          if warnings:
-              print("::error::Potential secret found in committed files:")
-              for w in warnings:
-                  print(w)
-              sys.exit(1)
-          else:
-              print("::notice::No secrets detected")
-          PYEOF
+        run: python3 .molecule-ci-canonical/scripts/check-secrets.py
       # Static-only validator — file existence checks, YAML parse,
       # AST inspection of adapter.py (no import). Doesn't execute
       # any third-party code; safe on fork PRs.
-      - run: pip install --break-system-packages pyyaml jsonschema -q
+      - run: pip install --break-system-packages pyyaml jsonschema packaging -q
       # Official-template SSOT enforcement is OPT-IN via a committed `.official`
       # marker in the template repo (dynamic — no hardcoded repo allowlist). When
       # present, the validator runs with --official so check_no_hardcoded_provider_model
@@ -186,28 +128,18 @@ jobs:
           # Cache pip against the calling repo's own requirements.txt
           # (the file we install one step below). Pointing the cache key
           # at the validator's own deps was decorative — pyyaml never
-          # changes, so the key never invalidated even when the template
-          # added a heavy dep like crewai.
+          # changes, so the key never invalidated when a template added
+          # a large runtime dependency.
           cache: "pip"
           cache-dependency-path: requirements.txt
-      - run: pip install --break-system-packages pyyaml jsonschema -q
-      # Install the template's runtime dependencies so the validator's
-      # `check_adapter_runtime_load()` can import adapter.py the same way
-      # the workspace container does at boot. Without this, a
-      # syntactically-valid adapter that ImportErrors on a missing
-      # transitive dep would build clean and crash on first user prompt.
-      # The fallback (no requirements.txt) installs the runtime alone so
-      # BaseAdapter is at least importable for the class-discovery check.
-      - if: hashFiles('requirements.txt') != ''
-        # HERMETIC: molecules-workspace-runtime is private-only (absent from
-        # public PyPI → no dependency-confusion); its public deps resolve from
-        # the default index. Private index added as EXTRA (not PIP_INDEX_URL).
-        run: pip install --break-system-packages -q --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ -r requirements.txt
-      - if: hashFiles('requirements.txt') == ''
-        # HERMETIC + no dependency-confusion: install the CURRENT dist name
-        # molecules-workspace-runtime from the private index (the legacy name
-        # molecule-ai-workspace-runtime is squatted on public PyPI at 0.1.999999).
-        run: pip install --break-system-packages -q --extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecules-workspace-runtime
+      - run: pip install --break-system-packages pyyaml jsonschema packaging -q
+      # Acquire the runtime wheel from the private index only, then pin that
+      # local artifact while resolving the template's public dependencies.
+      # The static job has already validated nested requirements and sources.
+      # This lets check_adapter_runtime_load() import adapter.py the same way
+      # the workspace container does without allowing public package selection.
+      - name: Install source-pinned runtime and template dependencies
+        run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
       # Same opt-in `.official` SSOT-enforcement detection as the static job
       # (separate job → its own detection step).
       - name: Detect official-template SSOT enforcement

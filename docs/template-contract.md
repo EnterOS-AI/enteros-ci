@@ -1,8 +1,8 @@
 # Workspace Template Contract
 
-Hard rules every `molecule-ai-workspace-template-*` repo must satisfy. Enforced by `scripts/validate-workspace-template.py` on every CI run via the reusable `validate-workspace-template.yml` workflow.
+Hard rules every `molecule-ai-workspace-template-*` repo must satisfy. Enforced by `scripts/validate-workspace-template.py` through the canonical inline consumer workflow in `templates/ci-workspace-template.yml`.
 
-The contract exists because the 8 template repos were extracted from a single monolithic Dockerfile pre-#87, and have drifted as each was edited piecemeal since. Without this gate, a 28-line cascade-friendly Dockerfile in one repo silently regresses to a 25-line non-cache-friendly one in another, and the next runtime publish ships the previous wheel from a stale layer (cache trap observed five times in a row on 2026-04-27).
+The official templates share a runtime and image contract but evolve independently. This gate prevents a template from silently losing cache invalidation, package provenance, adapter loading, or container-entrypoint behavior.
 
 ## Dockerfile
 
@@ -10,26 +10,29 @@ The contract exists because the 8 template repos were extracted from a single mo
 |---|---|
 | `FROM python:3.11-slim` | Single base everywhere — keeps apt + pip behaviour identical and lets us reason about CVE patches on one base. |
 | `ARG RUNTIME_VERSION=` declared | The arg invalidates the pip-install layer's cache key whenever the cascade publishes a new wheel. Without it the cache hit replays the previous runtime. |
-| `${RUNTIME_VERSION}` referenced in a `RUN` | Just declaring the ARG isn't enough — it has to be in the layer's command line so docker hashes it. Pattern: `if [ -n "${RUNTIME_VERSION}" ]; then pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; fi` |
+| `${RUNTIME_VERSION}` referenced in the private wheel download | Just declaring the ARG is not enough; it must select the runtime requirement in the cache-invalidating layer. |
+| `ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/` | The private runtime source is explicit and reviewable. |
+| Private-only wheel acquisition | Download exactly one runtime wheel with `pip download --isolated --only-binary=:all: --no-deps --index-url "${MOLECULE_RUNTIME_INDEX}"`; never use an extra index for this step. |
+| Local-wheel dependency solve | Install `/tmp/molecule-runtime/*.whl` in the same `pip install` solve as a filtered requirements file that excludes the runtime declaration. The local wheel pins runtime provenance, lets `RUNTIME_VERSION` override a checked-in pin, and leaves public dependencies to resolve normally. |
 | `RUN useradd -u 1000 -m -s /bin/bash agent` | The runtime drops to uid 1000 before exec'ing the SDK. Claude Code refuses `--dangerously-skip-permissions` as root for safety. The `/workspace` volume is also chown'd to 1000 by the platform provisioner. |
 | `ENTRYPOINT ["molecule-runtime"]` *or* a wrapper script that exec's `molecule-runtime` | Single entrypoint means the platform's container-restart contract is uniform across templates. Wrapper scripts are allowed (claude-code has `entrypoint.sh` for gosu drop-priv; hermes has `start.sh` to boot the hermes-agent daemon first). |
-| `molecule-ai-workspace-runtime` listed in `requirements.txt` (or installed in the Dockerfile directly) | The runtime wheel is the contract — without it the container has no A2A server, no heartbeat, no MCP bridge. |
+| `molecules-workspace-runtime` listed exactly once in `requirements.txt` | The runtime wheel is the contract. The old distribution name is rejected because it was retired after a dependency-confusion incident. Direct/VCS/local runtime sources are rejected. |
 
 ## config.yaml
 
 | Required key | Type | Notes |
 |---|---|---|
 | `name` | str | Human-readable; appears on the canvas card. |
-| `runtime` | str | Must be one of: `langgraph`, `claude-code`, `crewai`, `autogen`, `deepagents`, `hermes`, `gemini-cli`, `openclaw`. Custom runtimes warn but are allowed. |
+| `runtime` | str | Open RuntimeId: 1-64 lowercase alphanumeric segments separated by `-` or `_`. Official first-party support is discovered separately and is not a universal allowlist. |
 | `template_schema_version` | int | Currently `1`. Bump when adding a key that changes how the platform consumes config.yaml. **Must be int**, not string — a quoted `"1"` will fail validation. |
 
 | Optional key | Notes |
 |---|---|
 | `description` | Free text, surfaces on canvas. |
-| `version`, `tier` | int, controls platform-side rollout gating. |
+| `version`, `tier` | `version` is a string; `tier` is an integer controlling platform-side rollout gating. |
 | `model`, `models` | Either a single model id or a list of model ids the agent may use. |
-| `runtime_config` | Nested block of runtime-specific settings (used by claude-code, gemini-cli, hermes). |
-| `env`, `skills`, `tools`, `a2a`, `delegation`, `prompt_files`, `bridge`, `governance` | Optional feature blocks. Add new keys to `OPTIONAL_KEYS` in the validator when introducing them. |
+| `runtime_config` | Nested block of runtime-specific settings (for example, claude-code and hermes adapters). |
+| `env`, `skills`, `tools`, `a2a`, `delegation`, `prompt_files`, `bridge`, `governance` | Optional feature blocks. Add new contract keys to the SDK workspace-template schema SSOT, then re-vendor it here. |
 
 Unknown top-level keys produce a warning (not an error) so accidental drift is visible without blocking.
 
@@ -54,7 +57,7 @@ A template that **re-pins** any of these re-introduces the silent prod-routing d
 
 It does **not** flag a `runtime_config.models` *catalog* (the user-selectable menu + per-entry `required_env`) — that is kept ⊆ the registry SSOT by the separate platform-model / full-providers drift gates.
 
-**Activation is opt-in and dynamic** — no hardcoded repo allowlist. A template repo declares itself official by committing a `.official` marker file; the CI (`templates/ci-workspace-template.yml` and the reusable `validate-workspace-template.yml`) then runs the validator with `--official`. If `.official` contains the token `allow-self-model`, `--allow-self-model` is also passed — this exempts **only** the top-level `model:` for the platform-agent (Org Concierge) template whose own declared model IS its identity per core#2594. Community and un-migrated templates (no marker) are unaffected; the gate never fires for them.
+**Activation is opt-in and dynamic** — no hardcoded repo allowlist. A template repo declares itself official by committing a `.official` marker file; the canonical consumer CI then runs the validator with `--official`. If `.official` contains the token `allow-self-model`, `--allow-self-model` is also passed — this exempts **only** the top-level `model:` for the platform-agent (Org Concierge) template whose own declared model IS its identity per core#2594. Community and un-migrated templates (no marker) are unaffected; the gate never fires for them.
 
 ## adapter.py
 
@@ -66,21 +69,11 @@ The pre-#87 import path (`molecule_ai`) produces a warning if it appears.
 
 ## requirements.txt
 
-Must declare `molecule-ai-workspace-runtime` (with a version pin or floor).
+Must declare `molecules-workspace-runtime` exactly once, with an optional version pin or floor. Nested requirement files are inspected within the repository root. Untrusted index overrides, continuations, direct/VCS/archive/local sources, editable installs, and the retired runtime distribution fail closed.
 
 ## CI
 
-Every template repo's `.github/workflows/ci.yml` should be a one-liner that calls the canonical reusable workflow:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  validate:
-    uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@v1
-```
-
-The reusable workflow checks out `molecule-ci` itself (into `.molecule-ci-canonical`) and runs the canonical `validate-workspace-template.py` from there — so no per-repo vendoring of the script is needed. The legacy `.molecule-ci/scripts/` directory in each template repo is being phased out.
+Every template repo installs `templates/ci-workspace-template.yml` as `.gitea/workflows/ci.yml`. The current Gitea deployment does not resolve cross-repository `workflow_call`, so the canonical inline template clones `molecule-ci` into `.molecule-ci` and runs `scripts/validate-workspace-template.py` from that checkout. No validator script is vendored into the consumer repository.
 
 ### T4 live-gate aggregation (templates that inline T4)
 
@@ -101,9 +94,9 @@ if [ "$t4" != "success" ]; then
 fi
 ```
 
-## Adding a new runtime
+## Adding a runtime adapter
 
-1. Add the runtime name to the canonical `runtimes` enum in the marketplace workspace-template schema (`molecule-contracts/workspace-template/workspace-template.schema.json`) — that schema is the SSOT the validator enforces. Then re-vendor it into `molecule-ci/schemas/` (see `schemas/PROVENANCE.md`); `scripts/validate-workspace-template.py` validates against the vendored copy. (The hand-rolled `KNOWN_RUNTIMES` set was retired in the SSOT switch, RFC molecule-core#3285.)
-2. Add the runtime + image ref to `RuntimeImages` in `molecule-core/workspace-server/internal/provisioner/provisioner.go`.
-3. Stand up the `molecule-ai-workspace-template-<runtime>` repo from the existing template-of-templates pattern (issue #105 covers this).
-4. Confirm CI green on the new repo before opening it for general use.
+1. Choose a RuntimeId that satisfies the open SDK contract. Do not add it to an allowlist.
+2. Implement the adapter socket in its template repo and prove the native config, persona, MCP, and tool-enumeration surfaces.
+3. Third-party adapters remain valid without appearing in the official registry. Promotion to first-party support requires an SDK PR updating the official adapter registry and reconciled delivery contract.
+4. For a platform-managed image, add the image mapping in Core and confirm the template publish/conformance pipeline is green before rollout.
