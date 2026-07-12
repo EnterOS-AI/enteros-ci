@@ -309,6 +309,37 @@ def test_runtime_private_index_arg_is_required(
     )
 
 
+@pytest.mark.parametrize(
+    "shadow",
+    (
+        "ENV MOLECULE_RUNTIME_INDEX=https://pypi.org/simple\n",
+        "ENV MOLECULE_RUNTIME_INDEX https://pypi.org/simple\n",
+        "ARG MOLECULE_RUNTIME_INDEX=https://pypi.org/simple\n",
+    ),
+)
+def test_runtime_private_index_declaration_cannot_be_shadowed(
+    validator, tmp_path, monkeypatch, shadow
+):
+    dockerfile = _good_dockerfile().replace(
+        "ARG MOLECULE_RUNTIME_INDEX="
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/\n",
+        "ARG MOLECULE_RUNTIME_INDEX="
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/\n"
+        + shadow,
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("must not shadow" in e for e in validator.ERRORS)
+
+
 def test_wrong_base_image_errors(validator, tmp_path, monkeypatch):
     df = _good_dockerfile().replace("python:3.11-slim", "python:3.10-alpine")
     _materialise(tmp_path, dockerfile=df, config_yaml=_good_config_yaml(),

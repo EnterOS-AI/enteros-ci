@@ -179,10 +179,30 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
         if (args := _pip_args(command, "download")) is not None
     ]
     expected_arg = f"ARG MOLECULE_RUNTIME_INDEX={PRIVATE_INDEX_URL}"
-    if expected_arg not in instructions:
+    index_declarations = [
+        instruction
+        for instruction in instructions
+        if (
+            instruction.upper().startswith("ARG ")
+            and re.match(
+                r"^ARG\s+MOLECULE_RUNTIME_INDEX(?:=|\s|$)",
+                instruction,
+                flags=re.IGNORECASE,
+            )
+        )
+        or (
+            instruction.upper().startswith("ENV ")
+            and re.search(
+                r"(?:^|\s)MOLECULE_RUNTIME_INDEX(?:=|\s|$)",
+                instruction.removeprefix("ENV "),
+                flags=re.IGNORECASE,
+            )
+        )
+    ]
+    if index_declarations != [expected_arg]:
         err(
-            "Dockerfile: private-only runtime wheel acquisition must declare "
-            f"`{expected_arg}`"
+            "Dockerfile: private-only runtime wheel acquisition must declare exactly "
+            f"one `{expected_arg}` and must not shadow it with another ARG or ENV"
         )
     if len(downloads) != 1:
         err(
