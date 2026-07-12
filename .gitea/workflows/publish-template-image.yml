@@ -52,7 +52,7 @@ on:
         default: ""
       runtime_version:
         description: >-
-          molecule-ai-workspace-runtime version to install. Forwarded
+          molecules-workspace-runtime version to install. Forwarded
           as RUNTIME_VERSION docker build-arg. When unset, the
           Dockerfile's requirements.txt pin is used. Cascade-triggered
           builds forward client_payload.runtime_version here so each
@@ -136,9 +136,8 @@ jobs:
         # `from molecule_runtime.plugins import load_plugins`) work in
         # the monorepo's bundled-runtime layout but explode at startup
         # with `ModuleNotFoundError` once the runtime is installed as a
-        # package. This bit claude-code (5 imports), langgraph,
-        # deepagents, and gemini-cli on 2026-04-27 — each one a
-        # separate workspace-stuck-in-provisioning incident.
+        # package. This caused multiple workspace-stuck-in-provisioning
+        # incidents before the shared import manifest was introduced.
         #
         # Source of truth: molecule_runtime/_runtime_modules.json
         # inside the published wheel (emitted by
@@ -162,9 +161,8 @@ jobs:
 
           RUNTIME_MODULES=""
           mkdir -p /tmp/runtime-wheel
-          # HERMETIC + no dependency-confusion: pin the private index (--index-url) and
-          # the CURRENT dist name; the legacy molecule-ai-workspace-runtime is
-          # squatted on public PyPI (0.1.999999). --no-deps ⇒ private-only is safe.
+          # HERMETIC + no dependency-confusion: pin the private index (--index-url)
+          # and current distribution name. --no-deps keeps acquisition private-only.
           if pip download --quiet --index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/ molecules-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
             WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
             if [ -n "$WHEEL" ]; then
@@ -292,8 +290,7 @@ jobs:
         # `from a2a.types import FilePart`) NEVER evaluate at static-
         # import time. The 2026-04-2x v0→v1 a2a-sdk migration shipped 5
         # such regressions in templates that all looked fine at module-
-        # load smoke (claude-code, langgraph, deepagents, gemini-cli,
-        # hermes — every one a separate provisioning incident).
+        # load smoke, producing separate provisioning incidents.
         #
         # This step boots the image with MOLECULE_SMOKE_MODE=1, which
         # routes molecule-runtime through smoke_mode.run_executor_smoke()

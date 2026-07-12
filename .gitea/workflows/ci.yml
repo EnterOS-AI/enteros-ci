@@ -95,7 +95,7 @@ jobs:
         # test functions never executed. Run them for real here.
         #
         # The adapter runtime-load tests self-skip when
-        # molecule-ai-workspace-runtime isn't installed (not in
+        # molecules-workspace-runtime isn't installed (not in
         # scripts/requirements.txt); the git-clone drift tests run because
         # ubuntu-latest ships git. -ra surfaces every skip reason in the log
         # so a silently-skipped suite can't masquerade as a pass.

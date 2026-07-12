@@ -49,13 +49,22 @@ def _good_dockerfile() -> str:
     return (
         "FROM python:3.11-slim\n"
         "ARG RUNTIME_VERSION=\n"
+        "ARG MOLECULE_RUNTIME_INDEX="
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/\n"
         "RUN useradd -u 1000 -m -s /bin/bash agent\n"
         "WORKDIR /app\n"
         "COPY requirements.txt .\n"
-        'RUN pip install -r requirements.txt && \\\n'
+        'RUN runtime_requirement="molecules-workspace-runtime"; \\\n'
         '    if [ -n "${RUNTIME_VERSION}" ]; then \\\n'
-        '      pip install --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \\\n'
-        '    fi\n'
+        '      runtime_requirement="${runtime_requirement}==${RUNTIME_VERSION}"; \\\n'
+        '    fi; \\\n'
+        '    mkdir -p /tmp/molecule-runtime; \\\n'
+        '    pip download --isolated --only-binary=:all: --no-deps \\\n'
+        '      --index-url "${MOLECULE_RUNTIME_INDEX}" \\\n'
+        '      --dest /tmp/molecule-runtime "${runtime_requirement}"; \\\n'
+        '    pip install --isolated -r requirements.txt \\\n'
+        '      /tmp/molecule-runtime/*.whl; \\\n'
+        '    rm -rf /tmp/molecule-runtime\n'
         'ENTRYPOINT ["molecule-runtime"]\n'
     )
 
@@ -71,7 +80,7 @@ def _good_config_yaml() -> str:
 
 
 def _good_requirements_txt() -> str:
-    return "molecule-ai-workspace-runtime>=0.1.0\n"
+    return "molecules-workspace-runtime>=0.1.0\n"
 
 
 def _materialise(tmp_path: Path, dockerfile: str | None = None,
@@ -108,17 +117,9 @@ def test_canonical_template_passes(validator, tmp_path, monkeypatch):
 def test_custom_entrypoint_script_passes_when_it_execs_runtime(validator, tmp_path, monkeypatch):
     """claude-code style: ENTRYPOINT [/entrypoint.sh] + entrypoint.sh
     that exec's molecule-runtime at the end. Must pass."""
-    df = (
-        "FROM python:3.11-slim\n"
-        "ARG RUNTIME_VERSION=\n"
-        "RUN useradd -u 1000 -m -s /bin/bash agent\n"
-        "COPY requirements.txt .\n"
-        'RUN pip install -r requirements.txt && \\\n'
-        '    if [ -n "${RUNTIME_VERSION}" ]; then \\\n'
-        '      pip install --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \\\n'
-        '    fi\n'
-        "COPY entrypoint.sh /entrypoint.sh\n"
-        'ENTRYPOINT ["/entrypoint.sh"]\n'
+    df = _good_dockerfile().replace(
+        'ENTRYPOINT ["molecule-runtime"]\n',
+        'COPY entrypoint.sh /entrypoint.sh\nENTRYPOINT ["/entrypoint.sh"]\n',
     )
     ep = (
         "#!/bin/sh\n"
@@ -139,6 +140,72 @@ def test_custom_entrypoint_script_passes_when_it_execs_runtime(validator, tmp_pa
 
 
 # ───────────────────────────────────────────────────────── Dockerfile drift
+
+def test_runtime_install_must_use_private_only_wheel_acquisition(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile().replace(
+            "pip download --isolated",
+            "pip download --isolated --extra-index-url https://pypi.org/simple/",
+        ),
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("private-only runtime wheel" in e for e in validator.ERRORS), (
+        validator.ERRORS
+    )
+
+
+def test_runtime_must_install_from_local_wheel(
+    validator, tmp_path, monkeypatch
+):
+    dockerfile = _good_dockerfile().replace(
+        "/tmp/molecule-runtime/*.whl",
+        "molecules-workspace-runtime",
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("source-pinned local wheel" in e for e in validator.ERRORS), (
+        validator.ERRORS
+    )
+
+
+def test_runtime_private_index_arg_is_required(
+    validator, tmp_path, monkeypatch
+):
+    dockerfile = _good_dockerfile().replace(
+        "ARG MOLECULE_RUNTIME_INDEX="
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/\n",
+        "",
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("MOLECULE_RUNTIME_INDEX" in e for e in validator.ERRORS), (
+        validator.ERRORS
+    )
+
 
 def test_wrong_base_image_errors(validator, tmp_path, monkeypatch):
     df = _good_dockerfile().replace("python:3.11-slim", "python:3.10-alpine")
@@ -167,14 +234,17 @@ def test_missing_runtime_version_in_run_block_errors(validator, tmp_path, monkey
         "FROM python:3.11-slim\n"
         "ARG RUNTIME_VERSION=\n"
         "RUN useradd -u 1000 -m -s /bin/bash agent\n"
-        "RUN pip install molecule-ai-workspace-runtime\n"
+        "RUN pip install molecules-workspace-runtime\n"
         'ENTRYPOINT ["molecule-runtime"]\n'
     )
     _materialise(tmp_path, dockerfile=df, config_yaml=_good_config_yaml(),
                  requirements=_good_requirements_txt())
     monkeypatch.chdir(tmp_path)
     validator.check_dockerfile()
-    assert any("RUNTIME_VERSION" in e and "RUN block" in e for e in validator.ERRORS)
+    assert any(
+        "RUNTIME_VERSION" in e and "download layer" in e
+        for e in validator.ERRORS
+    )
 
 
 def test_missing_agent_user_errors(validator, tmp_path, monkeypatch):
@@ -248,18 +318,22 @@ def test_string_template_schema_version_errors(validator, tmp_path, monkeypatch)
     assert any("template_schema_version must be int" in e for e in validator.ERRORS)
 
 
-def test_unknown_runtime_errors(validator, tmp_path, monkeypatch):
-    """SSOT switch (molecule-core#3285): the canonical `runtime` enum now lives
-    in the molecule-contracts workspace-template schema, and validation runs
-    against that vendored schema. A runtime outside the enum is therefore a HARD
-    error (the schema is authoritative) — not the old soft warning. To add a new
-    runtime, widen the schema in molecule-contracts."""
+def test_safe_custom_runtime_passes(validator, tmp_path, monkeypatch):
     cfg = _good_config_yaml().replace("claude-code", "my-experimental-runtime")
     _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
                  requirements=_good_requirements_txt())
     monkeypatch.chdir(tmp_path)
     validator.check_config_yaml()
-    assert any("my-experimental-runtime" in e and "canonical runtime" in e
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_unsafe_runtime_id_errors(validator, tmp_path, monkeypatch):
+    cfg = _good_config_yaml().replace("claude-code", "../adapter")
+    _materialise(tmp_path, dockerfile=_good_dockerfile(), config_yaml=cfg,
+                 requirements=_good_requirements_txt())
+    monkeypatch.chdir(tmp_path)
+    validator.check_config_yaml()
+    assert any("runtime" in e and "schema violation" in e
                for e in validator.ERRORS), validator.ERRORS
 
 
@@ -280,7 +354,134 @@ def test_missing_runtime_in_requirements_errors(validator, tmp_path, monkeypatch
                  requirements="fastapi\n")
     monkeypatch.chdir(tmp_path)
     validator.check_requirements()
-    assert any("molecule-ai-workspace-runtime" in e for e in validator.ERRORS)
+    assert any("molecules-workspace-runtime" in e for e in validator.ERRORS)
+
+
+def test_commented_canonical_runtime_distribution_does_not_satisfy_requirement(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements="# molecules-workspace-runtime>=0.3\nfastapi\n",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert any("must declare" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_commented_retired_runtime_distribution_is_ignored(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements=(
+            "molecules-workspace-runtime>=0.3  "
+            "# molecule-ai-workspace-runtime is forbidden\n"
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert validator.ERRORS == [], validator.ERRORS
+
+
+def test_retired_runtime_distribution_errors(validator, tmp_path, monkeypatch):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements="molecule-ai-workspace-runtime>=0.1.0\n",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert any("retired runtime" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_mixed_canonical_and_retired_runtime_distribution_errors(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements=(
+            "molecules-workspace-runtime>=0.3\n"
+            "Molecule_AI.Workspace_Runtime==0.1\n"
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert any("retired runtime" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_retired_runtime_distribution_vcs_fragment_errors(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements=(
+            "molecules-workspace-runtime>=0.3\n"
+            "git+https://example.invalid/runtime.git"
+            "#egg=Molecule_AI.Workspace_Runtime\n"
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert any("retired runtime" in e for e in validator.ERRORS), validator.ERRORS
+
+
+def test_retired_runtime_distribution_in_dockerfile_errors(
+    validator, tmp_path, monkeypatch
+):
+    dockerfile = _good_dockerfile().replace(
+        "pip install --isolated -r requirements.txt",
+        "pip install --isolated -r requirements.txt molecule-ai-workspace-runtime",
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any(
+        "Dockerfile" in e and "retired runtime" in e
+        for e in validator.ERRORS
+    ), validator.ERRORS
+
+
+def test_canonical_runtime_distribution_accepts_pep503_normalization(
+    validator, tmp_path, monkeypatch
+):
+    _materialise(
+        tmp_path,
+        dockerfile=_good_dockerfile(),
+        config_yaml=_good_config_yaml(),
+        requirements="Molecules.Workspace_Runtime>=0.3\n",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_requirements()
+
+    assert validator.ERRORS == [], validator.ERRORS
 
 
 # ───────────────────────────────────────────────────────── adapter.py
@@ -310,13 +511,13 @@ def test_modern_molecule_runtime_import_does_not_warn(validator, tmp_path, monke
 #
 # These tests pin the contract that adapter.py must be importable AND
 # define at least one BaseAdapter subclass — the same path the runtime
-# uses at workspace boot. Skipped when molecule-ai-workspace-runtime
+# uses at workspace boot. Skipped when molecules-workspace-runtime
 # isn't installed in the test environment (the validator's CI workflow
 # guarantees it via `pip install -r requirements.txt` before invoking
 # the validator; local pytest can run with or without it).
 
 def _has_runtime_installed() -> bool:
-    """True if molecule-ai-workspace-runtime is importable. Used to skip
+    """True if molecules-workspace-runtime is importable. Used to skip
     the runtime-load tests when running pytest locally without the
     runtime in the venv."""
     try:
@@ -329,12 +530,12 @@ def _has_runtime_installed() -> bool:
 _RUNTIME_AVAILABLE = _has_runtime_installed()
 _skip_no_runtime = pytest.mark.skipif(
     not _RUNTIME_AVAILABLE,
-    reason="molecule-ai-workspace-runtime not installed in test env",
+    reason="molecules-workspace-runtime not installed in test env",
 )
 
 
 def test_no_adapter_skips_runtime_load_silently(validator, tmp_path, monkeypatch):
-    """No adapter.py = use default langgraph executor from the wheel.
+    """No adapter.py means the packaged default adapter is intentional.
     That's policy, not drift, so runtime-load check should not fire."""
     monkeypatch.chdir(tmp_path)
     validator.check_adapter_runtime_load()
@@ -655,7 +856,7 @@ def test_per_version_dispatch_calls_correct_check(validator, tmp_path, monkeypat
 
 
 def test_runtime_not_installed_warns_not_errors(validator, tmp_path, monkeypatch):
-    """If the validator runs in an env without molecule-ai-workspace-runtime,
+    """If the validator runs in an env without molecules-workspace-runtime,
     we WARN (loud) but don't error — hard-erroring would say 'your adapter
     is broken' when the actual issue is the CI infra. Mock the import to
     simulate this regardless of what's installed locally."""

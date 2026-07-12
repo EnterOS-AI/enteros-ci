@@ -13,13 +13,20 @@ import sys
 from pathlib import Path
 
 import yaml
+from requirements_contract import (
+    PRIVATE_INDEX_URL,
+    RETIRED_RUNTIME_PROJECT,
+    RUNTIME_PROJECT,
+    RequirementsContractError,
+    inspect_requirements,
+)
 
 try:
     from jsonschema import Draft202012Validator
 except ImportError:
     print(
         "::error::jsonschema not installed — validate-workspace-template.py "
-        "validates config.yaml against the vendored molecule-contracts schema "
+        "validates config.yaml against the vendored molecule-ai-sdk schema "
         "and needs `pip install jsonschema`. (CI installs it; see the "
         "validate-workspace-template workflow.)"
     )
@@ -27,13 +34,6 @@ except ImportError:
 
 ERRORS: list[str] = []
 WARNINGS: list[str] = []
-
-# Accepted pip/distribution names for the shared workspace runtime. The current
-# name is `molecules-workspace-runtime`; the legacy `molecule-ai-workspace-runtime`
-# was renamed to close a dependency-confusion hole (the legacy name is squatted on
-# public PyPI) and is still accepted so not-yet-migrated templates keep passing
-# during the transition. The import package `molecule_runtime` is unchanged.
-_RUNTIME_DIST_NAMES = ("molecules-workspace-runtime", "molecule-ai-workspace-runtime")
 
 def err(msg: str) -> None:
     ERRORS.append(msg)
@@ -58,8 +58,8 @@ _WORKSPACE_SCHEMA = None
 
 def _workspace_schema() -> dict | None:
     """Load + cache the vendored marketplace workspace-template JSON-Schema
-    (SSOT, from molecule-contracts). This is the authority for the config.yaml
-    field / required-key / runtime-enum / type shape — see _check_schema_v1."""
+    (SSOT, from molecule-ai-sdk). This is the authority for the config.yaml
+    field, required-key, RuntimeId, and type shape; see _check_schema_v1."""
     global _WORKSPACE_SCHEMA
     if _WORKSPACE_SCHEMA is None:
         path = _find_schema("workspace-template.schema.json")
@@ -70,6 +70,99 @@ def _workspace_schema() -> dict | None:
 
 
 # ───────────────────────────────────────────────────────────── Dockerfile
+
+def _logical_dockerfile_instructions(content: str) -> list[str]:
+    """Join Dockerfile continuation lines for command-level policy checks."""
+    instructions: list[str] = []
+    current = ""
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        continued = raw_line.rstrip().endswith("\\")
+        piece = raw_line.rstrip()
+        if continued:
+            piece = piece[:-1]
+        current = f"{current} {piece.strip()}".strip()
+        if not continued:
+            instructions.append(current)
+            current = ""
+    if current:
+        instructions.append(current)
+    return instructions
+
+
+def _check_private_runtime_wheel_install(dockerfile: str) -> None:
+    """Require private-only wheel acquisition before public dependency solve."""
+    instructions = _logical_dockerfile_instructions(dockerfile)
+    run_instructions = [
+        instruction
+        for instruction in instructions
+        if instruction.upper().startswith("RUN ")
+    ]
+    downloads = [
+        instruction
+        for instruction in run_instructions
+        if re.search(r"\bpip(?:3)?\s+download\b", instruction)
+        and RUNTIME_PROJECT in instruction
+    ]
+    expected_arg = f"ARG MOLECULE_RUNTIME_INDEX={PRIVATE_INDEX_URL}"
+    if expected_arg not in instructions:
+        err(
+            "Dockerfile: private-only runtime wheel acquisition must declare "
+            f"`{expected_arg}`"
+        )
+    if len(downloads) != 1:
+        err(
+            "Dockerfile: private-only runtime wheel acquisition must use exactly "
+            f"one `pip download` for `{RUNTIME_PROJECT}`"
+        )
+    else:
+        download = downloads[0]
+        required_tokens = (
+            "--isolated",
+            "--only-binary=:all:",
+            "--no-deps",
+            "--index-url",
+            "MOLECULE_RUNTIME_INDEX",
+        )
+        missing = [token for token in required_tokens if token not in download]
+        if missing or "--extra-index-url" in download:
+            err(
+                "Dockerfile: private-only runtime wheel acquisition is incomplete; "
+                f"missing={missing}, extra-index={('--extra-index-url' in download)}"
+            )
+
+    download_instruction = downloads[0] if len(downloads) == 1 else ""
+    has_local_solve = (
+        bool(re.search(r"\bpip(?:3)?\s+install\b", download_instruction))
+        and "--isolated" in download_instruction
+        and ".whl" in download_instruction
+        and bool(
+            re.search(
+                r"(?:^|\s)-r\s+requirements\.txt(?=\s|;|$)",
+                download_instruction,
+            )
+        )
+    )
+    if not has_local_solve:
+        err(
+            "Dockerfile: install the source-pinned local runtime `.whl` in the "
+            "same isolated RUN and pip solve as `-r requirements.txt`"
+        )
+
+    for instruction in run_instructions:
+        for match in re.finditer(
+            r"\bpip(?:3)?\s+install\b(?P<args>.*?)(?=(?:&&|;|\|\||$))",
+            instruction,
+        ):
+            args = match.group("args")
+            if RUNTIME_PROJECT in args and ".whl" not in args:
+                err(
+                    "Dockerfile: must not install the private runtime by project "
+                    "name; install the source-pinned local wheel"
+                )
+
 
 def check_dockerfile() -> None:
     if not os.path.isfile("Dockerfile"):
@@ -88,31 +181,30 @@ def check_dockerfile() -> None:
             "the previous runtime (cache trap observed 2026-04-27, 5x in a row)."
         )
 
-    # Accept either the current runtime dist name `molecules-workspace-runtime`
-    # or the legacy `molecule-ai-workspace-runtime`. The dist name was renamed to
-    # close a dependency-confusion hole (the legacy name is squatted on public
-    # PyPI); the legacy name is still accepted so templates that have not yet
-    # migrated keep passing during the transition. The import package
-    # `molecule_runtime` is unchanged. The two names are distinct substrings, so
-    # `any(... in ...)` matches whichever the template actually uses.
-    _reqs_for_runtime = (
-        open("requirements.txt").read() if os.path.isfile("requirements.txt") else ""
-    )
-    if not any(
-        (name in df) or (name in _reqs_for_runtime)
-        for name in _RUNTIME_DIST_NAMES
-    ):
+    requirements_has_runtime = False
+    if os.path.isfile("requirements.txt"):
+        try:
+            inspect_requirements(Path("requirements.txt"), root=Path.cwd())
+            requirements_has_runtime = True
+        except RequirementsContractError:
+            pass  # check_requirements() reports the actionable parse error.
+    if RUNTIME_PROJECT not in df and not requirements_has_runtime:
         err(
             "Dockerfile + requirements.txt: must install the runtime dist "
-            "`molecules-workspace-runtime` (legacy `molecule-ai-workspace-runtime` "
-            "still accepted)"
+            f"`{RUNTIME_PROJECT}`"
         )
+    if RETIRED_RUNTIME_PROJECT in df:
+        err(
+            "Dockerfile: must not install the retired runtime distribution "
+            f"`{RETIRED_RUNTIME_PROJECT}`; use `{RUNTIME_PROJECT}`"
+        )
+
+    _check_private_runtime_wheel_install(df)
 
     if "${RUNTIME_VERSION}" not in df and "$RUNTIME_VERSION" not in df:
         err(
-            "Dockerfile: must reference `${RUNTIME_VERSION}` in a pip install RUN block. "
-            'Pattern: `if [ -n "${RUNTIME_VERSION}" ]; then '
-            'pip install --no-cache-dir --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; fi`'
+            "Dockerfile: must reference `${RUNTIME_VERSION}` in the private "
+            "runtime-wheel download layer so releases invalidate its cache key"
         )
 
     if not re.search(r"useradd[^\n]*\bagent\b", df):
@@ -157,9 +249,9 @@ def check_dockerfile() -> None:
 
 # NOTE (SSOT switch, RFC molecule-core#3285): the former hand-rolled
 # KNOWN_RUNTIMES set and the per-key required/optional validation of config.yaml
-# have been RETIRED. The canonical runtimes enum + the required/type field shape
+# have been RETIRED. The open RuntimeId contract + required/type field shape
 # now live in the marketplace workspace-template JSON-Schema vendored from
-# molecule-contracts (schemas/workspace-template.schema.json), and _check_schema_v1
+# molecule-ai-sdk (schemas/workspace-template.schema.json), and _check_schema_v1
 # validates against it. The schema-version DISPATCH machinery below stays — which
 # contract version is current / deprecated / unknown is molecule-ci migration
 # policy that the JSON-Schema (a single-version shape) does not express.
@@ -171,8 +263,8 @@ def check_dockerfile() -> None:
 # shipped — never edit a SCHEMA_V* constant in place. To bump:
 #
 #   1. Add the v<N+1> shape to the marketplace workspace-template schema in
-#      molecule-contracts and re-vendor it (see schemas/PROVENANCE.md). The
-#      schema — not a hand-maintained key list — is the field/required/enum SSOT.
+#      molecule-ai-sdk and re-vendor it (see schemas/PROVENANCE.md). The
+#      schema — not a hand-maintained key list — is the field/required SSOT.
 #   2. Add `_check_schema_v<N+1>(config)` that validates against that schema
 #      (mirror `_check_schema_v1`; if contracts ships per-version schema files,
 #      point it at the v<N+1> file).
@@ -196,10 +288,10 @@ DEPRECATED_SCHEMA_VERSIONS: set[int] = set()
 
 def _check_schema_v1(config: dict) -> None:
     """v1 contract — validated against the marketplace workspace-template
-    JSON-Schema vendored from molecule-contracts (the SSOT). This REPLACES the
+    JSON-Schema vendored from molecule-ai-sdk (the SSOT). This REPLACES the
     former hand-rolled required-key list + KNOWN_RUNTIMES set: the schema is now
     the authority for which keys are required, which types are allowed, and the
-    canonical `runtime` enum.
+    open bounded/path-safe `runtime` identifier.
 
     `template_schema_version` is verified present + int by the dispatcher before
     we get here; the schema also requires it (integer), which is consistent — a
@@ -208,8 +300,8 @@ def _check_schema_v1(config: dict) -> None:
     Errors are formatted into molecule-ci's own actionable messages (the schema
     drives WHAT is wrong; this function reports it in a stable voice):
       * a `required` violation  -> config.yaml: missing required key `X`
-      * a `runtime` enum failure -> a runtime-not-canonical error (the schema is
-        now authoritative; an unrecognised runtime is a HARD error, not a warn).
+      * a malformed `runtime` -> a RuntimeId shape error. Safe custom IDs pass;
+        official-runtime discovery is a separate SDK registry concern.
     Unknown top-level keys are TOLERATED by the schema (additionalProperties:true,
     forward-compat) but still surfaced as a drift WARNING, with the known-key set
     derived from the schema's own `properties` (no hand-maintained list)."""
@@ -226,13 +318,6 @@ def _check_schema_v1(config: dict) -> None:
                     continue
                 if key not in config and f"'{key}'" in e.message:
                     err(f"config.yaml: missing required key `{key}`")
-        elif e.validator == "enum" and list(e.path) == ["runtime"]:
-            err(
-                f"config.yaml: runtime `{e.instance}` is not a canonical runtime "
-                f"— the marketplace workspace-template contract (molecule-contracts) "
-                f"is the SSOT for the runtimes enum; allowed: {e.validator_value}. "
-                f"Add a new runtime to that schema first."
-            )
         else:
             loc = "/".join(str(p) for p in e.path) or "(root)"
             err(f"config.yaml schema violation at `{loc}`: {e.message}")
@@ -245,7 +330,7 @@ def _check_schema_v1(config: dict) -> None:
         warn(
             f"config.yaml: unknown top-level keys {sorted(unknown)} — "
             f"may be drift. If intentional, add them to the workspace-template "
-            f"schema in molecule-contracts."
+            f"schema in molecule-ai-sdk."
         )
 
 
@@ -309,12 +394,11 @@ def check_requirements() -> None:
     if not os.path.isfile("requirements.txt"):
         warn("no requirements.txt — Dockerfile must install runtime by other means")
         return
-    reqs = open("requirements.txt").read()
-    if not any(name in reqs for name in _RUNTIME_DIST_NAMES):
-        err(
-            "requirements.txt: must declare `molecules-workspace-runtime` "
-            "(legacy `molecule-ai-workspace-runtime` still accepted) as a dependency"
-        )
+    try:
+        inspect_requirements(Path("requirements.txt"), root=Path.cwd())
+    except RequirementsContractError as exc:
+        for message in str(exc).splitlines():
+            err(message)
 
 
 # ───────────────────────────────────────────────────────────── adapter.py
@@ -322,7 +406,7 @@ def check_requirements() -> None:
 def check_adapter() -> None:
     """Static-text adapter checks. Fast — no imports."""
     if not os.path.isfile("adapter.py"):
-        warn("no adapter.py — runtime will use the default langgraph executor from the wheel")
+        warn("no adapter.py — runtime will use its packaged default adapter")
         return
     content = open("adapter.py").read()
     # The original validator's warning ("don't import molecule_runtime") was
@@ -350,15 +434,15 @@ def check_adapter_runtime_load() -> None:
     adapter-load step.
 
     Skip conditions:
-      - No adapter.py exists. Templates without one inherit the default
-        langgraph executor from the wheel (intentional, not drift).
-      - molecule-ai-workspace-runtime not importable in the validator
+      - No adapter.py exists. Templates without one inherit the runtime's
+        packaged default adapter (intentional, not drift).
+      - molecules-workspace-runtime not importable in the validator
         environment. That's a CI-config bug — the workflow that runs
-        this validator must `pip install molecule-ai-workspace-runtime`
+        this validator must run `install_workspace_dependencies.py`
         first. Warn loudly so the misconfiguration surfaces, but don't
         hard-fail (we'd be saying "your adapter is broken" when the
-        actual cause is missing infra). The `pip install -r
-        requirements.txt` step in validate-workspace-template.yml
+        actual cause is missing infra). The source-pinned dependency-install
+        step in validate-workspace-template.yml
         normally satisfies this transitively.
 
     Hard-error conditions:
@@ -377,10 +461,9 @@ def check_adapter_runtime_load() -> None:
     except ImportError:
         warn(
             "adapter.py: skipping runtime-load check — "
-            "`molecule-ai-workspace-runtime` not installed in the validator "
+            "`molecules-workspace-runtime` not installed in the validator "
             "environment. The CI workflow that invokes this script must "
-            "`pip install molecule-ai-workspace-runtime` (or `pip install "
-            "-r requirements.txt`) first; otherwise this critical check is "
+            "run `install_workspace_dependencies.py` first; otherwise this critical check is "
             "silently bypassed."
         )
         return
@@ -459,7 +542,7 @@ def check_adapter_runtime_load() -> None:
             "imports of base classes from molecule_runtime do not "
             "count, and abstract intermediates do not count. "
             "Without a concrete subclass DEFINED here, workspace "
-            "boot falls through to the default langgraph executor "
+            "boot falls through to the packaged default adapter "
             "and ignores this file silently. If that's intentional, "
             "delete adapter.py."
         )

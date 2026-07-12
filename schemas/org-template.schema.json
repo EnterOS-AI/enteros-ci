@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://git.moleculesai.app/molecule-ai/molecule-contracts/org-template/org-template.schema.json",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/org-template/org-template.schema.json",
   "title": "Marketplace Org-Template Contract",
   "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace org-template artifact — the publishable shape of an org-template `org.yaml` (+ per-agent `workspace.yaml`) (molecule-ai-org-template-* repos). DERIVED FROM THE REAL ARTIFACTS + their CI validator: molecule-ai-org-template-molecule-dev/org.yaml (+ community-manager/workspace.yaml), gemini-growth-team, mock-bigorg, validated by validate-org-template.py (required: name; must have at least `workspaces` or `defaults`; each workspace needs `name`; `plugins` must be a list; recurses `children`). TWO COMPOSITION STYLES are tolerated, exactly as the real templates use them: (1) INLINE — `workspaces` is a LIST of recursive workspace nodes with `children[]` (gemini-growth-team, mock-bigorg); (2) FOLDER-TREE — `org.yaml` references per-agent `workspace.yaml` files via custom YAML tags (`!include`, `!external`) that resolve at platform load time to workspace nodes (molecule-dev). Those custom tags are a YAML-load concern (validate-org-template.py parses past them): `!include x.yaml` loads as a plain path STRING and `!external {repo,ref,path}` loads as a plain MAP. `workspaces` therefore accepts BOTH a LIST and a MAP (name->node), and each LIST item is one of THREE forms: a resolved inline workspaceNode, an UNRESOLVED `!external` ref object (`$defs/unresolvedExternalRef`), or an UNRESOLVED `!include` path string. The two unresolved forms are PRE-RESOLUTION refs that core's `!include`/`!external` resolver expands into workspace nodes at platform load time; modelling them lets the real folder-tree templates (molecule-dev, molecule-production) validate as-authored, not only post-resolution. Modelled permissively (additionalProperties:true) because org templates carry heterogeneous per-org config (category_routing, idle-loop knobs, initial prompts).",
   "type": "object",
@@ -17,7 +17,14 @@
     "defaults": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present."
+      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
+      "allOf": [
+        {
+          "properties": {
+            "runtime": { "$ref": "#/$defs/runtimeId", "description": "Open RuntimeId inherited by workspaces without an override." }
+          }
+        }
+      ]
     },
     "workspaces": {
       "description": "The workspace tree. Accepts BOTH a LIST of workspace items (inline composition — gemini-growth-team/mock-bigorg) AND a MAP of name->node. In the FOLDER-TREE style (molecule-dev, molecule-production) the real org.yaml does NOT inline the nodes: it lists per-agent references via custom YAML tags — `!include teams/x.yaml` (a path string after YAML load) and `!external {repo, ref, path}` (a map after YAML load). core's `!include`/`!external` resolver EXPANDS these to full workspace nodes at platform load time; they are PRE-RESOLUTION refs, not resolved nodes. So each LIST item is one of THREE forms: (1) a resolved inline workspaceNode; (2) an unresolved `!external` ref object `{repo, ref, path}`; (3) an unresolved `!include` path STRING. The MAP branch carries the resolved name->node style.",
@@ -65,7 +72,7 @@
       "properties": {
         "name": { "type": "string", "minLength": 1, "description": "Workspace/agent name (required)." },
         "role": { "type": "string", "description": "Free-text role description for the agent." },
-        "runtime": { "$ref": "#/$defs/runtimeId", "description": "Optional per-workspace runtime override (else inherits `defaults.runtime`). Canonical hyphen form." },
+        "runtime": { "$ref": "#/$defs/runtimeId", "description": "Optional open RuntimeId override (else inherits `defaults.runtime`)." },
         "tier": { "type": "integer", "minimum": 1, "maximum": 4, "description": "Optional per-workspace tier override." },
         "model": { "type": "string", "description": "Optional per-workspace model override (e.g. `vertex:gemini-2.5-pro`)." },
         "files_dir": { "type": "string", "description": "Directory under the template repo holding this agent's files (prompts, schedules)." },
@@ -99,17 +106,13 @@
     },
     "runtimeId": {
       "type": "string",
-      "description": "Canonical runtime identifier (hyphen form). Same SSOT enum as plugin-manifest.schema.json; underscore aliases accepted.",
-      "enum": [
-        "claude-code",
-        "codex",
-        "hermes",
-        "openclaw",
-        "crewai",
-        "google-adk",
-        "external",
-        "claude_code"
-      ]
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+([-_][a-z0-9]+)*$",
+      "not": {
+        "pattern": "[^a-z0-9_-]"
+      },
+      "description": "Open, bounded, path-safe runtime identifier. Official first-party support is discovered separately; known aliases normalize without restricting third-party IDs."
     },
     "channel": {
       "type": "object",

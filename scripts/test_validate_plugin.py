@@ -152,3 +152,24 @@ def test_runtimes_must_be_list(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 1
     assert "runtimes must be a list" in r.stdout
+
+
+def test_safe_custom_runtime_passes(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(kind="env-mutator", entrypoint="x", runtimes=["acme-agent"]),
+    )
+    (tmp_path / "go.mod").write_text("module x\n")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout
+
+
+def test_unsafe_runtime_id_fails(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(kind="env-mutator", entrypoint="x", runtimes=["../adapter"]),
+    )
+    (tmp_path / "go.mod").write_text("module x\n")
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "runtimes/0" in r.stdout

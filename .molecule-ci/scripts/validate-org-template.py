@@ -4,7 +4,7 @@
 SSOT switch (RFC molecule-core#3285): the required-key / "workspaces-or-defaults"
 / per-workspace-name / plugins-must-be-a-list checks are NO LONGER hand-rolled —
 they are delegated to the marketplace org-template JSON-Schema (draft 2020-12)
-vendored from molecule-contracts at schemas/org-template.schema.json. That schema
+vendored from molecule-ai-sdk at schemas/org-template.schema.json. That schema
 is the real authority for the org.yaml shape (including the recursive workspace
 node tree and the THREE workspace-item forms: resolved inline node, unresolved
 `!external` ref object, unresolved `!include` path string).
@@ -32,7 +32,7 @@ try:
 except ImportError:
     print(
         "::error::jsonschema not installed — validate-org-template.py validates "
-        "org.yaml against the vendored molecule-contracts schema and needs "
+        "org.yaml against the vendored molecule-ai-sdk schema and needs "
         "`pip install jsonschema`. (CI installs it; see the validate-org-template "
         "workflow.)"
     )
@@ -105,7 +105,7 @@ if not isinstance(org, dict):
     print("::error::org.yaml must be a mapping at the top level")
     sys.exit(1)
 
-# 2. Shape validation against the molecule-contracts SSOT schema. Replaces the
+# 2. Shape validation against the molecule-ai-sdk SSOT schema. Replaces the
 #    former hand-rolled required-name / workspaces-or-defaults / per-workspace
 #    name / plugins-is-a-list checks (and the recursive children walk).
 schema = json.loads(_find_schema("org-template.schema.json").read_text())

@@ -19,8 +19,8 @@
 # script directly. Same single-source-of-truth (the validator lives in
 # molecule-ci, fetched fresh on every run), no cross-repo `uses:` dependency.
 #
-# When the operator-host actions/* mirror lands (internal task #109) and
-# cross-repo `uses:` resolves, this inline job can collapse back to a
+# When the Gitea deployment supports cross-repo reusable workflows, this
+# inline job can collapse back to a
 # `uses:` call WITHOUT changing the emitted `CI / validate` context.
 #
 # The SSOT is cloned into `.molecule-ci` (NOT `.molecule-ci-canonical`) so
