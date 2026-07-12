@@ -2,7 +2,7 @@
 
 Hard rules every `molecule-ai-workspace-template-*` repo must satisfy. Enforced by `scripts/validate-workspace-template.py` through the canonical inline consumer workflow in `templates/ci-workspace-template.yml`.
 
-The contract exists because the 8 template repos were extracted from a single monolithic Dockerfile pre-#87, and have drifted as each was edited piecemeal since. Without this gate, a 28-line cascade-friendly Dockerfile in one repo silently regresses to a 25-line non-cache-friendly one in another, and the next runtime publish ships the previous wheel from a stale layer (cache trap observed five times in a row on 2026-04-27).
+The official templates share a runtime and image contract but evolve independently. This gate prevents a template from silently losing cache invalidation, package provenance, adapter loading, or container-entrypoint behavior.
 
 ## Dockerfile
 
@@ -13,7 +13,7 @@ The contract exists because the 8 template repos were extracted from a single mo
 | `${RUNTIME_VERSION}` referenced in the private wheel download | Just declaring the ARG is not enough; it must select the runtime requirement in the cache-invalidating layer. |
 | `ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/` | The private runtime source is explicit and reviewable. |
 | Private-only wheel acquisition | Download exactly one runtime wheel with `pip download --isolated --only-binary=:all: --no-deps --index-url "${MOLECULE_RUNTIME_INDEX}"`; never use an extra index for this step. |
-| Local-wheel dependency solve | Install `/tmp/molecule-runtime/*.whl` in the same `pip install` solve as `-r requirements.txt`. The local wheel pins runtime provenance while public dependencies resolve normally. |
+| Local-wheel dependency solve | Install `/tmp/molecule-runtime/*.whl` in the same `pip install` solve as a filtered requirements file that excludes the runtime declaration. The local wheel pins runtime provenance, lets `RUNTIME_VERSION` override a checked-in pin, and leaves public dependencies to resolve normally. |
 | `RUN useradd -u 1000 -m -s /bin/bash agent` | The runtime drops to uid 1000 before exec'ing the SDK. Claude Code refuses `--dangerously-skip-permissions` as root for safety. The `/workspace` volume is also chown'd to 1000 by the platform provisioner. |
 | `ENTRYPOINT ["molecule-runtime"]` *or* a wrapper script that exec's `molecule-runtime` | Single entrypoint means the platform's container-restart contract is uniform across templates. Wrapper scripts are allowed (claude-code has `entrypoint.sh` for gosu drop-priv; hermes has `start.sh` to boot the hermes-agent daemon first). |
 | `molecules-workspace-runtime` listed exactly once in `requirements.txt` | The runtime wheel is the contract. The old distribution name is rejected because it was retired after a dependency-confusion incident. Direct/VCS/local runtime sources are rejected. |

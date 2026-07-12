@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Prototype of the beefed-up validate-workspace-template.py.
+"""Validate a workspace template against the canonical Molecule contract.
 
-Run from a template repo's root. Surfaces hard structural drift in
-Dockerfile + config.yaml + requirements.txt against the canonical
-contract. Replaces the existing soft-warnings-only validator at
-molecule-ci/scripts/validate-workspace-template.py.
+Run from the template repository root. The validator checks Dockerfile,
+config.yaml, requirements, adapter loading, and SDK-backed schema boundaries.
 """
 import json
 import os
