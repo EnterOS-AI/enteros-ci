@@ -8,8 +8,11 @@
 # directory is a public interface that must stay byte-identical to canonical.
 #
 # Two byte-identical copies with no guard WILL diverge silently (they already
-# had: a lost `pytest` pin + a mirror-only lint script). This gate fails on any
-# drift. Purely local diff — no network fetch, so no soft-skip: a red here is
+# had: a lost `pytest` pin + a mirror-only lint script). The vendored surface is
+# declared explicitly in `.molecule-ci/scripts/MIRROR.manifest`; the generator
+# `scripts/sync-scripts.sh` regenerates the mirror from canonical (fix-once), and
+# this gate runs that generator in `--check` mode to fail on any drift in either
+# direction. Purely local diff — no network fetch, so no soft-skip: a red here is
 # always a real, actionable drift. See scripts/check-scripts-in-sync.sh.
 
 name: Scripts Sync
@@ -20,6 +23,8 @@ on:
       - "scripts/**"
       - ".molecule-ci/scripts/**"
       - "scripts/check-scripts-in-sync.sh"
+      - "scripts/sync-scripts.sh"
+      - ".molecule-ci/scripts/MIRROR.manifest"
       - ".gitea/workflows/scripts-sync.yml"
   push:
     branches: [main]

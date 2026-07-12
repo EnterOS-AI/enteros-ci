@@ -1,0 +1,36 @@
+# MIRROR.manifest — the EXPLICIT list of canonical scripts/ files that are
+# vendored into the public `.molecule-ci/scripts/` mirror.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `scripts/` is the single source of truth for every validator/lint script.
+# `.molecule-ci/scripts/` is a byte-identical MIRROR that external org-template
+# and plugin repos pin (they clone molecule-ci and invoke
+# `.../.molecule-ci/scripts/validate-*.py`), so the mirror is a public interface
+# that cannot simply be deleted or moved.
+#
+# Before this manifest existed, "which files belong in the mirror" was implicit
+# — it was just whatever happened to already be in `.molecule-ci/scripts/`. That
+# made the drift guard one-directional: it caught a mirror file that diverged
+# from canonical, but it could NOT catch a canonical file that SHOULD be
+# vendored yet was never copied in (inverse drift — a new consumer-needed script
+# silently absent from the public surface).
+#
+# This manifest closes that hole: it is the authoritative set. The generator
+# `scripts/sync-scripts.sh` regenerates the mirror FROM `scripts/` per this list
+# (so a fix is "run the generator", not "remember to hand-copy N files"), and
+# the guard `scripts/check-scripts-in-sync.sh` verifies the mirror is exactly
+# what the generator would produce — enforcing the set in BOTH directions.
+#
+# TO ADD a script to the public vendored surface: add its basename here, then
+# run `bash scripts/sync-scripts.sh` and commit the new `.molecule-ci/scripts/`
+# copy alongside this change.
+#
+# One canonical basename per line. `#` comments and blank lines are ignored.
+# Each name must be a file that exists in `scripts/`.
+
+check-secrets.py
+lint_bp_context_emit_match.py
+requirements.txt
+validate-org-template.py
+validate-plugin.py
