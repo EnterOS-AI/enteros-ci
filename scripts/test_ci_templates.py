@@ -12,6 +12,14 @@ WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
 REUSABLE_WORKSPACE_WORKFLOW = (
     REPO_ROOT / ".gitea" / "workflows" / "validate-workspace-template.yml"
 )
+SECRET_SCANNING_WORKFLOWS = (
+    REUSABLE_WORKSPACE_WORKFLOW,
+    REPO_ROOT / ".gitea" / "workflows" / "validate-plugin.yml",
+    REPO_ROOT / ".gitea" / "workflows" / "validate-org-template.yml",
+    WORKSPACE_TEMPLATE,
+    REPO_ROOT / "templates" / "ci-plugin.yml",
+    REPO_ROOT / "templates" / "ci-org-template.yml",
+)
 
 
 def _workspace_run_steps() -> list[str]:
@@ -63,3 +71,13 @@ def test_workspace_runtime_install_uses_source_pinned_installer(path: Path) -> N
         )
         for command in commands
     )
+
+
+@pytest.mark.parametrize("path", SECRET_SCANNING_WORKFLOWS)
+def test_workflow_secret_scans_use_redacting_canonical_script(path: Path) -> None:
+    content = path.read_text()
+    commands = _all_run_steps(path)
+
+    assert "match.group(0)" not in content
+    scanners = [command for command in commands if "check-secrets.py" in command]
+    assert len(scanners) == 1

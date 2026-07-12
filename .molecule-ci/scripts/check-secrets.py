@@ -33,7 +33,13 @@ PATTERNS = [
 EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
 
 # Directories to skip entirely
-SKIP_DIRS = {'.molecule-ci', '.git', 'node_modules', '__pycache__'}
+SKIP_DIRS = {
+    '.molecule-ci',
+    '.molecule-ci-canonical',
+    '.git',
+    'node_modules',
+    '__pycache__',
+}
 
 
 def is_false_positive(line: str, match: str) -> bool:

@@ -211,6 +211,35 @@ def test_runtime_download_and_install_decoys_do_not_satisfy_contract(
     assert any("retired runtime distribution" in e for e in validator.ERRORS)
 
 
+@pytest.mark.parametrize(
+    "reassignment",
+    (
+        "    MOLECULE_RUNTIME_INDEX=https://pypi.org/simple; \\\n",
+        "    runtime_requirement=other-project; \\\n",
+        "    runtime_project=other-project; \\\n",
+    ),
+)
+def test_runtime_variables_cannot_be_reassigned_after_guard(
+    validator, tmp_path, monkeypatch, reassignment
+):
+    dockerfile = _good_dockerfile().replace(
+        '    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \\\n',
+        '    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \\\n'
+        + reassignment,
+    )
+    _materialise(
+        tmp_path,
+        dockerfile=dockerfile,
+        config_yaml=_good_config_yaml(),
+        requirements=_good_requirements_txt(),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    validator.check_dockerfile()
+
+    assert any("remain immutable" in e for e in validator.ERRORS)
+
+
 def test_unfiltered_solve_is_rejected_when_runtime_versions_can_conflict(
     validator, tmp_path, monkeypatch
 ):

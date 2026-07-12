@@ -151,6 +151,19 @@ def _literal_requirement_name(value: str) -> str | None:
         return None
 
 
+def _assignment_positions(
+    commands: list[list[str]],
+    variable: str,
+) -> list[tuple[int, str]]:
+    pattern = re.compile(rf"^{re.escape(variable)}(?:\+)?=")
+    return [
+        (position, token)
+        for position, command in enumerate(commands)
+        for token in command
+        if pattern.match(token)
+    ]
+
+
 def _check_private_runtime_wheel_install(dockerfile: str) -> None:
     """Require private-only wheel acquisition before public dependency solve."""
     instructions = _logical_dockerfile_instructions(dockerfile)
@@ -204,37 +217,65 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
     target = download_args[-1] if download_args else ""
     variable_targets = {"$runtime_requirement", "${runtime_requirement}"}
     if target in variable_targets:
-        has_project_assignment = any(
-            "runtime_project=molecules-workspace-runtime" in token
-            for command in pre_download_commands
-            for token in command
+        project_assignments = _assignment_positions(
+            pre_download_commands,
+            "runtime_project",
         )
-        has_runtime_guard = any(
-            (
-                command
-                and command[0] == "case"
-                and any("runtime_requirement" in token for token in command)
-                and any("runtime_project" in token for token in command)
+        requirement_assignments = _assignment_positions(
+            pre_download_commands,
+            "runtime_requirement",
+        )
+        index_assignments = _assignment_positions(
+            pre_download_commands,
+            "MOLECULE_RUNTIME_INDEX",
+        )
+        guard_positions = [
+            position
+            for position, command in enumerate(pre_download_commands)
+            if (
+                (
+                    command
+                    and command[0] == "case"
+                    and any("runtime_requirement" in token for token in command)
+                    and any("runtime_project" in token for token in command)
+                )
+                or any(
+                    "runtime_requirement#" in token and "runtime_project" in token
+                    for token in command
+                )
             )
-            or any(
-                "runtime_requirement#" in token and "runtime_project" in token
-                for token in command
-            )
-            for command in pre_download_commands
+        ]
+        valid_project_assignment = (
+            len(project_assignments) == 1
+            and project_assignments[0][1]
+            == "runtime_project=molecules-workspace-runtime"
         )
-        has_filtered_helper = any(
-            "runtime_requirement=$(" in token
-            and "prepare" in token
-            and "runtime_requirements.py" in token.replace("-", "_")
-            and "/tmp/template-requirements.txt" in token
-            and "RUNTIME_VERSION" in token
-            for command in pre_download_commands
-            for token in command
+        valid_helper_assignment = (
+            len(requirement_assignments) == 1
+            and "runtime_requirement=$(" in requirement_assignments[0][1]
+            and "prepare" in requirement_assignments[0][1]
+            and "runtime_requirements.py"
+            in requirement_assignments[0][1].replace("-", "_")
+            and "/tmp/template-requirements.txt" in requirement_assignments[0][1]
+            and "RUNTIME_VERSION" in requirement_assignments[0][1]
         )
-        if not (has_project_assignment and has_runtime_guard and has_filtered_helper):
+        assignments_end = max(
+            project_assignments[0][0] if project_assignments else -1,
+            requirement_assignments[0][0] if requirement_assignments else -1,
+        )
+        valid_runtime_guard = any(
+            position > assignments_end for position in guard_positions
+        )
+        if not (
+            valid_project_assignment
+            and valid_helper_assignment
+            and valid_runtime_guard
+            and not index_assignments
+        ):
             err(
-                "Dockerfile: runtime download variable must come from the filtered "
-                "requirements helper and be guarded by the canonical runtime project"
+                "Dockerfile: runtime download variables must each be assigned once, "
+                "come from the filtered helper, remain immutable, and be guarded "
+                "before the canonical download"
             )
     else:
         try:
@@ -318,7 +359,15 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
             for token in command
         )
         has_canonical_wheel = direct_wheel or (
-            variable_wheel and canonical_wheel_glob in commands_before_install
+            variable_wheel
+            and canonical_wheel_glob in commands_before_install
+            and len(
+                _assignment_positions(
+                    commands[download_position + 1 : install_position],
+                    "runtime_wheel",
+                )
+            )
+            == 1
         )
         has_index_override = any(
             token in {"--index-url", "--extra-index-url"}
