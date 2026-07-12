@@ -140,7 +140,8 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
         and ".whl" in download_instruction
         and bool(
             re.search(
-                r"(?:^|\s)-r\s+requirements\.txt(?=\s|;|$)",
+                r"(?:^|\s)-r\s+(?:requirements\.txt|/tmp/template-requirements\.txt)"
+                r"(?=\s|;|$)",
                 download_instruction,
             )
         )
@@ -148,7 +149,7 @@ def _check_private_runtime_wheel_install(dockerfile: str) -> None:
     if not has_local_solve:
         err(
             "Dockerfile: install the source-pinned local runtime `.whl` in the "
-            "same isolated RUN and pip solve as `-r requirements.txt`"
+            "same isolated RUN and dependency solve"
         )
 
     for instruction in run_instructions:
