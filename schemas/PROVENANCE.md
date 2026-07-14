@@ -9,11 +9,11 @@ repository (the marketplace-catalog contract family, RFC
 | --- | --- | --- |
 | `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
 
-`molecule-ai-sdk` main at re-vendor time: `c58c6697b2455540c515c9a3c6656a34ab286e66`
-(SDK PR #92). The source commit above is the reviewed PR head contained by that
-merge commit.
+`molecule-ai-sdk` main at re-vendor time: `0ff6e1bf09c2be6d08b56a53e88cffd7354ef9b0`
+(SDK PR #98). The source commits above are reviewed PR heads contained by that
+main: plugin/workspace from SDK PR #92 and org-template from SDK PR #98.
 
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 
