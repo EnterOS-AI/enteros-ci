@@ -17,7 +17,8 @@
     "defaults": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
+      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Core does not apply `defaults.channels`; native channel bindings belong on individual workspace nodes. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
+      "not": { "required": ["channels"] },
       "allOf": [
         {
           "properties": {
@@ -83,7 +84,7 @@
         },
         "channels": {
           "type": "array",
-          "description": "External channel bindings (e.g. a Discord channel the agent owns).",
+          "description": "Native Core channel bindings provisioned during org import. Retained until the guarded plugin cutover completes (molecule-core#4267, internal#988). New integrations should prefer kind:channel plugins.",
           "items": { "$ref": "#/$defs/channel" }
         },
         "schedules": {
@@ -116,18 +117,69 @@
     },
     "channel": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["type"],
-      "description": "A channel binding (e.g. Discord).",
+      "description": "A native Core channel binding retained during the channel-plugin migration window.",
       "properties": {
-        "type": { "type": "string", "minLength": 1, "description": "Channel type (e.g. `discord`)." },
+        "type": { "type": "string", "enum": ["telegram", "slack", "discord", "lark"], "description": "A native adapter currently registered by Core." },
         "config": {
           "type": "object",
-          "additionalProperties": true,
-          "description": "Channel-specific config (open object; e.g. `{ webhook_url: ${DISCORD_WEBHOOK_URL} }`)."
+          "additionalProperties": { "type": "string" },
+          "description": "Adapter-specific string config. Values may contain `${VAR_NAME}` references expanded from the workspace environment during org import. Core performs provider-specific format validation after expansion."
+        },
+        "allowed_users": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional adapter user/chat allow-list. SECURITY: omitted or empty means Core accepts every sender in the configured chat/channel; use a non-empty list for a private agent."
         },
         "enabled": { "type": "boolean", "description": "Whether the channel is enabled." }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "telegram" } }, "required": ["type"] },
+          "then": {
+            "required": ["config"],
+            "properties": {
+              "config": {
+                "required": ["bot_token", "chat_id"],
+                "properties": { "bot_token": { "type": "string", "minLength": 1 }, "chat_id": { "type": "string" } }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "slack" } }, "required": ["type"] },
+          "then": {
+            "required": ["config"],
+            "properties": {
+              "config": {
+                "anyOf": [
+                  { "required": ["webhook_url"], "properties": { "webhook_url": { "type": "string", "minLength": 1 } } },
+                  { "required": ["bot_token"], "properties": { "bot_token": { "type": "string", "minLength": 1 } } }
+                ],
+                "allOf": [
+                  {
+                    "if": { "required": ["bot_token"], "properties": { "bot_token": { "type": "string", "minLength": 1 } } },
+                    "then": { "required": ["channel_id"], "properties": { "channel_id": { "type": "string", "minLength": 1 } } }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "enum": ["discord", "lark"] } }, "required": ["type"] },
+          "then": {
+            "required": ["config"],
+            "properties": {
+              "config": {
+                "required": ["webhook_url"],
+                "properties": { "webhook_url": { "type": "string", "minLength": 1 } }
+              }
+            }
+          }
+        }
+      ]
     },
     "schedule": {
       "type": "object",
