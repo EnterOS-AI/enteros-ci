@@ -1,22 +1,13 @@
 # Gitea Actions port of .github/workflows/disable-auto-merge-on-push.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
-# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
-#
-# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
-# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
-# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
-# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
-# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
-# not a switch-on. Until the operator-host server-side flip lands (task #109
-# actions/* mirror) consumers calling this via `uses:` will continue to no-op
-# /404 even after switching to the .gitea/ path. Land this PR first; flip the
-# server config + consumers in a follow-up batch.
+# CURRENT CROSS-REPO INVOCATION CAVEAT (Gitea Actions 1.26.4):
+# A remote workflow_call can be recorded green without executing referenced
+# steps. This definition is retained for future capability and must not be used
+# as a current merge-safety gate without an inline/local executable caller.
 
 name: Disable auto-merge on push
 
-# Reusable guard against the "I enabled auto-merge then pushed more
+# Future reusable guard against the "I enabled auto-merge then pushed more
 # commits" race. Background: on 2026-04-27, PR #2174 in molecule-core
 # auto-merged with only the first commit because the second commit
 # was pushed AFTER the merge queue had already locked the PR's SHA.
@@ -28,7 +19,7 @@ name: Disable auto-merge on push
 # re-engage `gh pr merge --auto` after the new push, with the
 # re-engagement acting as the verification step.
 #
-# Call from each repo's .github/workflows/ via a thin wrapper:
+# FUTURE-ONLY caller example (do not install on the current deployment):
 #
 #   name: pr-guards
 #   on:

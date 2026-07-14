@@ -6,13 +6,11 @@ description: >-
   molecule-canonical-obs (per reference_obs_stack_phase1).
 
 # Why a composite action and not a reusable workflow:
-# Gitea 1.22.6 does NOT support cross-repo `uses: org/repo/.gitea/
-# workflows/X.yml@ref`. Cross-repo reusable workflows landed in
-# go-gitea/gitea PR #32562 in Gitea 1.26.0 (Oct 2025). On 1.22.x the
-# clone fails because act_runner mints a caller-scoped GITEA_TOKEN.
-# Composite actions resolve via the actions-fetch path which works
-# cross-repo on 1.22 against a public callee — that's us. Re-evaluate
-# this choice when the operator host upgrades to Gitea ≥ 1.26.
+# Cross-repository workflow_call does not execute referenced steps in the
+# current Gitea Actions 1.26.4 deployment. Direct cross-repository local-action
+# resolution is also not a validated CI capability. Consumers must explicitly
+# clone molecule-ci and invoke this action by local path until a live probe
+# proves remote `uses:` execution.
 
 inputs:
   gitea-token:

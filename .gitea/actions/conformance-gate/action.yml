@@ -20,14 +20,12 @@ description: >-
 #                           molecule-core/scripts/mcp-verb-manifest-check/check-published-mcp-manifest.mjs.
 #
 # WHY A COMPOSITE ACTION AND NOT A REUSABLE WORKFLOW:
-# Gitea 1.22.6 (the prod operator host) does NOT support cross-repo
-# `uses: org/repo/.gitea/workflows/X.yml@ref`. Cross-repo reusable workflows
-# landed in Gitea 1.26.0 (Oct 2025). Composite actions resolve via the
-# actions-fetch path which works cross-repo on 1.22 against a public callee —
-# that's us. Mirrors .gitea/actions/audit-force-merge/action.yml. Re-evaluate
-# when the operator host upgrades to Gitea >= 1.26 (internal task #109); at that
-# point the adopter's clone-then-`uses:`-local shim can collapse to a direct
-# `uses:` call WITHOUT changing the emitted context name.
+# Cross-repository workflow_call does not execute referenced steps in the
+# current Gitea Actions 1.26.4 deployment, and direct cross-repository local-
+# action resolution is not a validated CI capability. Adopters therefore clone
+# molecule-ci explicitly and invoke this composite action by local path. Keep
+# that clone-then-local shim until a live probe proves remote `uses:` execution;
+# the shim can then collapse without changing the emitted context name.
 #
 # FAIL-CLOSED CONTRACT (both modes): an infra error, an unreachable/unparseable
 # producer manifest, an empty required-capability set, or an incomplete result

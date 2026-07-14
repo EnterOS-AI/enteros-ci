@@ -4,7 +4,10 @@ Shared CI contracts for the Molecule AI ecosystem. Canonical consumer templates 
 
 ## Usage
 
-Cross-repository `workflow_call` is not supported by the current Gitea deployment. Install the matching canonical template as `.gitea/workflows/ci.yml` in the consumer repository:
+Cross-repository `workflow_call` is not a valid gate on the current Gitea
+deployment: a caller can be recorded green with zero referenced steps executed.
+Install the matching canonical template as `.gitea/workflows/ci.yml` in the
+consumer repository:
 
 | Consumer | Canonical template |
 |---|---|
@@ -16,7 +19,9 @@ The inline templates clone `molecule-ci` from `git.moleculesai.app` and execute 
 
 ### Any repo with auto-merge enabled
 
-The reusable `disable-auto-merge-on-push.yml` definition is retained for the point when cross-repository `workflow_call` is supported. Do not install a thin cross-repository caller before that capability is enabled; it will not resolve on the current deployment.
+The reusable `disable-auto-merge-on-push.yml` definition is retained for a
+future proven capability. Do not install a thin cross-repository caller before
+then; on the current deployment it can report success without running its guard.
 
 ## What each workflow validates
 
@@ -81,9 +86,10 @@ asserts it **satisfies** a consumer contract's required capabilities, evaluated
 **mode- and version-specifically**, and is **FAIL-CLOSED** on any error/miss.
 
 Lives at `.gitea/actions/conformance-gate/` and is a **composite action** (not a
-`workflow_call` reusable workflow) for the same reason as `audit-force-merge`:
-cross-repo `uses:` does not resolve on Gitea 1.22.6. Adopters inline-clone this
-SSOT and reference the action by local path — see `templates/ci-conformance-gate.yml`.
+`workflow_call` reusable workflow). Cross-repo action resolution is not part of
+the validated Gitea CI contract, so adopters must not assume it works: they
+inline-clone this SSOT and reference the action by local path. See
+`templates/ci-conformance-gate.yml`.
 
 **Two modes** (`mode:` input):
 

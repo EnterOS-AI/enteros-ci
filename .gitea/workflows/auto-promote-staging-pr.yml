@@ -1,22 +1,13 @@
 # Gitea Actions port of .github/workflows/auto-promote-staging-pr.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
-# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
-#
-# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
-# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
-# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
-# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
-# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
-# not a switch-on. Until the operator-host server-side flip lands (task #109
-# actions/* mirror) consumers calling this via `uses:` will continue to no-op
-# /404 even after switching to the .gitea/ path. Land this PR first; flip the
-# server config + consumers in a follow-up batch.
+# CURRENT CROSS-REPO INVOCATION CAVEAT (Gitea Actions 1.26.4):
+# A remote workflow_call can be recorded green without executing referenced
+# steps. This definition is retained for future capability and must not be used
+# as a current promotion gate without an inline/local executable caller.
 
 name: Auto-promote staging → main (PR-based, reusable)
 
-# Reusable PR-based auto-promote for repos whose `main` branch has
+# Future reusable PR-based auto-promote design for repos whose `main` branch has
 # protection rules that require status checks "set by the expected
 # GitHub apps" — direct `git push` from a workflow can't satisfy
 # that, only PR merges through the merge queue can.
@@ -26,7 +17,7 @@ name: Auto-promote staging → main (PR-based, reusable)
 # direct push and only works on repos WITHOUT required-status-checks.
 # This reusable workflow is for the protected-branch case.
 #
-# Call from each repo's .github/workflows/ via a thin wrapper:
+# FUTURE-ONLY caller example (do not install on the current deployment):
 #
 #   name: Auto-promote staging → main
 #   on:
