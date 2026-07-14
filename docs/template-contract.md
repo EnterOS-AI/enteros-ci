@@ -73,7 +73,12 @@ Must declare `molecules-workspace-runtime` exactly once, with an optional versio
 
 ## CI
 
-Every template repo installs `templates/ci-workspace-template.yml` as `.gitea/workflows/ci.yml`. The current Gitea deployment does not resolve cross-repository `workflow_call`, so the canonical inline template clones `molecule-ci` into `.molecule-ci` and runs `scripts/validate-workspace-template.py` from that checkout. No validator script is vendored into the consumer repository.
+Every template repo installs `templates/ci-workspace-template.yml` as
+`.gitea/workflows/ci.yml`. On the current Gitea deployment a cross-repository
+`workflow_call` can be recorded green without executing referenced steps, so
+the canonical inline template clones `molecule-ci` into `.molecule-ci` and runs
+`scripts/validate-workspace-template.py` from that checkout. No validator script
+is vendored into the consumer repository.
 
 ### T4 live-gate aggregation (templates that inline T4)
 

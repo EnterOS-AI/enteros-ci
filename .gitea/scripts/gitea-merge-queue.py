@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """gitea-merge-queue — conservative serialized merge bot for Gitea.
 
-Gitea 1.22.6 has auto-merge (`pull_auto_merge`) but no GitHub-style merge
-queue. This script provides the missing serialized policy in user space:
+This Gitea deployment exposes auto-merge (`pull_auto_merge`) but the repository
+uses this script for a conservative serialized policy in user space:
 
 1. Pick the oldest open PR carrying QUEUE_LABEL.
 2. Refuse to act unless main is green.

@@ -1,29 +1,17 @@
 # Gitea Actions port of .github/workflows/auto-promote-branch.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
-# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
-#
-# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
-# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
-# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
-# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
-# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
-# not a switch-on. Until the operator-host server-side flip lands (task #109
-# actions/* mirror) consumers calling this via `uses:` will continue to no-op
-# /404 even after switching to the .gitea/ path. Land this PR first; flip the
-# server config + consumers in a follow-up batch.
+# CURRENT CROSS-REPO INVOCATION CAVEAT (Gitea Actions 1.26.4):
+# A remote workflow_call can be recorded green without executing referenced
+# steps. This definition is retained for future capability and must not be used
+# as a current promotion gate without an inline/local executable caller.
 
 name: Auto-promote branch (reusable)
 
-# Reusable version of the auto-promote-staging workflow that lived
-# directly in molecule-ci. Any repo with a `from-branch` (typically
-# `staging`) → `to-branch` (typically `main`) flow can call this
-# workflow to fast-forward `to-branch` whenever `from-branch` is
-# strictly ahead AND all configured required-status-checks on the
-# `from-branch` HEAD are green.
+# Future reusable design for a `from-branch` (typically `staging`) →
+# `to-branch` (typically `main`) fast-forward after configured checks pass.
+# It is not callable as a current cross-repository gate.
 #
-# Adoption pattern in a consumer repo:
+# FUTURE-ONLY adoption pattern (do not install until remote steps are proven):
 #
 #   # .github/workflows/auto-promote.yml
 #   name: Auto-promote staging → main
@@ -45,13 +33,9 @@ name: Auto-promote branch (reusable)
 # Repo-agnostic by design — gates are read from the consuming repo's
 # branch protection at run time, not hardcoded here.
 #
-# `@v1` is a moving tag pointing at the latest 1.x release of
-# molecule-ci's reusable workflows (GitHub Actions convention, same
-# as `actions/checkout@v4`). Breaking changes get a new `@v2` tag
-# and the old `@v1` keeps working for existing consumers. Pinning to
-# `@main` is also accepted for forward-compat preview but is
-# unstable — any change merged here rolls out instantly to consumers
-# without a release boundary.
+# The `@v1` example above documents the intended future release boundary. It
+# does not imply a working current consumer; never pin a required gate to
+# `@main` or to this remote definition on the current deployment.
 #
 # `administration: read` is REQUIRED. Without it, the branch-protection
 # API returns 403 and the workflow refuses to fast-forward (fail-loud),

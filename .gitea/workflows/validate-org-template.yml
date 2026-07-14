@@ -1,18 +1,10 @@
 # Gitea Actions port of .github/workflows/validate-org-template.yml
 # Ported 2026-05-10 per RFC #229 P1-1.
-# Caller migration: update `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref`
-# → `uses: molecule-ai/molecule-ci/.gitea/workflows/...@ref` in your consuming repo.
-# Both .github/ and .gitea/ versions exist transitionally for safe consumer migration.
-#
-# CROSS-REPO INVOCATION CAVEAT (Gitea 1.22.6):
-# Per memory feedback_gitea_cross_repo_uses_blocked + audit-force-merge composite
-# rationale: cross-repo `uses: org/repo/...@ref` (workflow_call form) does NOT
-# resolve on Gitea 1.22.6 because [actions].DEFAULT_ACTIONS_URL=github routes the
-# fetch to github.com (where `molecule-ai` is suspended). This file is a port,
-# not a switch-on. Until the operator-host server-side flip lands (task #109
-# actions/* mirror) consumers calling this via `uses:` will continue to no-op
-# /404 even after switching to the .gitea/ path. Land this PR first; flip the
-# server config + consumers in a follow-up batch.
+# CURRENT CROSS-REPO INVOCATION CAVEAT (Gitea Actions 1.26.4):
+# A remote workflow_call can be recorded green without executing referenced
+# steps. This reusable definition is retained for future capability, but it is
+# not a current consumer gate. Install the matching inline template from
+# `templates/ci-org-template.yml`, which clones and executes canonical scripts.
 
 name: Validate Org Template
 on:

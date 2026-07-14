@@ -1,4 +1,4 @@
-# External serialized merge queue for Gitea 1.22.6.
+# External serialized merge queue used by this repository.
 #
 # Same as molecule-core/.gitea/workflows/gitea-merge-queue.yml but scoped
 # to molecule-ci's needs:
@@ -18,14 +18,10 @@
 name: gitea-merge-queue
 
 on:
-  # `schedule:` removed — the operator conductor tick now runs this queue
-  # in-process every 5 min with THIS repo's env + script version preserved
-  # (operator-config#194; measurement on operator-config#157: the schedule
-  # burned 288 container jobs/day/repo, ~52k/week fleet-wide, ~99% no-ops).
-  # workflow_dispatch below remains the manual fallback vehicle.
-  # Conductor kill-switch (operator host):
-  #   touch /etc/molecule-bootstrap/molecule-ci-conductor-fleet.disabled
-  # Full rollback: restore
+  # `schedule:` was removed during the retired operator-conductor era because
+  # it burned mostly no-op container jobs. No current scheduler is defined in
+  # this repository; workflow_dispatch is the explicit invocation path.
+  # Historical rollback shape (do not restore without a current design):
   #   schedule:
   #     - cron: "*/5 * * * *"
   workflow_dispatch:
