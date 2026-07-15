@@ -2,12 +2,11 @@
 #
 # Same as molecule-core/.gitea/workflows/gitea-merge-queue.yml but scoped
 # to molecule-ci's needs:
-#   - REQUIRED_CONTEXTS omits sop-checklist (not yet installed; added by PR #9)
-#   - Only CI / all-required is required as a pre-merge gate
+#   - the manual workflow fallback requires CI / Workflow YAML lint
+#   - the scoped conductor supplies its merge actor independently in-process
 #
-# Requires repo secret AUTO_SYNC_TOKEN (devops-engineer persona PAT) to be
-# provisioned — without it, the queue will exit 0 (API error → no-op per
-# queue script design) and PRs will not auto-merge.
+# A manual `workflow_dispatch` uses the repo AUTO_SYNC_TOKEN secret. The scoped
+# conductor does not execute this Actions job and supplies its own token.
 #
 # Queue contract:
 #   - add label `merge-queue` to an open same-repo PR
@@ -18,12 +17,13 @@
 name: gitea-merge-queue
 
 on:
-  # `schedule:` was removed during the retired operator-conductor era because
-  # it burned mostly no-op container jobs. No current scheduler is defined in
-  # this repository; workflow_dispatch is the explicit invocation path.
-  # Historical rollback shape (do not restore without a current design):
-  #   schedule:
-  #     - cron: "*/5 * * * *"
+  # `schedule:` was removed to avoid fleet-wide no-op runner jobs. Presence of
+  # this workflow is the opt-in marker consumed by the scoped conductor source
+  # in molecule-ai/operator-config (`bin/molecule-ci-fleet-queue.py`).
+  # `workflow_dispatch` remains the explicit manual fallback. A deployed
+  # conductor's fleet kill switch is
+  # `/var/lib/molecule/disabled/molecule-ci-conductor-fleet`; no operator host
+  # or `/etc/molecule-bootstrap` control path exists.
   workflow_dispatch:
 
 permissions:
@@ -45,11 +45,8 @@ jobs:
 
       - name: Process one queued PR
         env:
-          # AUTO_SYNC_TOKEN is the devops-engineer persona PAT. It is the
-          # non-bypass merge actor allowed by branch protection.
-          # MUST be provisioned as a repo secret in molecule-ci settings.
-          # Without it, the queue script exits 0 (API error → no-op) and
-          # PRs will not auto-merge.
+          # Manual-dispatch fallback only: the repo secret supplies the
+          # non-bypass merge actor. The conductor injects its token separately.
           GITEA_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
           GITEA_HOST: git.moleculesai.app
           REPO: ${{ github.repository }}
@@ -57,11 +54,7 @@ jobs:
           QUEUE_LABEL: merge-queue
           HOLD_LABEL: merge-queue-hold
           UPDATE_STYLE: merge
-          # CI contexts differ by PR age:
-          #   PR #9 (pre-ci.yml): only CI / noop (pull_request) — SKIPPED by queue
-          #   PR #10, #11 (post-ci.yml): CI / Workflow YAML lint, Python script lint,
-          #     Secrets scan — all pass; queue merges oldest-green first.
-          # PR #9 should be closed as duplicate of PR #10 (both add ci.yml).
+          # Current manual-fallback context for this repository.
           REQUIRED_CONTEXTS: CI / Workflow YAML lint (pull_request)
           PUSH_REQUIRED_CONTEXTS: CI / Workflow YAML lint (push)
         run: python3 .gitea/scripts/gitea-merge-queue.py
