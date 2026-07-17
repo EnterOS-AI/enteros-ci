@@ -10,7 +10,7 @@ repository (the marketplace-catalog contract family, RFC
 | `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `68f89520e508d6581fa522ac62b0074bd888dd96` (SDK PR #109) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
-| `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `0d275ccb` (SDK PR #85) |
+| `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 `molecule-ai-sdk` main at re-vendor time: `0ff6e1bf09c2be6d08b56a53e88cffd7354ef9b0`
 (SDK PR #98) for the three marketplace-artifact schemas;

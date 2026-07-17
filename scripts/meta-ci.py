@@ -20,9 +20,10 @@ runners. It:
   * schema-validates ``repo-meta.yaml`` (a malformed manifest is a HARD error), then
   * derives + prints the bundle PLAN (which bundles attach, and why), then
   * EXECUTES the bundle runners that are already canonical + safe to run in-repo
-    (today: ``secret-scan``), and REPORTS the rest as ``planned`` (execution wired
-    in Phase 2 — this file deliberately does not fork heavy docker-build / t4 /
-    codegen bundles yet).
+    (today: ``secret-scan`` and the self-guarding ``node-install-lint-typecheck-build``
+    node bundle), and REPORTS the rest as ``planned`` (execution wired in Phase 2 —
+    this file deliberately does not fork heavy go / docker-build / t4 / codegen
+    bundles yet).
 
 The aggregate result is: manifest-valid AND every EXECUTED runner passed. ``planned``
 bundles are surfaced but neutral. This keeps the advisory spine honest — it reds a
@@ -60,6 +61,7 @@ import argparse
 import datetime as _dt
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +93,7 @@ LAYER_BUNDLES: dict[str, tuple[str, ...]] = {
 CAPABILITY_BUNDLES: dict[str, tuple[str, ...]] = {
     "go-service": ("go-build-vet-lint-test",),
     "python-package": ("py-ruff-pytest-build",),
+    "node-package": ("node-install-lint-typecheck-build",),
     "adapter": ("adapter-conformance",),
     "mcp-server-bake": ("mcp-pin-lockstep",),
     "skills": ("skill-lint",),
@@ -275,10 +278,104 @@ def _run_secret_scan(repo_root: Path) -> tuple[bool, str]:
     return proc.returncode == 0, " | ".join(tail)
 
 
+# ---------------------------------------------------------------------------
+# node-package runner. UNLIKE the go / python / docker language bundles (still
+# 'planned' — they need heavyweight toolchains / registries wired in Phase 2),
+# the node bundle is fully SELF-GUARDING: it no-ops to a clean PASS whenever
+# package.json, the package-manager binary, or a given script is absent. That
+# makes it safe to EXECUTE in-process in Phase 1 (the same posture as
+# secret-scan), giving the deferred Node/TS repos REAL coverage now instead of a
+# planned placeholder.
+#
+# It detects the package manager from the lockfile (precedence pnpm > yarn > npm;
+# a package.json with NO lockfile can't be frozen-installed, so it degrades to a
+# non-frozen `npm install`), runs a frozen install, then runs ONLY the repo's OWN
+# declared lint / typecheck / build scripts (skip-if-absent — it never invents a
+# script the repo does not declare). This one capability covers frontend apps
+# (which declare `build`) and TS/JS services alike; a distinct `frontend`
+# capability is deliberately NOT added (see docs/meta-ci.md).
+# ---------------------------------------------------------------------------
+# lockfile basename -> (manager, frozen-install argv). Ordered = precedence.
+_NODE_LOCKFILES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("pnpm-lock.yaml", "pnpm", ("pnpm", "install", "--frozen-lockfile")),
+    ("yarn.lock", "yarn", ("yarn", "install", "--frozen-lockfile")),
+    ("package-lock.json", "npm", ("npm", "ci")),
+    ("npm-shrinkwrap.json", "npm", ("npm", "ci")),
+)
+# The scripts the bundle opts into IF the repo declares them, in run order.
+_NODE_BUNDLE_SCRIPTS: tuple[str, ...] = ("lint", "typecheck", "build")
+
+
+def _node_install_plan(repo_root: Path) -> tuple[str, list[str]] | None:
+    """Return (manager, install_argv) for the repo, or None when there is no
+    package.json (the bundle then no-ops). Package-manager precedence is
+    pnpm > yarn > npm by lockfile; a package.json with NO lockfile can't be
+    frozen-installed, so it degrades to a plain (non-frozen) `npm install`."""
+    if not (repo_root / "package.json").exists():
+        return None
+    for lock, manager, argv in _NODE_LOCKFILES:
+        if (repo_root / lock).exists():
+            return manager, list(argv)
+    return "npm", ["npm", "install", "--no-audit", "--no-fund"]
+
+
+def _node_declared_scripts(repo_root: Path) -> set[str]:
+    """The set of npm-script names the repo declares (empty on any parse error)."""
+    try:
+        pkg = json.loads((repo_root / "package.json").read_text())
+    except (OSError, ValueError):
+        return set()
+    scripts = pkg.get("scripts")
+    return set(scripts) if isinstance(scripts, dict) else set()
+
+
+def node_bundle_steps(repo_root: Path) -> list[tuple[str, list[str]]] | None:
+    """Ordered (label, argv) steps for the node bundle: the install, then each of
+    lint / typecheck / build the repo DECLARES (skip-if-absent). None => there is
+    no package.json (the bundle no-ops). Pure + deterministic so it is unit-tested
+    without shelling out to a package manager."""
+    plan = _node_install_plan(repo_root)
+    if plan is None:
+        return None
+    manager, install_argv = plan
+    steps: list[tuple[str, list[str]]] = [("install", install_argv)]
+    declared = _node_declared_scripts(repo_root)
+    for script in _NODE_BUNDLE_SCRIPTS:
+        if script in declared:
+            steps.append((script, [manager, "run", script]))
+    return steps
+
+
+def _run_node_package(repo_root: Path) -> tuple[bool, str]:
+    """Execute the node bundle: frozen install + the repo's declared lint /
+    typecheck / build. Self-guards to a clean PASS when package.json or the
+    package-manager binary is absent, so it never reds a runner that simply lacks
+    node tooling (same skip posture as secret-scan's 'not co-located')."""
+    steps = node_bundle_steps(repo_root)
+    if steps is None:
+        return True, "skipped (no package.json)"
+    manager = steps[0][1][0]
+    if shutil.which(manager) is None:
+        return True, f"skipped ({manager} not installed on runner)"
+    ran: list[str] = []
+    for label, argv in steps:
+        proc = subprocess.run(argv, cwd=str(repo_root), capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
+            return False, f"{label} failed ({manager}): " + " | ".join(tail)
+        ran.append(label)
+    if len(ran) > 1:
+        return True, f"{manager}: ran " + ", ".join(ran)
+    return True, f"{manager}: installed; no lint/typecheck/build scripts declared"
+
+
 # Runner table: bundle -> callable(repo_root)->(ok, detail). Bundles absent here are
-# 'planned' — reported but not executed in Phase 1 (execution wired in Phase 2).
+# 'planned' — reported but not executed in Phase 1 (execution wired in Phase 2). The
+# node bundle is executed now (not planned) because it self-guards to a no-op where
+# node tooling / a script is absent — see its definition above.
 EXECUTABLE_RUNNERS = {
     "secret-scan": _run_secret_scan,
+    "node-install-lint-typecheck-build": _run_node_package,
 }
 
 

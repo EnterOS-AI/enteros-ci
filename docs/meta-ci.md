@@ -44,6 +44,7 @@ plus a universal `secret-scan`, minus any live-waived bundle:
 | --- | --- |
 | `go-service` | `go-build-vet-lint-test` |
 | `python-package` | `py-ruff-pytest-build` |
+| `node-package` | `node-install-lint-typecheck-build` |
 | `adapter` | `adapter-conformance` |
 | `mcp-server-bake` | `mcp-pin-lockstep` |
 | `skills` | `skill-lint` |
@@ -55,12 +56,34 @@ plus a universal `secret-scan`, minus any live-waived bundle:
 are warned. Run `python3 scripts/meta-ci.py --repo-root . --plan-json` to see the
 derived plan for any repo.
 
-### Phase 1 executes only the cheap, universal runners
+### `node-package` — one bundle for frontends *and* TS/JS services
+
+`node-package` (RFC #57 Phase 2 — covers the deferred Node/TS repos) detects the package
+manager from the lockfile (precedence **pnpm > yarn > npm**; a `package.json` with no
+lockfile degrades to a non-frozen `npm install`), runs a **frozen** install, then runs
+**only the repo's own declared** `lint` / `typecheck` / `build` scripts (skip-if-absent —
+it never invents a script a repo lacks), on top of the universal `secret-scan`.
+
+**Why no distinct `frontend` capability.** The bundle is *script-driven*: a Next.js/Astro
+app's declared `build` runs under `node-package` exactly as a TS service's `build` does, so
+frontends need no separate treatment in Phase 1 (and a second vocab entry would need a
+second SDK-schema SSOT change for no behavioural gain). Ground truth across the fleet
+supports one bundle — frontends (`molecule-app`, `molecule-admin`, `molecules-market`,
+`landingpage`, `docs`) declare `build`+`lint` (± `typecheck`); `molecule-mobile` declares
+`lint`+`typecheck` (no web `build`); TS services declare a subset (`molecule-mcp-server`:
+`build`; `molecule-tenant-proxy`: none) — all handled by skip-if-absent. If a frontend-only
+artifact check (e.g. assert `build` emitted `.next/`/`dist/`) is later wanted, it layers on
+as a `frontend` capability then.
+
+### Phase 1 executes only the cheap, self-guarding runners
 
 The "matrix" runs **in-process** inside `meta-ci.py` (a loop), so exactly **one**
-aggregate context is produced — not one-per-leg. Phase 1 executes the bundle runners
-that are already canonical and safe to run in-repo (today: `secret-scan`); the rest are
-reported as `planned (execution wired in Phase 2)`. The aggregate is: manifest-valid
+aggregate context is produced — not one-per-leg. Phase 1 executes the bundle runners that
+are safe to run in-repo: `secret-scan` and the `node-install-lint-typecheck-build` bundle
+(the latter **self-guards** to a clean no-op when `package.json`, the package manager, or a
+script is absent — the same skip posture as `secret-scan`). The heavier language bundles
+(`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
+stay reported as `planned (execution wired in Phase 2)`. The aggregate is: manifest-valid
 AND every executed runner green. This is deliberately capture-first / enforce-later.
 
 ## Adoption (advisory)

@@ -42,6 +42,9 @@ def test_known_capabilities_match_vendored_schema():
     assert meta.KNOWN_CAPABILITIES == schema_known
     schema_layers = set(schema["$defs"]["layer"]["enum"])
     assert meta.LAYERS == schema_layers
+    # node-package is a KNOWN capability (added RFC #57 Phase 2) that attaches a bundle.
+    assert "node-package" in meta.KNOWN_CAPABILITIES
+    assert "node-package" in schema_known
     # NEGATIVE control: a bogus capability is NOT in the known set.
     assert "totally-made-up" not in meta.KNOWN_CAPABILITIES
 
@@ -82,6 +85,26 @@ def test_plugin_derivation():
     assert set(plan["bundles_effective"]) == {
         "plugin-manifest-validate", "skill-lint", "settings-fragment-validate", "secret-scan",
     }
+
+
+def test_node_package_derivation():
+    m = {"schema_version": 1, "layer": "service", "capabilities": ["node-package"]}
+    plan = meta.derive_bundles(m)
+    assert set(plan["bundles_effective"]) == {
+        "node-install-lint-typecheck-build", "go-build-vet-lint-test", "secret-scan",
+    }  # layer:service brings the go baseline; the cap adds the node bundle.
+
+
+def test_node_package_cap_plans_node_bundle_not_go():
+    # NEGATIVE control for the whole point of this change: a repo that declares
+    # node-package as its ONLY capability under a neutral layer must plan the NODE
+    # bundle, NOT the go one it used to mis-fit onto. `contract` layer's baseline
+    # is contracts-codegen-drift + secret-scan (no go), isolating the capability.
+    m = {"schema_version": 1, "layer": "contract", "capabilities": ["node-package"]}
+    plan = meta.derive_bundles(m)
+    assert "node-install-lint-typecheck-build" in plan["bundles_effective"]
+    assert "go-build-vet-lint-test" not in plan["bundles_effective"]
+    assert "node-package" not in plan["unknown_capabilities"]  # it is KNOWN now
 
 
 def test_universal_secret_scan_even_with_no_capabilities():
@@ -151,6 +174,77 @@ def test_valid_manifest_has_no_errors():
     m = {"schema_version": 1, "layer": "service", "capabilities": ["go-service"]}
     errors, warnings = meta.validate_manifest(m)
     assert errors == [] and warnings == []
+
+
+# --- node-package bundle runner --------------------------------------------
+def _write_pkg(tmp_path, scripts):
+    (tmp_path / "package.json").write_text(json.dumps({"name": "x", "scripts": scripts}))
+
+
+def test_node_steps_none_without_package_json(tmp_path):
+    assert meta.node_bundle_steps(tmp_path) is None
+
+
+def test_node_steps_pnpm_precedence_over_npm(tmp_path):
+    # A repo with BOTH pnpm-lock.yaml and package-lock.json (a real case:
+    # molecule-app) must resolve deterministically to pnpm (precedence pnpm > npm).
+    _write_pkg(tmp_path, {"build": "x", "lint": "x", "typecheck": "x"})
+    (tmp_path / "pnpm-lock.yaml").write_text("")
+    (tmp_path / "package-lock.json").write_text("{}")
+    steps = meta.node_bundle_steps(tmp_path)
+    assert steps[0] == ("install", ["pnpm", "install", "--frozen-lockfile"])
+    # declared scripts run in canonical order lint -> typecheck -> build, via pnpm.
+    assert [lbl for lbl, _ in steps] == ["install", "lint", "typecheck", "build"]
+    assert steps[3] == ("build", ["pnpm", "run", "build"])
+    # NEGATIVE control: npm was NOT chosen despite package-lock.json being present.
+    assert steps[0][1][0] != "npm"
+
+
+def test_node_steps_npm_ci_with_package_lock(tmp_path):
+    _write_pkg(tmp_path, {"build": "x"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    steps = meta.node_bundle_steps(tmp_path)
+    assert steps[0] == ("install", ["npm", "ci"])
+
+
+def test_node_steps_yarn_frozen(tmp_path):
+    _write_pkg(tmp_path, {"lint": "x"})
+    (tmp_path / "yarn.lock").write_text("")
+    steps = meta.node_bundle_steps(tmp_path)
+    assert steps[0] == ("install", ["yarn", "install", "--frozen-lockfile"])
+
+
+def test_node_steps_no_lockfile_falls_back_to_plain_install(tmp_path):
+    # A package.json with no lockfile can't be frozen-installed (npm ci needs one):
+    # degrade to a non-frozen `npm install`, don't fail (real case: tenant-proxy).
+    _write_pkg(tmp_path, {"test": "x"})
+    steps = meta.node_bundle_steps(tmp_path)
+    assert steps == [("install", ["npm", "install", "--no-audit", "--no-fund"])]
+
+
+def test_node_steps_skip_absent_scripts(tmp_path):
+    # Only DECLARED scripts run; a repo with just `build` (real case: mcp-server)
+    # runs build and skips lint/typecheck — never invents a script it lacks.
+    _write_pkg(tmp_path, {"build": "x", "start": "x", "test": "x"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    labels = [lbl for lbl, _ in meta.node_bundle_steps(tmp_path)]
+    assert labels == ["install", "build"]
+    # NEGATIVE control: lint/typecheck are NOT run (not declared).
+    assert "lint" not in labels and "typecheck" not in labels
+
+
+def test_run_node_package_noop_without_package_json(tmp_path):
+    ok, detail = meta._run_node_package(tmp_path)
+    assert ok and "no package.json" in detail  # self-guards to a clean PASS
+
+
+def test_run_node_package_skips_when_manager_absent(tmp_path, monkeypatch):
+    # A runner without the package-manager binary must SKIP (clean pass), not red.
+    _write_pkg(tmp_path, {"build": "x"})
+    (tmp_path / "pnpm-lock.yaml").write_text("")
+    monkeypatch.setattr(meta.shutil, "which", lambda _cmd: None)
+    ok, detail = meta._run_node_package(tmp_path)
+    assert ok and "not installed" in detail
 
 
 # --- CLI end-to-end (the exact entrypoint CI runs) -------------------------
