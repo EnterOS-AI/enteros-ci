@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 API_CLIENTS = (
     ROOT / ".gitea" / "scripts" / "gitea-merge-queue.py",
     ROOT / "scripts" / "lint_bp_context_emit_match.py",
+    ROOT / "scripts" / "check-askpass-drift.py",
 )
 
 

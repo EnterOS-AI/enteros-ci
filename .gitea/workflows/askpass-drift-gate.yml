@@ -1,0 +1,106 @@
+name: askpass-drift-gate
+
+# molecule-askpass byte-identity drift gate (ADVISORY).
+#
+# The `molecule-askpass` GIT_ASKPASS helper is byte-copied into all four
+# maintained workspace-runtime TEMPLATE repos (claude-code, codex, hermes,
+# openclaw). molecule-core's applyAgentGitIdentity wires
+# GIT_ASKPASS=/usr/local/bin/molecule-askpass into every workspace, so the four
+# images MUST ship the identical helper bytes — a silent divergence in one
+# template gives that runtime subtly different credential-prompt behaviour than
+# the platform contract assumes. This is the same "two byte-identical copies
+# with no guard WILL diverge silently" class that scripts-sync.yml guards for the
+# vendored .molecule-ci/scripts/ mirror, except the four copies live in FOUR
+# repos, so the compare is a cross-repo network fetch (fail-closed) rather than a
+# local diff.
+#
+# The durable fix is a shared workspace-base image (separate owner-gated RFC);
+# this gate is the interim guard (drift-audit finding E1).
+#
+# ADVISORY for now: this job is `continue-on-error: true`, so it NEVER blocks a
+# merge yet. The SCRIPT it runs (scripts/check-askpass-drift.py) is FAIL-CLOSED
+# (exit 2 on any unfetchable/auth error, exit 1 on real byte drift), so it is
+# already correct when later promoted to a required hard gate after a clean
+# advisory window. The offline comparison logic is unit-tested with a negative
+# control in scripts/test_check_askpass_drift.py (run by ci.yml's pytest job).
+#
+# Trigger scope: this fires on molecule-ci PRs that touch the gate itself
+# (self-test) and on manual workflow_dispatch. Wiring it to fire on a template
+# repo's askpass change (e.g. a template-CI call or scheduled dispatch, given
+# this org's no-nightly-cron CI policy) is a follow-up.
+#
+# Modeled on bp-context-drift-gate.yml (cross-repo drift gate conventions):
+# pinned action SHAs, concurrency cancel-in-progress, Infisical-sourced token,
+# in-step token handoff (never through $GITHUB_ENV / a `${{ }}` expression).
+
+on:
+  pull_request:
+    paths:
+      - "scripts/check-askpass-drift.py"
+      - "scripts/test_check_askpass_drift.py"
+      - ".gitea/workflows/askpass-drift-gate.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  askpass-drift-gate:
+    name: molecule-askpass byte-identity drift gate (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # ADVISORY: never block a merge while this gate beds in. The script itself is
+    # fail-closed; this flag only governs whether THIS job's red blocks the PR.
+    # Flip to false (and add the context to BP) to promote to a required gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Assert molecule-askpass is byte-identical across templates (token fetched in-step)
+        id: askpass_drift_assert
+        # TRUSTED-REF GATE: only run the Infisical CI-identity login on trusted
+        # refs so an untrusted fork PR cannot trigger it and harvest
+        # INFISICAL_CI_*. workflow_dispatch is collaborator-only on Gitea; a
+        # pull_request is allowed only when it is NOT from a fork.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          # GITEA_TOKEN is intentionally NOT set here: it is passed as a direct
+          # process env var on the python invocation below so the masked secret
+          # never round-trips through $GITHUB_ENV / a `${{ }}` expression (the
+          # act masked-substitution `***` bug — see bp-context-drift-gate.yml).
+          GITEA_HOST: git.moleculesai.app
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "Infisical universal-auth login returned no accessToken -- failing closed" >&2
+            exit 1
+          fi
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          DRIFT_BOT_TOKEN=$(read_secret DRIFT_BOT_TOKEN %2Fshared%2Fdrift-bot)
+          echo "::add-mask::$DRIFT_BOT_TOKEN"
+          if [ -z "$DRIFT_BOT_TOKEN" ]; then
+            echo "Infisical returned empty for DRIFT_BOT_TOKEN at /shared/drift-bot (prod) -- failing closed" >&2
+            exit 1
+          fi
+          echo "DRIFT_BOT_TOKEN loaded from Infisical (len=${#DRIFT_BOT_TOKEN})"
+          # Hand the token to the checker as a DIRECT process env var so `act`
+          # cannot substitute it with `***`.
+          GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 scripts/check-askpass-drift.py
