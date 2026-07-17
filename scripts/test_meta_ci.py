@@ -238,13 +238,77 @@ def test_run_node_package_noop_without_package_json(tmp_path):
     assert ok and "no package.json" in detail  # self-guards to a clean PASS
 
 
-def test_run_node_package_skips_when_manager_absent(tmp_path, monkeypatch):
-    # A runner without the package-manager binary must SKIP (clean pass), not red.
+def test_run_node_package_fails_closed_when_manager_absent(tmp_path, monkeypatch):
+    # DEFECT (code-review CONFIRMED): a repo that DECLARES node-package but whose
+    # package manager is missing from the runner used to return (True, "skipped …")
+    # — a silent FALSE-GREEN. The lint/typecheck/build never ran, yet the leg went
+    # green in the "every executed runner green" aggregate. The old buggy code was:
+    #     if shutil.which(manager) is None:
+    #         return True, f"skipped ({manager} not installed on runner)"
+    # It must now FAIL CLOSED (runner mis-provisioned; fail, don't skip).
     _write_pkg(tmp_path, {"build": "x"})
     (tmp_path / "pnpm-lock.yaml").write_text("")
     monkeypatch.setattr(meta.shutil, "which", lambda _cmd: None)
     ok, detail = meta._run_node_package(tmp_path)
-    assert ok and "not installed" in detail
+    assert not ok  # NEGATIVE control: old code returned ok=True here (false-green)
+    # actionable message must name the missing manager AND the repo
+    assert "pnpm" in detail
+    assert tmp_path.name in detail
+
+
+def test_absent_manager_reds_the_aggregate(tmp_path, monkeypatch):
+    # End-to-end at the aggregate seam: run_bundles ANDs each executed leg. A repo
+    # whose declared node manager is absent must drive aggregate_ok False — proving
+    # the false-green can no longer contribute a passing leg.
+    _write_pkg(tmp_path, {"lint": "x"})
+    (tmp_path / "yarn.lock").write_text("")
+    monkeypatch.setattr(meta.shutil, "which", lambda _cmd: None)
+    plan = {"bundles_effective": ["node-install-lint-typecheck-build"]}
+    aggregate_ok, lines = meta.run_bundles(plan, tmp_path)
+    assert aggregate_ok is False
+    assert any("FAIL" in ln for ln in lines)
+
+
+class _FakeProc:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def test_node_steps_run_with_a_bounded_timeout(tmp_path, monkeypatch):
+    # DEFECT (code-review CONFIRMED): the node lint/typecheck/build subprocess ran
+    # with NO timeout= — a watch/hanging build blocks meta-ci indefinitely. Every
+    # step must now be invoked with a bounded timeout= kwarg.
+    _write_pkg(tmp_path, {"build": "x"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    monkeypatch.setattr(meta.shutil, "which", lambda _cmd: "/usr/bin/" + _cmd)
+    seen_timeouts: list = []
+
+    def _fake_run(argv, **kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        return _FakeProc()
+
+    monkeypatch.setattr(meta.subprocess, "run", _fake_run)
+    ok, _ = meta._run_node_package(tmp_path)
+    assert ok
+    assert seen_timeouts, "no subprocess step was invoked"
+    # NEGATIVE control: every step carried a positive, bounded timeout (not None).
+    assert all(isinstance(t, (int, float)) and t > 0 for t in seen_timeouts)
+
+
+def test_node_step_timeout_fails_not_hangs(tmp_path, monkeypatch):
+    # A hanging build must surface as a clear FAILURE, never block the job.
+    _write_pkg(tmp_path, {"build": "x"})
+    (tmp_path / "package-lock.json").write_text("{}")
+    monkeypatch.setattr(meta.shutil, "which", lambda _cmd: "/usr/bin/" + _cmd)
+
+    def _timeout_run(argv, **kwargs):
+        raise meta.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(meta.subprocess, "run", _timeout_run)
+    ok, detail = meta._run_node_package(tmp_path)
+    assert not ok  # NEGATIVE control: a hang used to block forever, never returning
+    assert "timed out" in detail.lower()
 
 
 # --- CLI end-to-end (the exact entrypoint CI runs) -------------------------

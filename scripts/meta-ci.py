@@ -281,11 +281,14 @@ def _run_secret_scan(repo_root: Path) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # node-package runner. UNLIKE the go / python / docker language bundles (still
 # 'planned' — they need heavyweight toolchains / registries wired in Phase 2),
-# the node bundle is fully SELF-GUARDING: it no-ops to a clean PASS whenever
-# package.json, the package-manager binary, or a given script is absent. That
-# makes it safe to EXECUTE in-process in Phase 1 (the same posture as
-# secret-scan), giving the deferred Node/TS repos REAL coverage now instead of a
-# planned placeholder.
+# the node bundle is safe to EXECUTE in-process in Phase 1: it no-ops to a clean
+# PASS when there is no package.json (nothing to check) and only runs the scripts
+# the repo actually declares. It does NOT green-skip a missing package manager,
+# though — a repo that DECLARES node-package on a runner lacking its manager is a
+# mis-provisioned runner and FAILS CLOSED (an unrun lint/typecheck/build must
+# never masquerade as a passing leg). Every step is also run under a bounded
+# timeout so a hang can never wedge the job. This gives the deferred Node/TS repos
+# REAL coverage now instead of a planned placeholder.
 #
 # It detects the package manager from the lockfile (precedence pnpm > yarn > npm;
 # a package.json with NO lockfile can't be frozen-installed, so it degrades to a
@@ -304,6 +307,12 @@ _NODE_LOCKFILES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 # The scripts the bundle opts into IF the repo declares them, in run order.
 _NODE_BUNDLE_SCRIPTS: tuple[str, ...] = ("lint", "typecheck", "build")
+# Per-step wall-clock cap for the node install / lint / typecheck / build
+# subprocesses. A watch/hanging build (or one blocked on missing env/secrets) must
+# never block meta-ci indefinitely — on expiry the step is a clear FAILURE, so a
+# hang can never wedge the job. 10 min comfortably covers a cold frozen install +
+# a real build while bounding the pathological hang.
+_NODE_STEP_TIMEOUT_SEC = 600
 
 
 def _node_install_plan(repo_root: Path) -> tuple[str, list[str]] | None:
@@ -348,18 +357,42 @@ def node_bundle_steps(repo_root: Path) -> list[tuple[str, list[str]]] | None:
 
 def _run_node_package(repo_root: Path) -> tuple[bool, str]:
     """Execute the node bundle: frozen install + the repo's declared lint /
-    typecheck / build. Self-guards to a clean PASS when package.json or the
-    package-manager binary is absent, so it never reds a runner that simply lacks
-    node tooling (same skip posture as secret-scan's 'not co-located')."""
+    typecheck / build. No-ops to a clean PASS only when there is no package.json
+    (the repo has no node bundle to run). If the repo DECLARES node-package but the
+    package-manager binary is absent, the runner is mis-provisioned and this FAILS
+    CLOSED — an unrun lint/typecheck/build must never count as a passing leg in the
+    'every executed runner green' aggregate (that was a silent false-green)."""
     steps = node_bundle_steps(repo_root)
     if steps is None:
         return True, "skipped (no package.json)"
     manager = steps[0][1][0]
     if shutil.which(manager) is None:
-        return True, f"skipped ({manager} not installed on runner)"
+        # Fail closed, not a green skip: this repo declares node-package, so a
+        # missing manager means the RUNNER is wrong (image/lockfile disagree), not
+        # that the repo has nothing to check. Report it actionably.
+        return False, (
+            f"{manager} not installed on runner but repo '{repo_root.name}' "
+            f"declares node-package — lint/typecheck/build UNVERIFIED (runner "
+            f"mis-provisioned; install {manager} on the runner image)"
+        )
     ran: list[str] = []
     for label, argv in steps:
-        proc = subprocess.run(argv, cwd=str(repo_root), capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=_NODE_STEP_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            # A hanging/watch step (or one blocked on missing env/secrets) must
+            # surface as a clear failure, never block the job indefinitely.
+            return False, (
+                f"{label} timed out after {_NODE_STEP_TIMEOUT_SEC}s ({manager}) "
+                f"in repo '{repo_root.name}' — a hanging step must never wedge "
+                f"meta-ci"
+            )
         if proc.returncode != 0:
             tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
             return False, f"{label} failed ({manager}): " + " | ".join(tail)
@@ -371,8 +404,9 @@ def _run_node_package(repo_root: Path) -> tuple[bool, str]:
 
 # Runner table: bundle -> callable(repo_root)->(ok, detail). Bundles absent here are
 # 'planned' — reported but not executed in Phase 1 (execution wired in Phase 2). The
-# node bundle is executed now (not planned) because it self-guards to a no-op where
-# node tooling / a script is absent — see its definition above.
+# node bundle is executed now (not planned) because it no-ops safely where there is
+# no package.json / no declared script, fails closed on a missing manager, and bounds
+# every step with a timeout — see its definition above.
 EXECUTABLE_RUNNERS = {
     "secret-scan": _run_secret_scan,
     "node-install-lint-typecheck-build": _run_node_package,

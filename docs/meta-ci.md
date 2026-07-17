@@ -80,8 +80,11 @@ as a `frontend` capability then.
 The "matrix" runs **in-process** inside `meta-ci.py` (a loop), so exactly **one**
 aggregate context is produced — not one-per-leg. Phase 1 executes the bundle runners that
 are safe to run in-repo: `secret-scan` and the `node-install-lint-typecheck-build` bundle
-(the latter **self-guards** to a clean no-op when `package.json`, the package manager, or a
-script is absent — the same skip posture as `secret-scan`). The heavier language bundles
+(the latter no-ops to a clean pass when there is no `package.json` or a script is not
+declared, but **fails closed** — it does not green-skip — when a repo that declares
+`node-package` runs on a runner missing the package manager, because an unrun
+lint/typecheck/build must never count as a passing leg; every step is also bounded by a
+`timeout`, so a hanging build fails rather than wedging the job). The heavier language bundles
 (`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
 stay reported as `planned (execution wired in Phase 2)`. The aggregate is: manifest-valid
 AND every executed runner green. This is deliberately capture-first / enforce-later.
