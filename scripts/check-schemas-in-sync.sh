@@ -29,6 +29,7 @@ declare -A MAP=(
   [plugin-manifest.schema.json]="contracts/plugin-manifest/plugin-manifest.schema.json"
   [workspace-template.schema.json]="contracts/workspace-template/workspace-template.schema.json"
   [org-template.schema.json]="contracts/org-template/org-template.schema.json"
+  [repo-meta.schema.json]="contracts/repo-meta/repo-meta.schema.json"
 )
 
 tmp="$(mktemp -d)"

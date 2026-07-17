@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/repo-meta/repo-meta.schema.json",
+  "$comment": "contract-version 1.0.0 — the SSOT keystone for CI-enforcement (RFC: org CI-enforcement, P1 keystone). Introduced by feat/repo-meta-contract. INERT until the meta-CI router consumes it: this schema describes the `repo-meta.yaml` manifest every repo declares, from which the router derives WHICH CI capability-bundles to attach. Strict routing contract (additionalProperties:false) — deliberately UNLIKE the tolerant marketplace-artifact contracts (plugin-manifest, workspace-template), which are additionalProperties:true because they capture heterogeneous published artifacts. A repo-meta manifest is authored, not captured, and a typo must red the manifest rather than silently drop a bundle.",
+  "title": "Repository Meta Manifest Contract",
+  "description": "SSOT JSON-Schema (draft 2020-12) for `repo-meta.yaml` — the per-repository manifest that declares WHAT A REPO IS (`layer`) and WHAT IT CAN DO (`capabilities`), from which the meta-CI router derives which CI capability-bundles to attach and org-enforcement decides what a repo of a given layer is REQUIRED to carry. This is a NEW, first-class routing contract, NOT an extension of plugin.yaml/config.yaml: those are TOLERANT marketplace-artifact manifests that exist only in plugin/template repos, whereas repo-meta is REQUIRED of every repo including plain service repos that have neither. The contract is STRICT (`additionalProperties:false` at the top level) so a mis-spelled top-level key is a hard error at manifest validation, not a silently-ignored field — the opposite stance from the tolerant marketplace contracts, and deliberately so: a routing manifest that silently swallows an unknown key would silently mis-route CI. `capabilities` is an OPEN set with a KNOWN vocabulary (go-service, python-package, adapter, mcp-server-bake, skills, settings-fragment, env-mutator, docker-image): an unknown capability is NOT schema-rejected (forward-compat — a new bundle can be declared before this schema learns its name) but MUST match the kebab-case pattern (optionally `x-`-prefixed for experimental), so a typo on a KNOWN capability (`go-servcie`) still fails the pattern-or-is-flagged downstream rather than passing as a novel capability. An unknown capability attaches NO CI bundle (the router no-ops on it) and the validator WARNS (does not error) on it. molecule-ci vendors a copy of this schema; the copy is kept honest by schema-sync against this SSOT.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "layer"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. Const 1 for this contract revision. Bumped only on a breaking change to the manifest shape; the router keys its parser on this value."
+    },
+    "layer": {
+      "$ref": "#/$defs/layer",
+      "description": "What KIND of repo this is — the primary routing axis. Exactly one of the layer enum. Org-enforcement uses the layer to decide which capability-bundles a repo of this kind is REQUIRED to declare (e.g. a `service` must declare its language bundle); the router uses it to scope which checks even apply."
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "What this repo CAN DO — the set of CI capability-bundles the router should attach. MAY be empty (a repo that opts into no capability bundles). The KNOWN vocabulary is enumerated in $defs/knownCapability; UNKNOWN values are TOLERATED (forward-compat) provided they match the kebab-case pattern in $defs/capability, but attach no bundle and are WARNED by the validator. Duplicate entries are rejected (uniqueItems).",
+      "items": { "$ref": "#/$defs/capability" },
+      "uniqueItems": true,
+      "default": []
+    },
+    "waivers": {
+      "type": "array",
+      "description": "Optional time-boxed escape hatches. Each waiver suppresses a named CI bundle until a date, and MUST cite an issue in its reason — the audit trail that keeps a waiver from becoming a permanent silent skip. An empty or absent list means no waivers.",
+      "items": { "$ref": "#/$defs/waiver" }
+    }
+  },
+  "$defs": {
+    "layer": {
+      "type": "string",
+      "enum": ["service", "runtime-template", "plugin", "org-template", "contract"],
+      "description": "The repo-kind enum. `service` = a deployable backend service repo (controlplane, core; has neither plugin.yaml nor config.yaml). `runtime-template` = a workspace runtime-template repo (molecule-ai-workspace-template-*; carries an adapter + often an MCP bake). `plugin` = a marketplace plugin repo (molecule-ai-plugin-*). `org-template` = an org-template repo (molecule-ai-org-template-*). `contract` = a contract/SSOT repo (this one; molecule-contracts-shaped)."
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(x-)?[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "A single CI capability-bundle identifier. Lowercase kebab-case (`go-service`), optionally `x-`-prefixed for an experimental bundle (`x-fuzz`). The KNOWN vocabulary is $defs/knownCapability; an identifier OUTSIDE it is allowed by this schema (forward-compat) but the router attaches no bundle for it and the validator warns. The pattern is the load-bearing typo guard: `go_service` or `GoService` or `go-servcie ` (trailing space) fail the pattern, so most fat-finger errors on a KNOWN capability red at validation rather than passing as a novel capability."
+    },
+    "knownCapability": {
+      "$comment": "Documentation-only enumeration of the KNOWN capability vocabulary. NOT referenced by `capability` (which stays open); listed here so the vocabulary has one machine-readable home the docs and validator warn-list derive from. Each attaches a specific CI bundle in the meta-CI router.",
+      "type": "string",
+      "enum": [
+        "go-service",
+        "python-package",
+        "adapter",
+        "mcp-server-bake",
+        "skills",
+        "settings-fragment",
+        "env-mutator",
+        "docker-image"
+      ],
+      "description": "The KNOWN capability vocabulary: `go-service` (Go build/vet/test bundle), `python-package` (ruff+pytest+build bundle), `adapter` (SDK adapter-conformance bundle), `mcp-server-bake` (MCP server image-bake + npm-resolution bundle), `skills` (agentskills.io skill-lint bundle), `settings-fragment` (settings/config fragment validation bundle), `env-mutator` (Go env-mutator plugin-class bundle), `docker-image` (image build + publish bundle)."
+    },
+    "waiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle", "until", "reason"],
+      "description": "A single time-boxed waiver: suppress `bundle` until `until`, justified by `reason` (which must name a tracking issue).",
+      "properties": {
+        "bundle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The CI bundle being waived — a capability identifier ($defs/capability shape) or a check name within a bundle. The router skips attaching/enforcing this bundle for this repo while the waiver is live."
+        },
+        "until": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "description": "Expiry date (RFC 3339 full-date, YYYY-MM-DD). On or after this date the waiver is DEAD — the bundle re-attaches and the router should surface the expiry. Time-boxing is the whole point: a waiver without an expiry is a permanent silent skip, which this contract forbids."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the bundle is waived. MUST name a tracking issue (e.g. `blocked on molecule-core#1234 — flaky bake infra`) so every live waiver is auditable back to a ticket. The router/validator may warn if no issue reference is detected, but the human-readable reason itself is the required field."
+        }
+      }
+    }
+  }
+}

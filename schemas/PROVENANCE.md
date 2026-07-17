@@ -7,13 +7,27 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `68f89520e508d6581fa522ac62b0074bd888dd96` (SDK PR #109) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
+| `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `0d275ccb` (SDK PR #85) |
 
 `molecule-ai-sdk` main at re-vendor time: `0ff6e1bf09c2be6d08b56a53e88cffd7354ef9b0`
-(SDK PR #98). The source commits above are reviewed PR heads contained by that
-main: plugin/workspace from SDK PR #92 and org-template from SDK PR #98.
+(SDK PR #98) for the three marketplace-artifact schemas;
+`d60c7acf53dae697d1c061505e5ba9254ae474db` for `repo-meta.schema.json` (that main
+contains `0d275cc`, the reviewed head of SDK PR #85). The source commits above are
+reviewed PR heads contained by their re-vendor main: plugin-manifest re-vendored
+from SDK PR #109 (contributes.digestProviders — this copy had drifted stale before
+this re-vendor), workspace-template from SDK PR #92, org-template from SDK PR #98,
+repo-meta from SDK PR #85.
+
+> **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
+> capture heterogeneous *published artifacts* and are `additionalProperties:true`.
+> `repo-meta` is the STRICT (`additionalProperties:false`) per-repo *routing* manifest
+> the meta-CI router (`scripts/meta-ci.py`, task internal#57) reads to derive CI
+> capability-bundles. It is vendored here for the same reason — the router validates
+> `repo-meta.yaml` OFFLINE against this copy — and kept byte-honest by the same
+> `check-schemas-in-sync.sh` drift gate.
 
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 

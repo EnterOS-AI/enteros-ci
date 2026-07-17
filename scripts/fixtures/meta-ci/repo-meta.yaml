@@ -1,0 +1,13 @@
+# Fixture for meta-ci-selftest — a valid runtime-template manifest.
+# Exercises the UNION+dedupe path (layer runtime-template already brings
+# adapter-conformance; the `adapter` capability brings it too) and a LIVE waiver.
+schema_version: 1
+layer: runtime-template
+capabilities:
+  - adapter
+  - mcp-server-bake
+  - docker-image
+waivers:
+  - bundle: t4-assert
+    until: "2027-01-01"   # MUST be quoted — bare YYYY-MM-DD parses as a YAML date, not a string
+    reason: "fixture-only waiver — demonstrates live-waiver suppression (internal#57)"
