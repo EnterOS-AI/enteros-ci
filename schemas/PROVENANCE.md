@@ -7,15 +7,15 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119 merge) |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 `molecule-ai-sdk` main at re-vendor time:
-`bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119). The source commits
+`a51a008fc27abf3da599b95b5e101d5db5a7012c`. The source commits
 above are the latest contract-changing commits for each path and are all
-contained by that main: plugin-manifest from PR #119, workspace-template from
+contained by that main: plugin-manifest from PR #121, workspace-template from
 PR #92, org-template from PR #98, and repo-meta from PR #116.
 
 > **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
@@ -55,7 +55,7 @@ When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
 # Pin this to the exact molecule-ai-sdk main verified before the update.
-SDK_COMMIT=bdf41eb0517087acc47c74233755a37425fcd1b7
+SDK_COMMIT=a51a008fc27abf3da599b95b5e101d5db5a7012c
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 for s in plugin-manifest workspace-template org-template repo-meta; do
