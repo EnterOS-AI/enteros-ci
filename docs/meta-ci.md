@@ -79,12 +79,26 @@ as a `frontend` capability then.
 
 The "matrix" runs **in-process** inside `meta-ci.py` (a loop), so exactly **one**
 aggregate context is produced — not one-per-leg. Phase 1 executes the bundle runners that
-are safe to run in-repo: `secret-scan` and the `node-install-lint-typecheck-build` bundle
-(the latter no-ops to a clean pass when there is no `package.json` or a script is not
+are safe to run in-repo: `secret-scan`, `node-install-lint-typecheck-build`, and
+`mcp-pin-lockstep`. The Node bundle
+(which no-ops to a clean pass when there is no `package.json` or a script is not
 declared, but **fails closed** — it does not green-skip — when a repo that declares
 `node-package` runs on a runner missing the package manager, because an unrun
 lint/typecheck/build must never count as a passing leg; every step is also bounded by a
-`timeout`, so a hanging build fails rather than wedging the job). The heavier language bundles
+`timeout`, so a hanging build fails rather than wedging the job).
+
+The MCP lockstep runner follows the artifact chain the image really consumes:
+the template's exact `.runtime-version` selects one runtime wheel and its published
+SHA-256; that wheel must contain the executable prebake helper plus a literal exact MCP
+pin that satisfies its compatible launch range; and the exact MCP npm tarball must exist
+with matching SHA-512/SHA-1 integrity and package identity. The template Dockerfile must
+consume `RUNTIME_VERSION` and execute the helper. All reads are anonymous, bounded, and
+restricted to the public Molecule Gitea package origins. Missing metadata, unavailable or
+malformed responses, hash mismatch, pin/range skew, and a missing exact package all fail
+closed. This does not replace or relax the runtime-template's existing live Tier-4 Docker
+conformance gate.
+
+The heavier language bundles
 (`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
 stay reported as `planned (execution wired in Phase 2)`. The aggregate is: manifest-valid
 AND every executed runner green. This is deliberately capture-first / enforce-later.

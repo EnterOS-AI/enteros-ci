@@ -12,10 +12,15 @@ importlib and its CLI is exercised as a subprocess (the exact entrypoint CI invo
 from __future__ import annotations
 
 import datetime as _dt
+import base64
+import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -111,6 +116,19 @@ def test_universal_secret_scan_even_with_no_capabilities():
     m = {"schema_version": 1, "layer": "plugin", "capabilities": []}
     plan = meta.derive_bundles(m)
     assert "secret-scan" in plan["bundles_effective"]
+
+
+def test_mcp_server_bake_selects_an_executable_lockstep_bundle():
+    manifest = {
+        "schema_version": 1,
+        "layer": "runtime-template",
+        "capabilities": ["mcp-server-bake"],
+    }
+
+    plan = meta.derive_bundles(manifest)
+
+    assert "mcp-pin-lockstep" in plan["bundles_effective"]
+    assert meta.EXECUTABLE_RUNNERS["mcp-pin-lockstep"] is meta._run_mcp_pin_lockstep
 
 
 # --- waivers ----------------------------------------------------------------
@@ -309,6 +327,231 @@ def test_node_step_timeout_fails_not_hangs(tmp_path, monkeypatch):
     ok, detail = meta._run_node_package(tmp_path)
     assert not ok  # NEGATIVE control: a hang used to block forever, never returning
     assert "timed out" in detail.lower()
+
+
+# --- mcp-pin-lockstep bundle runner ----------------------------------------
+def _runtime_wheel(version="0.4.25", pinned="1.8.3", compatible="^1.8.0"):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as wheel:
+        wheel.writestr(
+            "molecule_runtime/platform_agent_identity.py",
+            "\n".join(
+                [
+                    'MANAGEMENT_MCP_NPM_PACKAGE = "@molecule-ai/mcp-server"',
+                    f'MANAGEMENT_MCP_PINNED_VERSION = "{pinned}"',
+                    f'MANAGEMENT_MCP_COMPATIBLE_RANGE = "{compatible}"',
+                    'MANAGEMENT_MCP_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"',
+                    'MANAGEMENT_MCP_REGISTRY_SCOPE = "@molecule-ai"',
+                ]
+            ),
+        )
+        wheel.writestr(
+            "molecule_runtime/scripts/prebake-mgmt-mcp.sh",
+            "\n".join(
+                [
+                    "#!/usr/bin/env bash",
+                    "VER=\"$(_read MANAGEMENT_MCP_PINNED_VERSION)\"",
+                    'SPEC="${PKG}@${VER}"',
+                    '_prebake_self_check "${SPEC}"',
+                ]
+            ),
+        )
+        wheel.writestr(
+            f"molecules_workspace_runtime-{version}.dist-info/METADATA",
+            f"Metadata-Version: 2.4\nName: molecules-workspace-runtime\nVersion: {version}\n",
+        )
+    return stream.getvalue()
+
+
+def _mcp_tarball(version="1.8.3"):
+    stream = io.BytesIO()
+    payload = json.dumps(
+        {
+            "name": "@molecule-ai/mcp-server",
+            "version": version,
+            "bin": {"molecule-mcp": "./dist/index.js"},
+        }
+    ).encode()
+    with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+        info = tarfile.TarInfo("package/package.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    return stream.getvalue()
+
+
+def _mcp_lockstep_fixture(tmp_path, *, runtime_version="0.4.25", pinned="1.8.3"):
+    (tmp_path / ".runtime-version").write_text(runtime_version + "\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.11-slim\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN test -n \"${RUNTIME_VERSION}\"\n"
+        "RUN bash \"$(python3 -c 'import molecule_runtime')/scripts/prebake-mgmt-mcp.sh\"\n"
+    )
+
+    wheel = _runtime_wheel(version=runtime_version, pinned=pinned)
+    wheel_sha = hashlib.sha256(wheel).hexdigest()
+    wheel_name = f"molecules_workspace_runtime-{runtime_version}-py3-none-any.whl"
+    wheel_url = (
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/files/"
+        f"molecules-workspace-runtime/{runtime_version}/{wheel_name}"
+    )
+    index_url = meta.MOLECULE_RUNTIME_INDEX_URL
+    index = f'<a href="{wheel_url}#sha256={wheel_sha}">{wheel_name}</a>'.encode()
+
+    tarball = _mcp_tarball(pinned)
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode()
+    tarball_url = (
+        "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
+        f"%40molecule-ai%2Fmcp-server/-/{pinned}/mcp-server-{pinned}.tgz"
+    )
+    packument_url = (
+        "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
+        "%40molecule-ai%2Fmcp-server"
+    )
+    packument = json.dumps(
+        {
+            "name": "@molecule-ai/mcp-server",
+            "versions": {
+                pinned: {
+                    "name": "@molecule-ai/mcp-server",
+                    "version": pinned,
+                    "dist": {
+                        "integrity": integrity,
+                        "shasum": hashlib.sha1(tarball).hexdigest(),
+                        "tarball": tarball_url,
+                    },
+                }
+            },
+        }
+    ).encode()
+    responses = {
+        index_url: index,
+        wheel_url: wheel,
+        packument_url: packument,
+        tarball_url: tarball,
+    }
+
+    def fetch(url):
+        if url not in responses:
+            raise AssertionError(f"unexpected URL: {url}")
+        return responses[url]
+
+    return responses, fetch
+
+
+def test_mcp_pin_lockstep_verifies_exact_immutable_runtime_and_mcp_artifacts(tmp_path):
+    _, fetch = _mcp_lockstep_fixture(tmp_path)
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=fetch)
+
+    assert ok, detail
+    assert "runtime 0.4.25" in detail
+    assert "@molecule-ai/mcp-server@1.8.3" in detail
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "message"),
+    [
+        (".runtime-version", None, ".runtime-version"),
+        (".runtime-version", "not-a-version\n", "exact stable semver"),
+        (
+            "Dockerfile",
+            "FROM scratch\nARG RUNTIME_VERSION=\nRUN test -n \"${RUNTIME_VERSION}\"\n",
+            "prebake-mgmt-mcp.sh",
+        ),
+    ],
+)
+def test_mcp_pin_lockstep_fails_closed_on_missing_or_malformed_template_metadata(
+    tmp_path, filename, contents, message
+):
+    _, fetch = _mcp_lockstep_fixture(tmp_path)
+    path = tmp_path / filename
+    if contents is None:
+        path.unlink()
+    else:
+        path.write_text(contents)
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=fetch)
+
+    assert not ok
+    assert message in detail
+
+
+def test_mcp_pin_lockstep_fails_closed_on_runtime_wheel_hash_mismatch(tmp_path):
+    responses, fetch = _mcp_lockstep_fixture(tmp_path)
+    wheel_url = next(url for url in responses if url.endswith(".whl"))
+    responses[wheel_url] += b"tampered"
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=fetch)
+
+    assert not ok
+    assert "sha256" in detail.lower()
+
+
+def test_mcp_pin_lockstep_fails_closed_when_exact_mcp_package_is_missing(tmp_path):
+    responses, fetch = _mcp_lockstep_fixture(tmp_path)
+    packument_url = next(
+        url for url in responses if url.endswith("%40molecule-ai%2Fmcp-server")
+    )
+    responses[packument_url] = json.dumps(
+        {"name": "@molecule-ai/mcp-server", "versions": {}}
+    ).encode()
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=fetch)
+
+    assert not ok
+    assert "exact MCP package version 1.8.3" in detail
+
+
+def test_mcp_pin_lockstep_fails_closed_when_registry_is_unavailable(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+
+    def unavailable(_url):
+        raise OSError("registry unavailable")
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=unavailable)
+
+    assert not ok
+    assert "registry unavailable" in detail
+
+
+def test_mcp_pin_lockstep_fails_closed_when_pin_is_outside_compatible_range(tmp_path):
+    responses, fetch = _mcp_lockstep_fixture(tmp_path)
+    wheel_url = next(url for url in responses if url.endswith(".whl"))
+    wheel = _runtime_wheel(pinned="2.0.0", compatible="^1.8.0")
+    responses[wheel_url] = wheel
+    wheel_sha = hashlib.sha256(wheel).hexdigest()
+    responses[meta.MOLECULE_RUNTIME_INDEX_URL] = (
+        responses[meta.MOLECULE_RUNTIME_INDEX_URL]
+        .decode()
+        .replace(
+            responses[meta.MOLECULE_RUNTIME_INDEX_URL]
+            .decode()
+            .split("#sha256=")[1]
+            .split('"')[0],
+            wheel_sha,
+        )
+        .encode()
+    )
+
+    ok, detail = meta._run_mcp_pin_lockstep(tmp_path, fetch_bytes=fetch)
+
+    assert not ok
+    assert "outside compatible range" in detail
+
+
+def test_cli_mcp_bundle_fails_closed_before_network_when_runtime_metadata_missing(tmp_path):
+    (tmp_path / "repo-meta.yaml").write_text(
+        "schema_version: 1\n"
+        "layer: runtime-template\n"
+        "capabilities: [mcp-server-bake]\n"
+    )
+
+    proc = _run_cli(tmp_path)
+
+    assert proc.returncode == 1
+    assert "FAIL    mcp-pin-lockstep" in proc.stdout
+    assert ".runtime-version" in proc.stdout
 
 
 # --- CLI end-to-end (the exact entrypoint CI runs) -------------------------

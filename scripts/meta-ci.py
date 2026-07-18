@@ -20,10 +20,10 @@ runners. It:
   * schema-validates ``repo-meta.yaml`` (a malformed manifest is a HARD error), then
   * derives + prints the bundle PLAN (which bundles attach, and why), then
   * EXECUTES the bundle runners that are already canonical + safe to run in-repo
-    (today: ``secret-scan`` and the self-guarding ``node-install-lint-typecheck-build``
-    node bundle), and REPORTS the rest as ``planned`` (execution wired in Phase 2 —
-    this file deliberately does not fork heavy go / docker-build / t4 / codegen
-    bundles yet).
+    (today: ``secret-scan``, the self-guarding ``node-install-lint-typecheck-build``
+    node bundle, and credential-free immutable-artifact ``mcp-pin-lockstep``), and
+    REPORTS the rest as ``planned`` (execution wired in Phase 2 — this file
+    deliberately does not fork heavy go / docker-build / t4 / codegen bundles yet).
 
 The aggregate result is: manifest-valid AND every EXECUTED runner passed. ``planned``
 bundles are surfaced but neutral. This keeps the advisory spine honest — it reds a
@@ -57,12 +57,24 @@ Usage
 from __future__ import annotations
 
 import argparse
+import ast
+import base64
 import datetime as _dt
+import hashlib
+import hmac
+import io
 import json
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from email.parser import BytesParser
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +120,18 @@ LAYERS = frozenset(LAYER_BUNDLES)
 CAPABILITY_RE = re.compile(r"^(x-)?[a-z0-9]+(-[a-z0-9]+)*$")
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "repo-meta.schema.json"
+
+# Credential-free, read-only package endpoints used by the mcp-pin-lockstep
+# runner. The runtime index publishes an immutable sha256 with every exact wheel;
+# the exact runtime wheel then names the exact MCP npm package artifact to check.
+MOLECULE_RUNTIME_INDEX_URL = (
+    "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/"
+    "molecules-workspace-runtime/"
+)
+_PACKAGE_HOST = "git.moleculesai.app"
+_HTTP_TIMEOUT_SECONDS = 30
+_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+_STABLE_SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 class MetaCIError(Exception):
@@ -401,14 +425,367 @@ def _run_node_package(repo_root: Path) -> tuple[bool, str]:
     return True, f"{manager}: installed; no lint/typecheck/build scripts declared"
 
 
+# ---------------------------------------------------------------------------
+# mcp-server-bake runner. Runtime templates do not own a hand-typed MCP pin:
+# they pin one exact molecules-workspace-runtime wheel and delegate their image
+# bake to that wheel's prebake-mgmt-mcp.sh. This runner follows that real chain:
+#
+#   template .runtime-version -> immutable runtime wheel + sha256
+#     -> embedded exact MCP pin + compatible launch range + prebake helper
+#       -> immutable exact npm tarball + sha512/sha1
+#
+# Every missing/malformed/network/integrity condition is a hard failure. The
+# check is credential-free and read-only; both registries are public. It does
+# not run Docker or alter the existing Tier-4 live-container conformance gate.
+# ---------------------------------------------------------------------------
+class MCPPinLockstepError(Exception):
+    """A fail-closed mcp-pin-lockstep contract violation."""
+
+
+class _RuntimeWheelLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self.hrefs.append(href)
+
+
+def _same_origin(left: str, right: str) -> bool:
+    a = urllib.parse.urlsplit(left)
+    b = urllib.parse.urlsplit(right)
+    return a.scheme == b.scheme == "https" and a.netloc == b.netloc
+
+
+def _fetch_bytes(url: str) -> bytes:
+    """Bounded credential-free GET with the canonical Cloudflare-safe UA."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != _PACKAGE_HOST:
+        raise MCPPinLockstepError(f"refusing untrusted package URL: {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            if not _same_origin(url, final_url):
+                raise MCPPinLockstepError(
+                    f"package request redirected off origin: {url} -> {final_url}"
+                )
+            length = response.headers.get("Content-Length")
+            if length and int(length) > _MAX_ARTIFACT_BYTES:
+                raise MCPPinLockstepError(
+                    f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
+                )
+            payload = response.read(_MAX_ARTIFACT_BYTES + 1)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise MCPPinLockstepError(f"package fetch failed for {url}: {exc}") from exc
+    if len(payload) > _MAX_ARTIFACT_BYTES:
+        raise MCPPinLockstepError(
+            f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
+        )
+    return payload
+
+
+def _exact_semver(value: str, label: str) -> tuple[int, int, int]:
+    match = _STABLE_SEMVER_RE.fullmatch(value)
+    if not match:
+        raise MCPPinLockstepError(f"{label} must be an exact stable semver; got {value!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def _caret_contains(compatible: str, pinned: str) -> bool:
+    if not compatible.startswith("^"):
+        raise MCPPinLockstepError(
+            f"MCP compatible range must be a caret stable semver; got {compatible!r}"
+        )
+    floor = _exact_semver(compatible[1:], "MCP compatible range floor")
+    version = _exact_semver(pinned, "runtime MCP pinned version")
+    if floor[0] > 0:
+        ceiling = (floor[0] + 1, 0, 0)
+    elif floor[1] > 0:
+        ceiling = (0, floor[1] + 1, 0)
+    else:
+        ceiling = (0, 0, floor[2] + 1)
+    return floor <= version < ceiling
+
+
+def _template_runtime_pin(repo_root: Path) -> str:
+    pin_path = repo_root / ".runtime-version"
+    if not pin_path.is_file():
+        raise MCPPinLockstepError("missing .runtime-version exact runtime pin")
+    pin = pin_path.read_text(encoding="utf-8").strip()
+    _exact_semver(pin, ".runtime-version")
+
+    dockerfile = repo_root / "Dockerfile"
+    if not dockerfile.is_file():
+        raise MCPPinLockstepError("missing Dockerfile for mcp-server-bake capability")
+    logical: list[str] = []
+    pending = ""
+    for raw in dockerfile.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pending += (" " if pending else "") + line.removesuffix("\\").rstrip()
+        if line.endswith("\\"):
+            continue
+        logical.append(pending)
+        pending = ""
+    if pending:
+        logical.append(pending)
+
+    if not any(re.match(r"^ARG\s+RUNTIME_VERSION(?:=|\s|$)", line, re.I) for line in logical):
+        raise MCPPinLockstepError("Dockerfile is missing ARG RUNTIME_VERSION")
+    if not any(
+        re.search(r"\$\{?RUNTIME_VERSION\}?", line)
+        for line in logical
+        if not line.upper().startswith("ARG ")
+    ):
+        raise MCPPinLockstepError("Dockerfile does not consume its exact RUNTIME_VERSION pin")
+    if not any(
+        line.upper().startswith("RUN ") and "prebake-mgmt-mcp.sh" in line
+        for line in logical
+    ):
+        raise MCPPinLockstepError(
+            "Dockerfile has no executable RUN delegation to prebake-mgmt-mcp.sh"
+        )
+    return pin
+
+
+def _runtime_wheel_reference(index: bytes, runtime_version: str) -> tuple[str, str]:
+    expected = f"molecules_workspace_runtime-{runtime_version}-py3-none-any.whl"
+    parser = _RuntimeWheelLinks()
+    try:
+        parser.feed(index.decode("utf-8"))
+    except UnicodeError as exc:
+        raise MCPPinLockstepError("runtime package index is not UTF-8 HTML") from exc
+    matches: list[tuple[str, str]] = []
+    for href in parser.hrefs:
+        absolute = urllib.parse.urljoin(MOLECULE_RUNTIME_INDEX_URL, href)
+        parsed = urllib.parse.urlsplit(absolute)
+        if urllib.parse.unquote(Path(parsed.path).name) != expected:
+            continue
+        digest = urllib.parse.parse_qs(parsed.fragment).get("sha256", [])
+        if len(digest) != 1 or not re.fullmatch(r"[0-9a-f]{64}", digest[0]):
+            raise MCPPinLockstepError(
+                f"exact runtime wheel {expected} lacks a valid immutable sha256"
+            )
+        clean = urllib.parse.urlunsplit(parsed._replace(fragment=""))
+        if not _same_origin(clean, MOLECULE_RUNTIME_INDEX_URL):
+            raise MCPPinLockstepError(f"runtime wheel URL leaves trusted registry: {clean}")
+        matches.append((clean, digest[0]))
+    if len(matches) != 1:
+        raise MCPPinLockstepError(
+            f"expected exactly one immutable runtime wheel for {runtime_version}; "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
+def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str]:
+    source_path = "molecule_runtime/platform_agent_identity.py"
+    helper_path = "molecule_runtime/scripts/prebake-mgmt-mcp.sh"
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as wheel:
+            names = set(wheel.namelist())
+            if source_path not in names or helper_path not in names:
+                raise MCPPinLockstepError(
+                    "exact runtime wheel is missing platform_agent_identity.py or "
+                    "prebake-mgmt-mcp.sh"
+                )
+            metadata_paths = [
+                name
+                for name in names
+                if name.endswith(".dist-info/METADATA")
+                and Path(name).name == "METADATA"
+            ]
+            if len(metadata_paths) != 1:
+                raise MCPPinLockstepError(
+                    f"exact runtime wheel must contain one METADATA file; found {len(metadata_paths)}"
+                )
+            metadata = BytesParser().parsebytes(wheel.read(metadata_paths[0]))
+            if metadata.get("Name", "").lower().replace("_", "-") != "molecules-workspace-runtime":
+                raise MCPPinLockstepError("runtime wheel METADATA has the wrong project name")
+            if metadata.get("Version") != runtime_version:
+                raise MCPPinLockstepError(
+                    "runtime wheel METADATA version does not match .runtime-version"
+                )
+            source = wheel.read(source_path).decode("utf-8")
+            helper = wheel.read(helper_path).decode("utf-8")
+    except (zipfile.BadZipFile, KeyError, UnicodeError, OSError) as exc:
+        raise MCPPinLockstepError(f"runtime wheel is malformed: {exc}") from exc
+
+    required = {
+        "MANAGEMENT_MCP_NPM_PACKAGE",
+        "MANAGEMENT_MCP_PINNED_VERSION",
+        "MANAGEMENT_MCP_COMPATIBLE_RANGE",
+        "MANAGEMENT_MCP_REGISTRY",
+        "MANAGEMENT_MCP_REGISTRY_SCOPE",
+    }
+    values: dict[str, str] = {}
+    try:
+        module = ast.parse(source)
+    except SyntaxError as exc:
+        raise MCPPinLockstepError("runtime platform_agent_identity.py is invalid Python") from exc
+    for node in module.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if (
+            isinstance(target, ast.Name)
+            and target.id in required
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            values[target.id] = node.value.value
+    missing = sorted(required - values.keys())
+    if missing:
+        raise MCPPinLockstepError(
+            "runtime wheel lacks literal MCP contract constants: " + ", ".join(missing)
+        )
+    helper_markers = (
+        "_read MANAGEMENT_MCP_PINNED_VERSION",
+        'SPEC="${PKG}@${VER}"',
+        '_prebake_self_check "${SPEC}"',
+    )
+    if any(marker not in helper for marker in helper_markers):
+        raise MCPPinLockstepError(
+            "runtime prebake helper does not consume and offline-check the exact MCP pin"
+        )
+    if not _caret_contains(
+        values["MANAGEMENT_MCP_COMPATIBLE_RANGE"],
+        values["MANAGEMENT_MCP_PINNED_VERSION"],
+    ):
+        raise MCPPinLockstepError(
+            f"runtime MCP pin {values['MANAGEMENT_MCP_PINNED_VERSION']} is outside "
+            f"compatible range {values['MANAGEMENT_MCP_COMPATIBLE_RANGE']}"
+        )
+    package = values["MANAGEMENT_MCP_NPM_PACKAGE"]
+    scope = values["MANAGEMENT_MCP_REGISTRY_SCOPE"]
+    registry = values["MANAGEMENT_MCP_REGISTRY"]
+    if not package.startswith(scope + "/"):
+        raise MCPPinLockstepError("runtime MCP package and registry scope disagree")
+    parsed_registry = urllib.parse.urlsplit(registry)
+    if (
+        parsed_registry.scheme != "https"
+        or parsed_registry.hostname != _PACKAGE_HOST
+        or parsed_registry.path != "/api/packages/molecule-ai/npm/"
+    ):
+        raise MCPPinLockstepError(f"runtime wheel names an untrusted MCP registry: {registry}")
+    return values
+
+
+def _verify_mcp_tarball(
+    tarball: bytes,
+    *,
+    package: str,
+    version: str,
+    integrity: str,
+    shasum: str,
+) -> None:
+    if not integrity.startswith("sha512-"):
+        raise MCPPinLockstepError("exact MCP artifact lacks sha512 integrity")
+    try:
+        expected_sha512 = base64.b64decode(integrity.removeprefix("sha512-"), validate=True)
+    except ValueError as exc:
+        raise MCPPinLockstepError("exact MCP artifact has malformed sha512 integrity") from exc
+    if not hmac.compare_digest(hashlib.sha512(tarball).digest(), expected_sha512):
+        raise MCPPinLockstepError("exact MCP tarball sha512 integrity mismatch")
+    if not re.fullmatch(r"[0-9a-f]{40}", shasum):
+        raise MCPPinLockstepError("exact MCP artifact has malformed sha1 shasum")
+    if not hmac.compare_digest(hashlib.sha1(tarball).hexdigest(), shasum):
+        raise MCPPinLockstepError("exact MCP tarball sha1 shasum mismatch")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as archive:
+            member = archive.getmember("package/package.json")
+            if not member.isfile() or member.size > 1024 * 1024:
+                raise MCPPinLockstepError("MCP tarball package.json is not a bounded file")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise MCPPinLockstepError("MCP tarball package.json is unreadable")
+            manifest = json.loads(stream.read().decode("utf-8"))
+    except (tarfile.TarError, KeyError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MCPPinLockstepError(f"exact MCP tarball is malformed: {exc}") from exc
+    if manifest.get("name") != package or manifest.get("version") != version:
+        raise MCPPinLockstepError("MCP tarball package identity does not match its exact pin")
+    binaries = manifest.get("bin")
+    if not isinstance(binaries, (str, dict)) or not binaries:
+        raise MCPPinLockstepError("MCP tarball has no executable bin entry")
+
+
+def _verify_exact_mcp_artifact(values: dict[str, str], fetch_bytes) -> None:
+    package = values["MANAGEMENT_MCP_NPM_PACKAGE"]
+    version = values["MANAGEMENT_MCP_PINNED_VERSION"]
+    registry = values["MANAGEMENT_MCP_REGISTRY"]
+    packument_url = registry + urllib.parse.quote(package, safe="")
+    try:
+        packument = json.loads(fetch_bytes(packument_url).decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise MCPPinLockstepError("MCP registry packument is malformed JSON") from exc
+    if not isinstance(packument, dict) or packument.get("name") != package:
+        raise MCPPinLockstepError("MCP registry packument has the wrong package identity")
+    versions = packument.get("versions")
+    exact = versions.get(version) if isinstance(versions, dict) else None
+    if not isinstance(exact, dict):
+        raise MCPPinLockstepError(
+            f"exact MCP package version {version} is missing from the registry"
+        )
+    if exact.get("name") != package or exact.get("version") != version:
+        raise MCPPinLockstepError("exact MCP registry metadata has a mismatched identity")
+    dist = exact.get("dist")
+    if not isinstance(dist, dict):
+        raise MCPPinLockstepError("exact MCP registry metadata lacks dist integrity")
+    tarball_url = dist.get("tarball")
+    integrity = dist.get("integrity")
+    shasum = dist.get("shasum")
+    if not all(isinstance(value, str) and value for value in (tarball_url, integrity, shasum)):
+        raise MCPPinLockstepError("exact MCP registry metadata lacks immutable dist fields")
+    if not _same_origin(tarball_url, registry):
+        raise MCPPinLockstepError(f"MCP tarball URL leaves trusted registry: {tarball_url}")
+    _verify_mcp_tarball(
+        fetch_bytes(tarball_url),
+        package=package,
+        version=version,
+        integrity=integrity,
+        shasum=shasum,
+    )
+
+
+def _run_mcp_pin_lockstep(
+    repo_root: Path,
+    *,
+    fetch_bytes=_fetch_bytes,
+) -> tuple[bool, str]:
+    try:
+        runtime_version = _template_runtime_pin(repo_root)
+        index = fetch_bytes(MOLECULE_RUNTIME_INDEX_URL)
+        wheel_url, wheel_sha = _runtime_wheel_reference(index, runtime_version)
+        wheel = fetch_bytes(wheel_url)
+        if not hmac.compare_digest(hashlib.sha256(wheel).hexdigest(), wheel_sha):
+            raise MCPPinLockstepError("exact runtime wheel sha256 mismatch")
+        values = _runtime_contract(wheel, runtime_version)
+        _verify_exact_mcp_artifact(values, fetch_bytes)
+    except Exception as exc:  # runner boundary: every unexpected condition fails closed
+        return False, str(exc) or exc.__class__.__name__
+    package = values["MANAGEMENT_MCP_NPM_PACKAGE"]
+    pinned = values["MANAGEMENT_MCP_PINNED_VERSION"]
+    compatible = values["MANAGEMENT_MCP_COMPATIBLE_RANGE"]
+    return True, (
+        f"runtime {runtime_version} immutable wheel -> {package}@{pinned} immutable tarball; "
+        f"exact pin satisfies launch range {compatible}; template delegates prebake"
+    )
+
+
 # Runner table: bundle -> callable(repo_root)->(ok, detail). Bundles absent here are
 # 'planned' — reported but not executed in Phase 1 (execution wired in Phase 2). The
-# node bundle is executed now (not planned) because it no-ops safely where there is
-# no package.json / no declared script, fails closed on a missing manager, and bounds
-# every step with a timeout — see its definition above.
+# node and MCP lockstep bundles are executed now because they are self-guarding,
+# credential-free, bounded, and fail closed — see their definitions above.
 EXECUTABLE_RUNNERS = {
     "secret-scan": _run_secret_scan,
     "node-install-lint-typecheck-build": _run_node_package,
+    "mcp-pin-lockstep": _run_mcp_pin_lockstep,
 }
 
 
