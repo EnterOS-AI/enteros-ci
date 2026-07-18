@@ -13,16 +13,16 @@
 # cross-repo `uses:` (workflow_call) does NOT execute in Gitea Actions 1.26.4;
 # a consumer job can be recorded as successful without running the referenced
 # steps. The former remote definition was removed from active workflows.
-# This template instead INLINES the validate job: it anon-clones
-# the public molecule-ci SSOT at CI time and runs the canonical validator
+# This template instead INLINES the validate job: it anonymously fetches
+# the public molecule-ci SSOT at an immutable pin and runs the canonical validator
 # script directly. Same single-source-of-truth (the validator lives in
-# molecule-ci, fetched fresh on every run), no cross-repo `uses:` dependency.
+# molecule-ci at a reviewed immutable pin), no cross-repo `uses:` dependency.
 #
 # When the Gitea deployment supports cross-repo reusable workflows, this
 # inline job can collapse back to a
 # `uses:` call WITHOUT changing the emitted `CI / validate` context.
 #
-# The SSOT is cloned into `.molecule-ci` (NOT `.molecule-ci-canonical`) so
+# The SSOT is fetched into `.molecule-ci` (NOT `.molecule-ci-canonical`) so
 # that the canonical check-secrets.py — whose SKIP_DIRS prunes `.molecule-ci`
 # — does not scan molecule-ci's own fixtures and self-flag.
 
@@ -42,13 +42,21 @@ jobs:
     name: validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      MOLECULE_CI_REF: 1896b1cafc4fbf778f7baa9e627c975803fcd088
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
       # Fetch the canonical validator from the public molecule-ci SSOT. A
-      # direct anonymous clone avoids cross-repo workflow/action resolution on
+      # direct anonymous SHA fetch avoids cross-repo workflow/action resolution on
       # Gitea 1.26.4 while still executing one canonical script implementation.
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          git init -q .molecule-ci
+          git -C .molecule-ci remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          git -C .molecule-ci checkout -q --detach FETCH_HEAD
+          test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.11"

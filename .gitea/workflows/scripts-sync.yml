@@ -3,8 +3,8 @@
 #
 # `scripts/` is the canonical location for every validator/lint script (the
 # meta-CI router and molecule-ci's own ci.yml run `scripts/...`). Several
-# external org-template and plugin repos, however, clone molecule-ci and pin
-# `.molecule-ci-canonical/.molecule-ci/scripts/validate-*.py`, so the mirror
+# external org-template and plugin repos, however, fetch an immutable molecule-ci
+# commit and invoke `.molecule-ci/scripts/validate-*.py`, so the mirror
 # directory is a public interface that must stay byte-identical to canonical.
 #
 # Two byte-identical copies with no guard WILL diverge silently (they already

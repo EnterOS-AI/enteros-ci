@@ -17,7 +17,10 @@ consumer repository:
 | satellite/channel/misc repositories | [`templates/ci-minimal.yml`](templates/ci-minimal.yml) |
 | repositories needing the canonical diff secret gate | [`templates/ci-secret-scan.yml`](templates/ci-secret-scan.yml) |
 
-The inline templates clone `molecule-ci` from `git.moleculesai.app` and execute the canonical validators from `scripts/`, so validator logic remains centralized without a cross-repository action fetch.
+The inline templates fetch an immutable, verified `molecule-ci` commit from
+`git.moleculesai.app` and execute the canonical validators from `scripts/`.
+Validator logic remains centralized without a cross-repository action fetch,
+while every consumer update stays an explicit reviewed pin change.
 
 ### Merge and promotion automation
 
@@ -32,9 +35,9 @@ workflow, use the `git.moleculesai.app` API with a least-privilege identity, and
 prove its emitted context before branch protection requires it. Until then,
 operators must treat every new PR head as a new review and CI boundary.
 
-The inline minimal and secret-scan templates pin an immutable molecule-ci
-commit, verify the fetched SHA, execute a canonical script, and assert that
-script's sentinel. Updating the pin is a reviewed dependency change.
+Every inline consumer template pins an immutable molecule-ci commit and
+verifies the fetched SHA before execution. The minimal and secret-scan gates
+also assert script sentinels. Updating any pin is a reviewed dependency change.
 
 ## What each workflow validates
 
@@ -114,18 +117,26 @@ version/dist-tag — evaluation is version-specific), `contract-path` *or*
 `required-caps` (+`transitional-aliases`), `server-mode`, `expected-server-name`,
 `registry-token` (OPTIONAL read:package bearer), `require-token`, `is-trusted`.
 
-**Adoption** (clone-then-`uses:`-local; full example in `templates/ci-conformance-gate.yml`):
+**Adoption** (immutable-fetch-then-`uses:`-local; full example in `templates/ci-conformance-gate.yml`):
 
 ```yaml
-- run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
-- uses: ./.molecule-ci/.gitea/actions/conformance-gate
-  with:
-    mode: package-introspection
-    package: "@molecule-ai/mcp-server"
-    contract-path: contracts/mcp-plugin-delivery.contract.json
-    server-mode: management
-    require-token: "true"
-    registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
+env:
+  MOLECULE_CI_REF: 1896b1cafc4fbf778f7baa9e627c975803fcd088
+steps:
+  - run: |
+      git init -q .molecule-ci
+      git -C .molecule-ci remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+      git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+      git -C .molecule-ci checkout -q --detach FETCH_HEAD
+      test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
+  - uses: ./.molecule-ci/.gitea/actions/conformance-gate
+    with:
+      mode: package-introspection
+      package: "@molecule-ai/mcp-server"
+      contract-path: contracts/mcp-plugin-delivery.contract.json
+      server-mode: management
+      require-token: "true"
+      registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
 ```
 
 **Rollout** (soak-then-promote): ship the adopter caller as a STANDALONE

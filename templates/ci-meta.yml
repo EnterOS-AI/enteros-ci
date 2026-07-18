@@ -9,10 +9,10 @@
 # WHY INLINE (not `uses: molecule-ai/molecule-ci/.gitea/workflows/meta-ci.yml`):
 # cross-repo `workflow_call` is NOT a trustworthy gate on Gitea Actions 1.26.4 —
 # a consumer job can be recorded green WITHOUT running the referenced steps
-# (internal#1000). This template instead anon-clones the public molecule-ci SSOT
-# at CI time and runs the canonical `scripts/meta-ci.py` directly. Same single
-# source of truth (the router lives in molecule-ci, fetched fresh every run), no
-# cross-repo `uses:` dependency.
+# (internal#1000). This template instead anonymously fetches the public molecule-ci SSOT
+# at a reviewed immutable commit and runs the canonical `scripts/meta-ci.py`
+# directly. Same single source of truth (the router lives in molecule-ci), no
+# mutable or cross-repo `uses:` dependency.
 #
 # WHY IT CANNOT BLOCK A MERGE (advisory contract):
 # the router step is `continue-on-error: true` and this workflow posts NO commit
@@ -43,13 +43,15 @@ jobs:
     name: meta (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      MOLECULE_CI_REF: 1896b1cafc4fbf778f7baa9e627c975803fcd088
     # ADVISORY: never block a merge while the router beds in. The router SCRIPT
     # exits nonzero on an invalid repo-meta / failed bundle; this flag only
     # governs whether THIS job's red blocks the PR (it does not).
     continue-on-error: true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
-      # Anon-clone the molecule-ci SSOT; run the CANONICAL scripts/meta-ci.py
+      # Fetch the molecule-ci SSOT by immutable SHA; run the CANONICAL scripts/meta-ci.py
       # (schemas/ is its sibling there, so schema validation is intact). Direct
       # git-clone avoids unsupported cross-repository workflow/action resolution
       # on Gitea 1.26.4.
@@ -61,7 +63,12 @@ jobs:
         run: |
           set +e
           python3 -m pip install --break-system-packages -q pyyaml jsonschema
-          git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+          git init -q .molecule-ci-canonical
+          git -C .molecule-ci-canonical remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          git -C .molecule-ci-canonical fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          git -C .molecule-ci-canonical checkout -q --detach FETCH_HEAD
+          test "$(git -C .molecule-ci-canonical rev-parse HEAD)" = "$MOLECULE_CI_REF"
           python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root . \
             | tee /tmp/meta-ci.log
           rc=${PIPESTATUS[0]}

@@ -71,13 +71,14 @@ def test_consumer_templates_never_use_remote_workflow_call(path: Path) -> None:
     ), f"{path.name} uses unsupported cross-repository workflow_call"
 
 
-@pytest.mark.parametrize("path", (MINIMAL_TEMPLATE, DIFF_SECRET_TEMPLATE))
+@pytest.mark.parametrize("path", CONSUMER_TEMPLATES)
 def test_inline_ssot_templates_pin_and_verify_an_immutable_ref(path: Path) -> None:
     workflow = yaml.safe_load(path.read_text())
     job = next(iter(workflow["jobs"].values()))
     ref = job["env"]["MOLECULE_CI_REF"]
     commands = "\n".join(_all_run_steps(path))
     assert re.fullmatch(r"[0-9a-f]{40}", ref)
+    assert "git clone" not in commands
     assert 'fetch -q --depth 1 origin "$MOLECULE_CI_REF"' in commands
     assert 'rev-parse HEAD)" = "$MOLECULE_CI_REF"' in commands
 

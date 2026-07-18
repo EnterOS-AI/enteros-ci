@@ -5,10 +5,9 @@
 # WHY TWO COPIES EXIST
 # --------------------
 # `scripts/` is the CANONICAL location for every validator/lint script
-# (molecule-ci's own ci.yml runs `scripts/...`, and the future meta-CI router —
-# task #57, not yet built in this repo — will run `{CI}/scripts/...`).
+# (molecule-ci's own ci.yml and the meta-CI router run `scripts/...`).
 # `.molecule-ci/scripts/` is a byte-identical MIRROR that external consumers
-# pin: several org-template and plugin repos clone molecule-ci and invoke
+# pin: org-template and plugin repos fetch molecule-ci by immutable SHA and invoke
 #     python3 .../.molecule-ci/scripts/validate-*.py
 # so the mirror directory is a public interface we cannot simply delete without
 # breaking those repos' CI.
