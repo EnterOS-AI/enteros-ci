@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -513,6 +514,134 @@ def test_mcp_pin_lockstep_fails_closed_when_registry_is_unavailable(tmp_path):
 
     assert not ok
     assert "registry unavailable" in detail
+
+
+class _FakeHTTPResponse:
+    def __init__(self, url, payload=b"ok"):
+        self._url = url
+        self._payload = payload
+        self.headers = {"Content-Length": str(len(payload))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def geturl(self):
+        return self._url
+
+    def read(self, limit):
+        return self._payload[:limit]
+
+
+def test_package_fetch_retries_only_transient_http_failures(monkeypatch):
+    url = meta.MOLECULE_RUNTIME_INDEX_URL
+    outcomes = [
+        urllib.error.HTTPError(url, 429, "rate limited", {}, None),
+        urllib.error.HTTPError(url, 503, "unavailable", {}, None),
+        _FakeHTTPResponse(url, b"eventual success"),
+    ]
+    requests = []
+    sleeps = []
+
+    def urlopen(request, *, timeout):
+        requests.append((request, timeout))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(meta.time, "sleep", sleeps.append)
+
+    assert meta._fetch_bytes(url) == b"eventual success"
+    assert len(requests) == 3
+    assert all(timeout == meta._HTTP_ATTEMPT_TIMEOUT_SECONDS for _, timeout in requests)
+    assert all(request.get_header("User-agent") == "curl/8.4.0" for request, _ in requests)
+    assert sleeps == [meta._HTTP_RETRY_DELAY_SECONDS, meta._HTTP_RETRY_DELAY_SECONDS * 2]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_package_fetch_does_not_retry_auth_or_other_client_errors(monkeypatch, status):
+    url = meta.MOLECULE_RUNTIME_INDEX_URL
+    calls = 0
+
+    def urlopen(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise urllib.error.HTTPError(url, status, "client error", {}, None)
+
+    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(meta.MCPPinLockstepError, match=f"HTTP {status}"):
+        meta._fetch_bytes(url)
+    assert calls == 1
+
+
+def test_package_fetch_fails_closed_after_bounded_transport_retries(monkeypatch):
+    url = meta.MOLECULE_RUNTIME_INDEX_URL
+    calls = 0
+
+    def urlopen(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise urllib.error.URLError("connection reset")
+
+    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(meta.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="after 3 attempts"):
+        meta._fetch_bytes(url)
+    assert calls == meta._HTTP_MAX_ATTEMPTS == 3
+
+
+def test_runtime_wheel_rejects_oversized_member_before_decompression(monkeypatch):
+    wheel = _runtime_wheel()
+    monkeypatch.setattr(meta, "_MAX_ARCHIVE_MEMBER_BYTES", 64)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="member exceeds"):
+        meta._runtime_contract(wheel, "0.4.25")
+
+
+def test_runtime_wheel_rejects_excess_total_uncompressed_size(monkeypatch):
+    wheel = _runtime_wheel()
+    monkeypatch.setattr(meta, "_MAX_WHEEL_UNCOMPRESSED_BYTES", 128)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="total uncompressed"):
+        meta._runtime_contract(wheel, "0.4.25")
+
+
+def test_mcp_tarball_rejects_gzip_bomb_before_tar_parse(monkeypatch):
+    import gzip
+
+    payload = gzip.compress(b"A" * 257)
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode()
+    monkeypatch.setattr(meta, "_MAX_TAR_UNCOMPRESSED_BYTES", 256)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="gzip payload exceeds"):
+        meta._verify_mcp_tarball(
+            payload,
+            package="@molecule-ai/mcp-server",
+            version="1.8.3",
+            integrity=integrity,
+            shasum=hashlib.sha1(payload).hexdigest(),
+        )
+
+
+def test_mcp_tarball_rejects_oversized_member(monkeypatch):
+    tarball = _mcp_tarball()
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode()
+    monkeypatch.setattr(meta, "_MAX_ARCHIVE_MEMBER_BYTES", 64)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="member exceeds"):
+        meta._verify_mcp_tarball(
+            tarball,
+            package="@molecule-ai/mcp-server",
+            version="1.8.3",
+            integrity=integrity,
+            shasum=hashlib.sha1(tarball).hexdigest(),
+        )
 
 
 def test_mcp_pin_lockstep_fails_closed_when_pin_is_outside_compatible_range(tmp_path):

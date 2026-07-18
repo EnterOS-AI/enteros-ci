@@ -60,6 +60,7 @@ import argparse
 import ast
 import base64
 import datetime as _dt
+import gzip
 import hashlib
 import hmac
 import io
@@ -69,6 +70,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,8 +131,14 @@ MOLECULE_RUNTIME_INDEX_URL = (
     "molecules-workspace-runtime/"
 )
 _PACKAGE_HOST = "git.moleculesai.app"
-_HTTP_TIMEOUT_SECONDS = 30
+_HTTP_ATTEMPT_TIMEOUT_SECONDS = 10
+_HTTP_MAX_ATTEMPTS = 3
+_HTTP_RETRY_DELAY_SECONDS = 0.25
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+_MAX_WHEEL_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
+_MAX_TAR_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
+_MAX_ARCHIVE_MEMBER_BYTES = 2 * 1024 * 1024
+_MAX_ARCHIVE_MEMBERS = 10_000
 _STABLE_SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
@@ -431,12 +439,15 @@ def _run_node_package(repo_root: Path) -> tuple[bool, str]:
 # bake to that wheel's prebake-mgmt-mcp.sh. This runner follows that real chain:
 #
 #   template .runtime-version -> immutable runtime wheel + sha256
-#     -> embedded exact MCP pin + compatible launch range + prebake helper
+#     -> packaged executable MCP constants + compatible range + prebake helper
 #       -> immutable exact npm tarball + sha512/sha1
 #
 # Every missing/malformed/network/integrity condition is a hard failure. The
 # check is credential-free and read-only; both registries are public. It does
 # not run Docker or alter the existing Tier-4 live-container conformance gate.
+# The source repo's top-level mcp-plugin-delivery contract is not in the wheel;
+# SDK/runtime contract byte-sync remains its own gate. This runner verifies the
+# executable constants and helper that the published image actually consumes.
 # ---------------------------------------------------------------------------
 class MCPPinLockstepError(Exception):
     """A fail-closed mcp-pin-lockstep contract violation."""
@@ -462,31 +473,52 @@ def _same_origin(left: str, right: str) -> bool:
 
 
 def _fetch_bytes(url: str) -> bytes:
-    """Bounded credential-free GET with the canonical Cloudflare-safe UA."""
+    """Bounded credential-free GET with transient-only bounded retries.
+
+    Transport failures, 429, and 5xx retry up to three 10-second attempts.
+    Authentication and all other 4xx responses fail immediately.
+    """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname != _PACKAGE_HOST:
         raise MCPPinLockstepError(f"refusing untrusted package URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
-            final_url = response.geturl()
-            if not _same_origin(url, final_url):
+    last_error: Exception | None = None
+    for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=_HTTP_ATTEMPT_TIMEOUT_SECONDS
+            ) as response:
+                final_url = response.geturl()
+                if not _same_origin(url, final_url):
+                    raise MCPPinLockstepError(
+                        f"package request redirected off origin: {url} -> {final_url}"
+                    )
+                length = response.headers.get("Content-Length")
+                if length and int(length) > _MAX_ARTIFACT_BYTES:
+                    raise MCPPinLockstepError(
+                        f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
+                    )
+                payload = response.read(_MAX_ARTIFACT_BYTES + 1)
+                if len(payload) > _MAX_ARTIFACT_BYTES:
+                    raise MCPPinLockstepError(
+                        f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
+                    )
+                return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and not 500 <= exc.code <= 599:
                 raise MCPPinLockstepError(
-                    f"package request redirected off origin: {url} -> {final_url}"
-                )
-            length = response.headers.get("Content-Length")
-            if length and int(length) > _MAX_ARTIFACT_BYTES:
-                raise MCPPinLockstepError(
-                    f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
-                )
-            payload = response.read(_MAX_ARTIFACT_BYTES + 1)
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        raise MCPPinLockstepError(f"package fetch failed for {url}: {exc}") from exc
-    if len(payload) > _MAX_ARTIFACT_BYTES:
-        raise MCPPinLockstepError(
-            f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes: {url}"
-        )
-    return payload
+                    f"package fetch failed for {url}: HTTP {exc.code} (not retryable)"
+                ) from exc
+            last_error = exc
+        except (TimeoutError, ConnectionError, urllib.error.URLError, OSError) as exc:
+            last_error = exc
+        except ValueError as exc:
+            raise MCPPinLockstepError(f"malformed package response for {url}: {exc}") from exc
+        if attempt < _HTTP_MAX_ATTEMPTS:
+            time.sleep(_HTTP_RETRY_DELAY_SECONDS * attempt)
+    raise MCPPinLockstepError(
+        f"package fetch failed for {url} after {_HTTP_MAX_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
 
 
 def _exact_semver(value: str, label: str) -> tuple[int, int, int]:
@@ -589,7 +621,32 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
     helper_path = "molecule_runtime/scripts/prebake-mgmt-mcp.sh"
     try:
         with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as wheel:
-            names = set(wheel.namelist())
+            members = wheel.infolist()
+            if len(members) > _MAX_ARCHIVE_MEMBERS:
+                raise MCPPinLockstepError(
+                    f"runtime wheel has too many members: {len(members)}"
+                )
+            total_size = 0
+            for member in members:
+                if member.flag_bits & 0x1:
+                    raise MCPPinLockstepError(
+                        f"runtime wheel contains encrypted member: {member.filename}"
+                    )
+                if member.file_size < 0 or member.file_size > _MAX_ARCHIVE_MEMBER_BYTES:
+                    raise MCPPinLockstepError(
+                        f"runtime wheel member exceeds {_MAX_ARCHIVE_MEMBER_BYTES} "
+                        f"uncompressed bytes: {member.filename}"
+                    )
+                total_size += member.file_size
+                if total_size > _MAX_WHEEL_UNCOMPRESSED_BYTES:
+                    raise MCPPinLockstepError(
+                        "runtime wheel total uncompressed size exceeds "
+                        f"{_MAX_WHEEL_UNCOMPRESSED_BYTES} bytes"
+                    )
+            member_names = [member.filename for member in members]
+            names = set(member_names)
+            if len(names) != len(member_names):
+                raise MCPPinLockstepError("runtime wheel contains duplicate member names")
             if source_path not in names or helper_path not in names:
                 raise MCPPinLockstepError(
                     "exact runtime wheel is missing platform_agent_identity.py or "
@@ -698,9 +755,36 @@ def _verify_mcp_tarball(
     if not hmac.compare_digest(hashlib.sha1(tarball).hexdigest(), shasum):
         raise MCPPinLockstepError("exact MCP tarball sha1 shasum mismatch")
     try:
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as archive:
+        with gzip.GzipFile(fileobj=io.BytesIO(tarball), mode="rb") as compressed:
+            uncompressed = compressed.read(_MAX_TAR_UNCOMPRESSED_BYTES + 1)
+    except (EOFError, OSError) as exc:
+        raise MCPPinLockstepError(f"exact MCP gzip payload is malformed: {exc}") from exc
+    if len(uncompressed) > _MAX_TAR_UNCOMPRESSED_BYTES:
+        raise MCPPinLockstepError(
+            f"MCP gzip payload exceeds {_MAX_TAR_UNCOMPRESSED_BYTES} uncompressed bytes"
+        )
+    try:
+        with tarfile.open(fileobj=io.BytesIO(uncompressed), mode="r:") as archive:
+            members = archive.getmembers()
+            if len(members) > _MAX_ARCHIVE_MEMBERS:
+                raise MCPPinLockstepError(
+                    f"MCP tarball has too many members: {len(members)}"
+                )
+            total_size = 0
+            for item in members:
+                if item.size < 0 or item.size > _MAX_ARCHIVE_MEMBER_BYTES:
+                    raise MCPPinLockstepError(
+                        f"MCP tarball member exceeds {_MAX_ARCHIVE_MEMBER_BYTES} "
+                        f"uncompressed bytes: {item.name}"
+                    )
+                total_size += item.size
+                if total_size > _MAX_TAR_UNCOMPRESSED_BYTES:
+                    raise MCPPinLockstepError(
+                        "MCP tarball total uncompressed member size exceeds "
+                        f"{_MAX_TAR_UNCOMPRESSED_BYTES} bytes"
+                    )
             member = archive.getmember("package/package.json")
-            if not member.isfile() or member.size > 1024 * 1024:
+            if not member.isfile():
                 raise MCPPinLockstepError("MCP tarball package.json is not a bounded file")
             stream = archive.extractfile(member)
             if stream is None:

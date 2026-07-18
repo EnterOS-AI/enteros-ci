@@ -89,12 +89,20 @@ lint/typecheck/build must never count as a passing leg; every step is also bound
 
 The MCP lockstep runner follows the artifact chain the image really consumes:
 the template's exact `.runtime-version` selects one runtime wheel and its published
-SHA-256; that wheel must contain the executable prebake helper plus a literal exact MCP
-pin that satisfies its compatible launch range; and the exact MCP npm tarball must exist
-with matching SHA-512/SHA-1 integrity and package identity. The template Dockerfile must
-consume `RUNTIME_VERSION` and execute the helper. All reads are anonymous, bounded, and
-restricted to the public Molecule Gitea package origins. Missing metadata, unavailable or
-malformed responses, hash mismatch, pin/range skew, and a missing exact package all fail
+SHA-256; that wheel must contain the packaged executable platform constants and prebake
+helper, with an exact MCP pin that satisfies its compatible launch range; and the exact
+MCP npm tarball must exist with matching SHA-512/SHA-1 integrity and package identity.
+The source repo's top-level `contracts/mcp-plugin-delivery.contract.json` is not packaged
+in the wheel, so this runner does not claim to inspect it; SDK/runtime contract byte-sync
+remains its own gate. This runner checks the executable constants and helper the image
+actually consumes.
+
+The template Dockerfile must consume `RUNTIME_VERSION` and execute the helper. All reads
+are anonymous, size/decompression bounded, and restricted to the public Molecule Gitea
+package origins. Transient transport errors, HTTP 429, and HTTP 5xx receive at most three
+10-second attempts; authentication and other 4xx responses fail immediately. Missing
+metadata, unavailable or malformed responses, compressed-archive expansion beyond the
+per-member/total caps, hash mismatch, pin/range skew, and a missing exact package all fail
 closed. This does not replace or relax the runtime-template's existing live Tier-4 Docker
 conformance gate.
 
