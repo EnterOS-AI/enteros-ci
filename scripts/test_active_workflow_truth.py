@@ -1,6 +1,8 @@
 from pathlib import Path
 import re
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".gitea" / "workflows"
@@ -51,6 +53,29 @@ def test_active_workflows_do_not_expose_workflow_call() -> None:
             violations.append(str(path.relative_to(ROOT)))
 
     assert not violations, "unsupported reusable workflow surface remains: " + ", ".join(violations)
+
+
+def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> None:
+    """Pin both sides of the conflict-sensitive post-workflow_call shape."""
+
+    workflow = yaml.safe_load((WORKFLOWS / "meta-ci-selftest.yml").read_text())
+    selftest = workflow["jobs"]["selftest"]
+    archive = workflow["jobs"]["official-consumer-archives"]
+
+    assert "uses" not in selftest
+    selftest_runs = "\n".join(
+        step["run"] for step in selftest["steps"] if "run" in step
+    )
+    assert "python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci" in selftest_runs
+    assert "grep -qxF 'meta-ci:sentinel:executed'" in selftest_runs
+
+    assert "uses" not in archive
+    archive_runs = "\n".join(
+        step["run"] for step in archive["steps"] if "run" in step
+    )
+    assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
+    assert "git -C \"$fetch_dir\" archive \"$actual\"" in archive_runs
+    assert 'python3 scripts/meta-ci.py --repo-root "$archive_dir"' in archive_runs
 
 
 def test_readme_does_not_claim_the_retired_guard_is_active() -> None:
