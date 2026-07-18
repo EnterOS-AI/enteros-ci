@@ -1109,6 +1109,103 @@ def test_runtime_helper_accepts_exporting_existing_canonical_bindings():
     assert meta._helper_consumes_mcp_contract(helper)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "printf -v VER %s 9.9.9",
+        "read -r VER <<< 9.9.9",
+        "read -ra VER <<< 9.9.9",
+        "read -aVER",
+        "while read -r VER; do :; done <<< 9.9.9",
+        "mapfile -t VER < input",
+        "wait -p VER 123",
+        "for VER in 9.9.9; do :; done",
+        "select VER in 9.9.9; do break; done <<< 1",
+        "declare -n REPLY=VER; read <<< 9.9.9",
+        "declare -n OPTIND=VER; set -- -x; getopts x option",
+        "declare -n PWD=VER; cd /tmp",
+        "declare -n version_alias=VER; version_alias=9.9.9",
+        "typeset -n version_alias=VER; printf -v version_alias %s 9.9.9",
+        'target=VER; local -n version_alias="$target"; version_alias=9.9.9',
+    ],
+)
+def test_runtime_helper_rejects_implicit_or_indirect_version_write(mutation):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            mutation,
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "printf -v harmless %s value",
+        "read -r harmless <<< value",
+        "read -aharmless <<< value",
+        "mapfile -t harmless < input",
+        "wait -p harmless 123",
+        "for harmless in value; do :; done",
+        "declare -n harmless_alias=harmless; harmless_alias=value",
+        "declare -n harmless_alias=VER; unset -n harmless_alias; harmless_alias=value",
+        "declare -n harmless_alias=VER; declare +n harmless_alias; harmless_alias=value",
+    ],
+)
+def test_runtime_helper_allows_implicit_write_to_unprotected_variable(mutation):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            mutation,
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "eval ':'",
+        "source /tmp/mutate-helper.sh",
+        "trap 'VER=9.9.9' DEBUG",
+        "mutate_pin() { VER=9.9.9; }; mutate_pin",
+    ],
+)
+def test_runtime_helper_rejects_unverifiable_control_before_bindings(mutation):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            mutation,
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
 @pytest.mark.parametrize("mutation", ["overwrite", "unset"])
 def test_runtime_acquisition_rejects_invalidated_prepared_requirement(mutation):
     change = (
@@ -1287,6 +1384,101 @@ def test_runtime_acquisition_rejects_prepare_output_from_masked_failure():
 )
 def test_runtime_acquisition_rejects_augmented_protected_assignment(run):
     assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "printf -v RUNTIME_VERSION %s 9.9.9",
+        "read -r RUNTIME_VERSION <<< 9.9.9",
+        "read -ra RUNTIME_VERSION <<< 9.9.9",
+        "read -aRUNTIME_VERSION",
+        "if read -r RUNTIME_VERSION <<< 9.9.9; then :; fi",
+        "mapfile -t RUNTIME_VERSION < input",
+        "wait -p RUNTIME_VERSION 123",
+        "for RUNTIME_VERSION in 9.9.9; do :; done",
+        "select RUNTIME_VERSION in 9.9.9; do break; done <<< 1",
+        "getopts x RUNTIME_VERSION",
+        "declare -n REPLY=RUNTIME_VERSION; read <<< 9.9.9",
+        "declare -n OPTARG=RUNTIME_VERSION; set -- -x 9.9.9; "
+        "getopts x: option",
+        "declare -n BASH_REMATCH=RUNTIME_VERSION; [[ 9.9.9 =~ (.*) ]]",
+        "declare -n pin_alias=RUNTIME_VERSION; pin_alias=9.9.9",
+        "typeset -n pin_alias=RUNTIME_VERSION; printf -v pin_alias %s 9.9.9",
+        'target=RUNTIME_VERSION; local -n pin_alias="$target"; pin_alias=9.9.9',
+        'target=RUNTIME_VERSION; printf -v "$target" %s 9.9.9',
+        "trap 'RUNTIME_VERSION=9.9.9' DEBUG",
+    ],
+)
+def test_runtime_acquisition_rejects_implicit_or_indirect_runtime_version_write(
+    mutation,
+):
+    run = (
+        f"{mutation}; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "printf -v runtime_requirement %s requests==2.32.0",
+        "read -r runtime_requirement <<< requests==2.32.0",
+        "read -a runtime_requirement <<< requests==2.32.0",
+        "read -aruntime_requirement",
+        "until read -r runtime_requirement; do break; done <<< requests==2.32.0",
+        "readarray -t runtime_requirement < input",
+        "wait -p runtime_requirement 123",
+        "for runtime_requirement in requests==2.32.0; do :; done",
+        "select runtime_requirement in requests==2.32.0; do break; done <<< 1",
+        "declare -n OPTARG=runtime_requirement; set -- -x requests==2.32.0; "
+        "getopts x: option",
+        "declare -n OLDPWD=runtime_requirement; cd /tmp",
+        "declare -n req_alias=runtime_requirement; req_alias=requests==2.32.0",
+        "typeset -n req_alias=runtime_requirement; "
+        "printf -v req_alias %s requests==2.32.0",
+    ],
+)
+def test_runtime_acquisition_rejects_implicit_or_indirect_prepared_write(mutation):
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        f"{mutation}; "
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "printf -v harmless %s value",
+        "read -r harmless <<< value",
+        "read -aharmless <<< value",
+        "mapfile -t harmless < input",
+        "wait -p harmless 123",
+        "for harmless in value; do :; done",
+        "declare -n harmless_alias=harmless; harmless_alias=value",
+        "declare -n harmless_alias=RUNTIME_VERSION; "
+        "unset -n harmless_alias; harmless_alias=value",
+        "declare -n harmless_alias=RUNTIME_VERSION; "
+        "declare +n harmless_alias; harmless_alias=value",
+    ],
+)
+def test_runtime_acquisition_allows_implicit_write_to_unprotected_variable(mutation):
+    run = (
+        f"set -e; {mutation}; "
+        'runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert meta._run_acquires_pinned_runtime(run)
 
 
 def test_runtime_wheel_rejects_helper_markers_in_comments_and_echoes():

@@ -109,7 +109,12 @@ failure-unmasked plain assignments. Pipeline/background/conditional assignment e
 declaration assignments (`export`/`readonly`/`local`/`declare`/`typeset`) invalidate proof;
 the latter can mask a failed command substitution. Reaching state remains valid only
 while the prepared requirement, `RUNTIME_VERSION`, and runtime-project identity are not
-unset, overwritten, augmented, or otherwise rebound. A direct
+unset, overwritten, augmented, or otherwise rebound. The shared reaching-state check
+also follows parent-shell writes from `printf -v`, `read`/`mapfile`/`readarray`,
+`wait -p`, `getopts`, `for`/`select` binders, and writes through
+`declare`/`local`/`typeset -n` namerefs. Dynamic write targets, unresolved namerefs,
+arithmetic mutation, traps, and `eval`/`source` forms invalidate proof instead of being
+guessed. A direct
 `|| { ...; exit <status>; }` branch counts only when the shell-normalized status is
 nonzero. `bash`/`sh` invocations accept only path-executing `-e`/`-u`/`-x` options;
 stdin, help/version, no-exec, command-string, comments, and `echo` forms are not helper
@@ -117,7 +122,8 @@ execution. The packaged helper must likewise preserve effective reaching binding
 plain top-level, persistent, unmasked reads through `SPEC` and both top-level unmasked
 exact/range self-checks. Declaration, unset, augmented, nested, masked, or non-persistent
 helper writes invalidate that proof; exporting an already-proven binding without assigning
-a new value is allowed. Explicit non-zero failure branches remain accepted.
+a new value is allowed. The same implicit-write and nameref invalidation rules apply to
+helper bindings before `SPEC`. Explicit non-zero failure branches remain accepted.
 
 Each required Python MCP constant must have exactly one top-level literal string binding
 in the published runtime module. Duplicate, dynamic, augmented, nested, annotated,

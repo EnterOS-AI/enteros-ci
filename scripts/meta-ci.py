@@ -685,14 +685,274 @@ def _assignment_updates(
     return updates
 
 
-def _opens_function_scope(words: list[str]) -> bool:
-    return bool(
-        "{" in words
-        and (
-            (words and words[0] == "function")
-            or (words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)", words[0]))
+def _literal_shell_variable(value: str) -> str | None:
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]+\])?", value)
+    return match.group(1) if match else None
+
+
+def _resolve_nameref(name: str, namerefs: dict[str, str | None]) -> str | None:
+    seen: set[str] = set()
+    while name in namerefs:
+        if name in seen or namerefs[name] is None:
+            return None
+        seen.add(name)
+        name = namerefs[name]
+    return name
+
+
+def _record_nameref_declarations(
+    words: list[str], namerefs: dict[str, str | None]
+) -> set[str]:
+    if not words or words[0] not in {"declare", "local", "typeset"}:
+        return set()
+    index = 1
+    nameref_mode: bool | None = None
+    while index < len(words) and words[index].startswith(("-", "+")):
+        option = words[index]
+        if option == "--":
+            index += 1
+            break
+        if "n" in option[1:]:
+            nameref_mode = option.startswith("-")
+        index += 1
+    if nameref_mode is None:
+        return set()
+
+    declared: set[str] = set()
+    for operand in words[index:]:
+        write = _assignment_write(operand)
+        if write is not None:
+            name, target, is_direct = write
+            if nameref_mode:
+                namerefs[name] = (
+                    _literal_shell_variable(target) if is_direct else None
+                )
+            else:
+                namerefs.pop(name, None)
+            declared.add(name)
+            continue
+        name = _literal_shell_variable(operand)
+        if name is not None:
+            if nameref_mode:
+                namerefs[name] = None
+            else:
+                namerefs.pop(name, None)
+            declared.add(name)
+    return declared
+
+
+def _stateful_shell_writes(
+    segment: list[str], namerefs: dict[str, str | None]
+) -> tuple[set[str], bool]:
+    """Return variables a shell construct may write and whether its target is unknown.
+
+    Only parent-shell mutation surfaces needed by the accepted grammar are modeled.
+    Dynamic targets plus eval/source/arithmetic forms are deliberately unknown so callers
+    invalidate all proof rather than guessing.
+    """
+    words = _command_words(segment)
+    declared = _record_nameref_declarations(words, namerefs)
+    writes: set[str] = set()
+    unknown = False
+
+    def record(target: str) -> None:
+        nonlocal unknown
+        name = _literal_shell_variable(target)
+        if name is None:
+            unknown = True
+            return
+        resolved = _resolve_nameref(name, namerefs)
+        if resolved is None:
+            unknown = True
+        else:
+            writes.add(resolved)
+
+    for name, _, _, _, _ in _assignment_updates(segment):
+        if name in namerefs and name not in declared:
+            resolved = _resolve_nameref(name, namerefs)
+            if resolved is None:
+                unknown = True
+            else:
+                writes.add(resolved)
+        else:
+            writes.add(name)
+
+    if not words:
+        return writes, unknown
+    if words[0] in {"!", "elif", "if", "until", "while"}:
+        condition = words[1:]
+        if condition and condition[0] == "!":
+            condition = condition[1:]
+        condition_writes, condition_unknown = _stateful_shell_writes(
+            condition, namerefs
         )
-    )
+        writes.update(condition_writes)
+        return writes, unknown or condition_unknown
+    if words[0] in {"builtin", "command"}:
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            if words[0] == "command" and set(words[index][1:]) & {"v", "V"}:
+                return writes, unknown
+            index += 1
+        words = words[index:]
+        if not words:
+            return writes, unknown
+
+    command = words[0]
+    if command == "printf":
+        index = 1
+        while index < len(words):
+            option = words[index]
+            if option == "--":
+                break
+            if option == "-v" and index + 1 < len(words):
+                record(words[index + 1])
+                break
+            if option.startswith("-v") and len(option) > 2:
+                record(option[2:])
+                break
+            if not option.startswith("-"):
+                break
+            index += 1
+    elif command == "read":
+        index = 1
+        read_targeted = False
+        while index < len(words) and words[index].startswith("-"):
+            option = words[index]
+            if option == "--":
+                index += 1
+                break
+            flags = option[1:]
+            for flag_index, flag in enumerate(flags):
+                if flag not in {"a", "d", "i", "n", "N", "p", "t", "u"}:
+                    continue
+                argument = flags[flag_index + 1 :]
+                if not argument:
+                    if index + 1 >= len(words):
+                        unknown = True
+                        break
+                    index += 1
+                    argument = words[index]
+                if flag == "a":
+                    record(argument)
+                    read_targeted = True
+                break
+            index += 1
+        for target in words[index:]:
+            if target.startswith(("<", ">")):
+                break
+            record(target)
+            read_targeted = True
+        if not read_targeted:
+            record("REPLY")
+    elif command in {"for", "select"}:
+        if len(words) < 2:
+            unknown = True
+        elif words[1].startswith("(("):
+            unknown = True
+        else:
+            record(words[1])
+            if command == "select":
+                record("REPLY")
+    elif command == "getopts":
+        if len(words) < 3:
+            unknown = True
+        else:
+            record(words[2])
+            record("OPTARG")
+            record("OPTIND")
+    elif command in {"mapfile", "readarray"}:
+        index = 1
+        target = "MAPFILE"
+        options_with_arguments = {"d", "n", "O", "s", "u", "C", "c"}
+        while index < len(words):
+            option = words[index]
+            if option.startswith(("<", ">")):
+                break
+            if option == "--":
+                index += 1
+                if index < len(words) and not words[index].startswith(("<", ">")):
+                    target = words[index]
+                break
+            if not option.startswith("-") or option == "-":
+                target = option
+                break
+            for flag_index, flag in enumerate(option[1:]):
+                if flag not in options_with_arguments:
+                    continue
+                if flag == "C":
+                    unknown = True
+                if not option[flag_index + 2 :]:
+                    index += 1
+                break
+            index += 1
+        record(target)
+    elif command == "wait":
+        index = 1
+        while index < len(words):
+            option = words[index]
+            if option == "--" or not option.startswith("-"):
+                break
+            flag_index = option.find("p", 1)
+            if flag_index >= 0:
+                target = option[flag_index + 1 :]
+                if not target:
+                    if index + 1 >= len(words):
+                        unknown = True
+                        break
+                    target = words[index + 1]
+                record(target)
+                break
+            index += 1
+    elif command in {"cd", "popd", "pushd"}:
+        record("PWD")
+        record("OLDPWD")
+        if command != "cd":
+            record("DIRSTACK")
+    elif command == "[[" and "=~" in words:
+        record("BASH_REMATCH")
+    elif command == "unset":
+        unset_nameref = any(
+            option.startswith("-") and "n" in option[1:]
+            for option in words[1:]
+            if option != "--"
+        )
+        for target in words[1:]:
+            if target == "--" or target.startswith("-"):
+                continue
+            if unset_nameref:
+                name = _literal_shell_variable(target)
+                if name is None:
+                    unknown = True
+                    continue
+                namerefs.pop(name, None)
+                writes.add(name)
+            else:
+                record(target)
+    elif command in {"declare", "export", "local", "readonly", "typeset"}:
+        for operand in words[1:]:
+            if "$" in operand and _assignment_write(operand) is None:
+                unknown = True
+    elif command in {".", "eval", "let", "source", "trap"} or command.startswith(
+        "(("
+    ):
+        unknown = True
+    return writes, unknown
+
+
+def _function_scope_name(words: list[str]) -> str | None:
+    if "{" not in words or not words:
+        return None
+    if words[0] == "function" and len(words) >= 2:
+        name = words[1].removesuffix("()")
+        return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else None
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)", words[0]):
+        return words[0][:-2]
+    return None
+
+
+def _opens_function_scope(words: list[str]) -> bool:
+    return _function_scope_name(words) is not None
 
 
 def _top_level_shell_commands(
@@ -861,9 +1121,22 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
     if any(_opens_function_scope(_command_words(segment)) for segment, _ in commands):
         return False
     prepared: dict[str, int] = {}
+    namerefs: dict[str, str | None] = {}
     runtime_project_is_runtime = False
     runtime_version_pristine = True
     for index, (segment, _) in enumerate(commands):
+        writes, unknown_write = _stateful_shell_writes(segment, namerefs)
+        if unknown_write:
+            prepared.clear()
+            runtime_project_is_runtime = False
+            runtime_version_pristine = False
+        for name in writes:
+            if name == "RUNTIME_VERSION":
+                runtime_version_pristine = False
+            prepared.pop(name, None)
+            if name == "runtime_project":
+                runtime_project_is_runtime = False
+
         assignment_is_unmasked = bool(
             top_level[index] and _command_failure_is_unmasked(commands, index)
         )
@@ -878,6 +1151,7 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
                     persists
                     and is_direct
                     and establishes
+                    and name not in namerefs
                     and assignment_is_unmasked
                     and top_level[index]
                     and value.replace("_", "-") == "molecules-workspace-runtime"
@@ -886,6 +1160,7 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
                 persists
                 and is_direct
                 and establishes
+                and name not in namerefs
                 and assignment_is_unmasked
                 and top_level[index]
                 and runtime_version_pristine
@@ -894,14 +1169,6 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
                 prepared[name] = index
 
         words = _command_words(segment)
-        if words and words[0] == "unset":
-            for name in (word for word in words[1:] if not word.startswith("-")):
-                if name == "RUNTIME_VERSION":
-                    runtime_version_pristine = False
-                prepared.pop(name, None)
-                if name == "runtime_project":
-                    runtime_project_is_runtime = False
-
         if not top_level[index]:
             continue
 
@@ -965,11 +1232,31 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
     }
     protected = {*expected, "SPEC"}
     bindings: dict[str, str] = {}
+    namerefs: dict[str, str | None] = {}
     exact_checked = False
     range_checked = False
     commands = _shell_commands(" ; ".join(_continued_lines(helper)))
     top_level = _top_level_shell_commands(commands)
+    function_names = {
+        name
+        for segment, _ in commands
+        if (name := _function_scope_name(_command_words(segment))) is not None
+    }
     for index, (segment, _) in enumerate(commands):
+        words = _command_words(segment)
+        if (
+            words
+            and words[0] != "_prebake_self_check"
+            and words[0] in function_names
+            and _function_scope_name(words) is None
+        ):
+            return False
+        writes, unknown_write = _stateful_shell_writes(segment, namerefs)
+        if unknown_write:
+            return False
+        for name in writes & protected:
+            bindings.pop(name, None)
+
         assignment_is_unmasked = bool(
             top_level[index] and _command_failure_is_unmasked(commands, index)
         )
@@ -980,7 +1267,11 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
                 continue
             bindings.pop(name, None)
             if not (
-                persists and is_direct and establishes and assignment_is_unmasked
+                persists
+                and is_direct
+                and establishes
+                and name not in namerefs
+                and assignment_is_unmasked
             ):
                 continue
             if name == "SPEC":
@@ -992,12 +1283,6 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
                     bindings[name] = "canonical-exact-spec"
             else:
                 bindings[name] = value
-
-        words = _command_words(segment)
-        if words and words[0] == "unset":
-            for name in (word for word in words[1:] if not word.startswith("-")):
-                if name in protected:
-                    bindings.pop(name, None)
 
         if (
             not top_level[index]
