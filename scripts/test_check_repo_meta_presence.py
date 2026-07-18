@@ -75,3 +75,56 @@ def test_sentinel_always_printed(env, monkeypatch, capsys):
     _stub(monkeypatch, m, {"molecule-core": ("missing", None)})
     m.run()
     assert "repo-meta-presence:executed" in capsys.readouterr().out
+
+
+def test_error_does_not_hide_missing(env, monkeypatch, capsys):
+    # A transient 'error' on one repo must NOT swallow a genuine 'missing' on
+    # another: the actionable missing is named and the exit code is the
+    # actionable 1, not 2. (Regression: run() used to `return 2` on any error
+    # before ever printing the missing.)
+    m = _import()
+    _stub(
+        monkeypatch,
+        m,
+        {"molecule-ai-sdk": ("error", None), "molecule-core": ("missing", None)},
+    )
+    assert m.run() == 1
+    assert "molecule-core" in capsys.readouterr().out
+
+
+def _stub_get(monkeypatch, m, by_url):
+    """Stub the low-level _get(url, token, timeout=...) -> (code, body, err)."""
+
+    def fake_get(url, token, timeout=15):
+        for frag, resp in by_url.items():
+            if frag in url:
+                return resp
+        return (200, {}, None)
+
+    monkeypatch.setattr(m, "_get", fake_get)
+
+
+def test_manifest_404_but_repo_ok_is_missing(env, monkeypatch):
+    m = _import()
+    _stub_get(monkeypatch, m, {"/contents/repo-meta.yaml": (404, None, None)})  # repo GET → 200 default
+    assert m.fetch_repo_meta("https://api", "org", "r", "t")[0] == "missing"
+
+
+def test_manifest_404_but_repo_inaccessible_is_error(env, monkeypatch):
+    # Gitea 404s a repo the token cannot see (or that was renamed/archived).
+    # That must be 'error' (fail-closed), NOT a false 'missing'/'add a manifest'.
+    m = _import()
+    _stub_get(
+        monkeypatch,
+        m,
+        {"/contents/repo-meta.yaml": (404, None, None), "/repos/org/r": (404, None, None)},
+    )
+    assert m.fetch_repo_meta("https://api", "org", "r", "t")[0] == "error"
+
+
+def test_non_json_200_is_error(env, monkeypatch):
+    # A 200 whose body is a Cloudflare challenge page (non-JSON) surfaces from
+    # _get as (None, None, err); fetch must map it to 'error', never crash.
+    m = _import()
+    _stub_get(monkeypatch, m, {"/contents/repo-meta.yaml": (None, None, "non-JSON 200 body")})
+    assert m.fetch_repo_meta("https://api", "org", "r", "t")[0] == "error"
