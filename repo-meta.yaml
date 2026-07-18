@@ -1,0 +1,7 @@
+# repo-meta.yaml — SSOT manifest for the meta-CI capability→bundle router (internal#57).
+# Declares WHAT this repo IS (layer) and WHAT IT CAN DO (capabilities); the router
+# derives which CI bundles attach. See molecule-ci/docs/meta-ci.md.
+# ADVISORY router metadata; the repo-meta PRESENCE gate (Piece 3) is the hard check.
+schema_version: 1
+layer: service
+capabilities: []     # meta-CI tooling host; layer baseline covers it
