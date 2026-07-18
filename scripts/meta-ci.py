@@ -969,13 +969,24 @@ def _top_level_shell_commands(
     for segment, _ in commands:
         words = _command_words(segment)
         first = words[0] if words else ""
+        scope_index = 0
+        while scope_index < len(words) and words[scope_index] == "!":
+            scope_index += 1
+        if scope_index < len(words) and words[scope_index] == "time":
+            scope_index += 1
+            while scope_index < len(words) and words[scope_index] in {"--", "-p"}:
+                scope_index += 1
+        scope_first = words[scope_index] if scope_index < len(words) else ""
+        if scope_first.startswith("(") and scope_first != "(":
+            return [False] * len(commands)
         if first in {"fi", "esac", "done", "}", ")"}:
             depth -= 1
             if depth < 0:
                 return [False] * len(commands)
         top_level.append(depth == 0)
         if (
-            first in {"if", "case", "for", "while", "until", "select", "{", "("}
+            scope_first
+            in {"if", "case", "for", "while", "until", "select", "{", "("}
             or _opens_function_scope(words)
         ):
             depth += 1

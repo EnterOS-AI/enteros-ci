@@ -1005,6 +1005,62 @@ def test_prebake_delegation_rejects_command_inside_never_called_function():
     assert not meta._run_directly_executes_prebake(run)
 
 
+def test_runtime_acquisition_rejects_attached_posix_subshell():
+    run = (
+        "(true; set -e; runtime_project=molecules-workspace-runtime; "
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version ${RUNTIME_VERSION})"; '
+        'pip download "$runtime_requirement" )'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_prebake_delegation_rejects_attached_posix_subshell():
+    run = "(true; set -e; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh )"
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+def test_runtime_helper_rejects_attached_posix_subshell():
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "(true; set -e",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+            "true )",
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+def test_attached_posix_subshell_rejection_preserves_top_level_controls():
+    acquisition = 'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"'
+    delegation = "bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -e",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert meta._run_acquires_pinned_runtime(acquisition)
+    assert meta._run_directly_executes_prebake(delegation)
+    assert meta._helper_consumes_mcp_contract(helper)
+
+
 @pytest.mark.parametrize("mask", [" || true", " | true"])
 def test_runtime_helper_rejects_masked_exact_and_range_self_checks(mask):
     helper = "\n".join(
