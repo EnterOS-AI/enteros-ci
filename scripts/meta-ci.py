@@ -603,24 +603,29 @@ def _continued_lines(contents: str) -> list[str]:
     return logical
 
 
-def _shell_segments(command: str, *, reject_or_fallback: bool = False) -> list[list[str]]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+def _shell_commands(command: str) -> list[tuple[list[str], str | None]]:
+    """Tokenize only the command/control edges this static gate needs.
+
+    This is deliberately not a general shell parser. Quoting remains delegated to
+    ``shlex``; the returned operator is the control token immediately following each
+    command. Including redirection punctuation keeps ``>&2`` distinct from background
+    ``&`` so masking decisions are made on real control edges.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
     lexer.whitespace_split = True
     lexer.commenters = "#"
-    segments: list[list[str]] = []
+    commands: list[tuple[list[str], str | None]] = []
     current: list[str] = []
     for word in lexer:
         if re.fullmatch(r"[;&|]+", word):
-            if reject_or_fallback and word == "||":
-                return []
             if current:
-                segments.append(current)
+                commands.append((current, word))
                 current = []
             continue
         current.append(word)
     if current:
-        segments.append(current)
-    return segments
+        commands.append((current, None))
+    return commands
 
 
 def _assignment(word: str) -> tuple[str, str] | None:
@@ -638,10 +643,10 @@ def _command_words(segment: list[str]) -> list[str]:
 def _runtime_prepare_assignment(value: str) -> bool:
     if not value.startswith("$(") or not value.endswith(")"):
         return False
-    nested = _shell_segments(value[2:-1])
-    if len(nested) != 1:
+    nested = _shell_commands(value[2:-1])
+    if len(nested) != 1 or nested[0][1] is not None:
         return False
-    words = _command_words(nested[0])
+    words = _command_words(nested[0][0])
     if len(words) < 3 or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(words[0]).name):
         return False
     script = Path(words[1]).name.replace("_", "-")
@@ -670,11 +675,106 @@ def _pip_acquisition_arguments(words: list[str]) -> list[str] | None:
     return None
 
 
+def _set_errexit(words: list[str], enabled: bool) -> bool:
+    words = _command_words(words)
+    if not words or words[0] != "set":
+        return enabled
+    index = 1
+    while index < len(words):
+        option = words[index]
+        if option in {"-o", "+o"} and index + 1 < len(words):
+            if words[index + 1] == "errexit":
+                enabled = option == "-o"
+            index += 2
+            continue
+        if re.fullmatch(r"-[A-Za-z]+", option) and "e" in option[1:]:
+            enabled = True
+        elif re.fullmatch(r"\+[A-Za-z]+", option) and "e" in option[1:]:
+            enabled = False
+        index += 1
+    return enabled
+
+
+def _errexit_enabled_before(
+    commands: list[tuple[list[str], str | None]], stop: int
+) -> bool:
+    enabled = False
+    for index, (words, operator) in enumerate(commands[:stop]):
+        previous = commands[index - 1][1] if index else None
+        if previous not in {None, ";"} or operator in {"|", "|&", "&"}:
+            continue
+        enabled = _set_errexit(words, enabled)
+    return enabled
+
+
+def _nonzero_exit(words: list[str]) -> bool:
+    words = _command_words(words)
+    return bool(
+        len(words) == 2
+        and words[0] == "exit"
+        and re.fullmatch(r"[0-9]+", words[1])
+        and int(words[1]) != 0
+    )
+
+
+def _or_fallback_exits_nonzero(
+    commands: list[tuple[list[str], str | None]], command_index: int
+) -> bool:
+    """Recognize the one fail-closed OR form used by the packaged helper.
+
+    ``command || true`` and arbitrary fallback programs remain untrusted. The accepted
+    form is a direct non-zero ``exit`` or a simple braced sequence whose last command is
+    that exit, with no nested control edge that could mask it.
+    """
+    fallback_index = command_index + 1
+    if fallback_index >= len(commands):
+        return False
+    words, operator = commands[fallback_index]
+    direct = _command_words(words)
+    if _nonzero_exit(direct):
+        return operator not in {"||", "&&", "|", "|&", "&"}
+    if not direct or direct[0] != "{":
+        return False
+
+    last_command: list[str] | None = direct[1:] or None
+    for index in range(fallback_index, len(commands)):
+        group_words, group_operator = commands[index]
+        words = _command_words(group_words)
+        if index == fallback_index:
+            words = words[1:]
+        closes_group = "}" in words
+        if closes_group:
+            words = words[: words.index("}")]
+        if words:
+            last_command = words
+        if group_operator in {"||", "&&", "|", "|&", "&"}:
+            return False
+        if closes_group:
+            return last_command is not None and _nonzero_exit(last_command)
+    return False
+
+
+def _command_failure_is_unmasked(
+    commands: list[tuple[list[str], str | None]], command_index: int
+) -> bool:
+    previous = commands[command_index - 1][1] if command_index else None
+    if previous not in {None, ";"}:
+        return False
+    operator = commands[command_index][1]
+    if operator is None:
+        return True
+    if operator == "||":
+        return _or_fallback_exits_nonzero(commands, command_index)
+    if operator != ";":
+        return False
+    return _errexit_enabled_before(commands, command_index)
+
+
 def _run_acquires_pinned_runtime(run: str) -> bool:
-    segments = _shell_segments(run, reject_or_fallback=True)
+    commands = _shell_commands(run)
     prepared: dict[str, int] = {}
     has_runtime_identity = False
-    for index, segment in enumerate(segments):
+    for index, (segment, _) in enumerate(commands):
         if len(segment) == 1:
             assignment = _assignment(segment[0])
             if assignment:
@@ -686,7 +786,7 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
                     prepared[name] = index
 
         arguments = _pip_acquisition_arguments(_command_words(segment))
-        if arguments is None:
+        if arguments is None or not _command_failure_is_unmasked(commands, index):
             continue
         if any(
             re.fullmatch(
@@ -704,41 +804,48 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
 
 
 def _run_directly_executes_prebake(run: str) -> bool:
-    segments = _shell_segments(run)
-    if len(segments) != 1:
-        return False
-    words = _command_words(segments[0])
-    if not words:
-        return False
-    executable = Path(words[0]).name
-    if executable == "prebake-mgmt-mcp.sh":
-        return True
-    shell_options = [word for word in words[1:] if word.startswith("-")]
-    if executable not in {"bash", "sh"} or any(
-        option == "-c" or (not option.startswith("--") and "c" in option[1:])
-        for option in shell_options
-    ):
-        return False
-    script_arguments = [word for word in words[1:] if not word.startswith("-")]
-    return bool(
-        script_arguments
-        and script_arguments[0].endswith("/scripts/prebake-mgmt-mcp.sh")
-    )
+    commands = _shell_commands(run)
+    for index, (segment, _) in enumerate(commands):
+        if not _command_failure_is_unmasked(commands, index):
+            continue
+        words = _command_words(segment)
+        if not words:
+            continue
+        executable = Path(words[0]).name
+        if executable == "prebake-mgmt-mcp.sh":
+            return True
+        if executable not in {"bash", "sh"}:
+            continue
+        script_index = 1
+        while script_index < len(words):
+            option = words[script_index]
+            if option == "--":
+                script_index += 1
+                break
+            if not option.startswith("-") or option == "-":
+                break
+            if option == "--noexec" or (
+                not option.startswith("--") and set(option[1:]) & {"c", "n"}
+            ):
+                script_index = len(words)
+                break
+            script_index += 1
+        if (
+            script_index < len(words)
+            and words[script_index].endswith("/scripts/prebake-mgmt-mcp.sh")
+        ):
+            return True
+    return False
 
 
 def _helper_consumes_mcp_contract(helper: str) -> bool:
     assignments: dict[str, str] = {}
-    commands: list[list[str]] = []
-    for line in _continued_lines(helper):
-        for segment in _shell_segments(line):
-            if len(segment) == 1:
-                assignment = _assignment(segment[0])
-                if assignment:
-                    assignments[assignment[0]] = assignment[1]
-                    continue
-            words = _command_words(segment)
-            if words:
-                commands.append(words)
+    commands = _shell_commands(" ; ".join(_continued_lines(helper)))
+    for segment, _ in commands:
+        if len(segment) == 1:
+            assignment = _assignment(segment[0])
+            if assignment:
+                assignments[assignment[0]] = assignment[1]
 
     if assignments.get("PKG") != "$(_read MANAGEMENT_MCP_NPM_PACKAGE)":
         return False
@@ -750,8 +857,10 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
         return False
     invocations = {
         words[1]
-        for words in commands
-        if len(words) >= 2 and words[0] == "_prebake_self_check"
+        for index, (segment, _) in enumerate(commands)
+        if len(words := _command_words(segment)) >= 2
+        and words[0] == "_prebake_self_check"
+        and _command_failure_is_unmasked(commands, index)
     }
     return "${SPEC}" in invocations and "${PKG}@${RANGE}" in invocations
 

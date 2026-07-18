@@ -18,6 +18,7 @@ import http.client
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -40,6 +41,13 @@ def _load_module():
 
 
 meta = _load_module()
+_OFFICIAL_CONSUMER_RECORDS = json.loads(
+    (_SCRIPTS / "fixtures" / "meta-ci" / "official-consumers.json").read_text()
+)
+_OFFICIAL_CONSUMERS = {
+    consumer["name"]: consumer
+    for consumer in _OFFICIAL_CONSUMER_RECORDS
+}
 
 
 # --- map/vocab sync with the schema + SDK validator ------------------------
@@ -358,6 +366,7 @@ def _runtime_wheel(
             or "\n".join(
                 [
                     "#!/usr/bin/env bash",
+                    "set -eu",
                     "PKG=\"$(_read MANAGEMENT_MCP_NPM_PACKAGE)\"",
                     "VER=\"$(_read MANAGEMENT_MCP_PINNED_VERSION)\"",
                     "RANGE=\"$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)\"",
@@ -771,6 +780,193 @@ def test_dockerfile_rejects_optional_runtime_acquisition(tmp_path):
 
     with pytest.raises(meta.MCPPinLockstepError, match="runtime wheel acquisition"):
         meta._template_runtime_pin(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("consumer_name", "runtime_run"),
+    [
+        (
+            "claude-code",
+            '''set -eu;
+            runtime_project="molecules-workspace-runtime";
+            rm -rf /tmp/molecule-runtime;
+            rm -f /tmp/template-requirements.txt;
+            mkdir -p /tmp/molecule-runtime;
+            runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py
+              requirements.txt /tmp/template-requirements.txt
+              --runtime-version "${RUNTIME_VERSION}")";
+            if [ "${runtime_requirement#${runtime_project}}" = "${runtime_requirement}" ]; then
+              echo "ERROR: runtime requirement was not canonicalized" >&2;
+              exit 1;
+            fi;
+            pip download --isolated --only-binary=:all: --no-deps
+              --index-url "$MOLECULE_RUNTIME_INDEX"
+              --dest /tmp/molecule-runtime "${runtime_requirement}";
+            set -- /tmp/molecule-runtime/*.whl;
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+              echo "ERROR: private runtime acquisition did not produce exactly one wheel" >&2;
+              exit 1;
+            fi;
+            pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl
+              -r /tmp/template-requirements.txt;
+            rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt''',
+        ),
+        (
+            "codex",
+            '''set -eux;
+            runtime_project="molecules-workspace-runtime";
+            runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py
+              requirements.txt /tmp/template-requirements.txt
+              --runtime-version "${RUNTIME_VERSION}")";
+            case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac;
+            rm -rf /tmp/molecule-runtime;
+            mkdir -p /tmp/molecule-runtime;
+            pip download --isolated --no-cache-dir --only-binary=:all: --no-deps
+              --index-url "${MOLECULE_RUNTIME_INDEX}"
+              --dest /tmp/molecule-runtime "${runtime_requirement}";
+            test "$(find /tmp/molecule-runtime -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1;
+            pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl
+              -r /tmp/template-requirements.txt;
+            rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
+              /tmp/prepare_runtime_requirements.py;
+            python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true''',
+        ),
+        (
+            "openclaw",
+            '''set -eux;
+            runtime_project="molecules-workspace-runtime";
+            rm -rf /tmp/molecule-runtime;
+            mkdir -p /tmp/molecule-runtime;
+            runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py
+              requirements.txt /tmp/template-requirements.txt "${RUNTIME_VERSION}")";
+            case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac;
+            pip download --isolated --only-binary=:all: --no-deps
+              --index-url "$MOLECULE_RUNTIME_INDEX"
+              --dest /tmp/molecule-runtime "${runtime_requirement}";
+            runtime_wheel_count="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl' | wc -l)";
+            test "${runtime_wheel_count}" -eq 1;
+            runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')";
+            pip install --isolated --no-cache-dir
+              "${runtime_wheel}" -r /tmp/template-requirements.txt;
+            rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt''',
+        ),
+        (
+            "hermes",
+            '''set -eu;
+            runtime_project="molecules-workspace-runtime";
+            runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py
+              --requirements requirements.txt
+              --output /tmp/template-requirements.txt
+              --runtime-version "$RUNTIME_VERSION")";
+            case "$runtime_requirement" in "$runtime_project"*) ;; *) exit 1 ;; esac;
+            rm -rf /tmp/molecule-runtime;
+            mkdir /tmp/molecule-runtime;
+            pip download --isolated --only-binary=:all: --no-deps
+              --index-url "$MOLECULE_RUNTIME_INDEX"
+              --dest /tmp/molecule-runtime "$runtime_requirement";
+            wheel_count="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name '*.whl' | wc -l)";
+            test "$wheel_count" -eq 1;
+            runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')";
+            test -n "$runtime_wheel";
+            pip install --isolated --no-cache-dir "$runtime_wheel"
+              -r /tmp/template-requirements.txt;
+            rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt''',
+        ),
+    ],
+)
+def test_clean_current_consumer_runtime_acquisition_is_recognized(
+    consumer_name, runtime_run
+):
+    consumer = _OFFICIAL_CONSUMERS[consumer_name]
+    # Each RUN was extracted from a clean git archive at the recorded immutable ref.
+    # The live self-test downloads those same archives and exercises the full runner.
+    assert meta._run_acquires_pinned_runtime(runtime_run), consumer["commit"]
+
+
+def test_official_consumer_archive_manifest_is_exact_and_immutable():
+    assert len(_OFFICIAL_CONSUMER_RECORDS) == len(_OFFICIAL_CONSUMERS) == 4
+    assert set(_OFFICIAL_CONSUMERS) == {"claude-code", "codex", "openclaw", "hermes"}
+    assert all(
+        set(item) == {"name", "repository", "commit"}
+        and item["repository"] == f"molecule-ai-workspace-template-{name}"
+        and re.fullmatch(r"[0-9a-f]{40}", item["commit"])
+        for name, item in _OFFICIAL_CONSUMERS.items()
+    )
+
+
+def test_runtime_acquisition_rejects_pipeline_masking():
+    run = 'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}" | true'
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_accepts_explicit_fail_closed_fallback():
+    run = (
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}" '
+        '|| { echo acquisition failed >&2; exit 1; }'
+    )
+
+    assert meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "bash -n /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+        "bash --noexec /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+        "sh -n /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+    ],
+)
+def test_prebake_delegation_rejects_shell_noexec_modes(invocation):
+    assert not meta._run_directly_executes_prebake(invocation)
+
+
+def test_prebake_delegation_ignores_unrelated_optional_command():
+    run = "compatibility_probe || true; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+
+    assert meta._run_directly_executes_prebake(run)
+
+
+@pytest.mark.parametrize("mask", [" || true", " | true"])
+def test_prebake_delegation_rejects_masked_execution(mask):
+    run = f"bash /opt/molecule/scripts/prebake-mgmt-mcp.sh{mask}"
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+@pytest.mark.parametrize("mask", [" || true", " | true"])
+def test_runtime_helper_rejects_masked_exact_and_range_self_checks(mask):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            f'_prebake_self_check "${{SPEC}}"{mask}',
+            f'_prebake_self_check "${{PKG}}@${{RANGE}}"{mask}',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+def test_runtime_helper_accepts_fail_closed_self_check_fallbacks():
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}" || { echo exact failed; exit 1; }',
+            '_prebake_self_check "${PKG}@${RANGE}" || { echo range failed; exit 1; }',
+        ]
+    )
+
+    assert meta._helper_consumes_mcp_contract(helper)
 
 
 def test_runtime_wheel_rejects_helper_markers_in_comments_and_echoes():

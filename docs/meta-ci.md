@@ -99,9 +99,20 @@ actually consumes.
 
 The template Dockerfile must bind `RUNTIME_VERSION` to an effective runtime-wheel
 download/install and directly execute the helper. The runner tokenizes the relevant shell
-commands and checks that data flow; comments, `echo` markers, and optional `|| true`
-acquisition do not count. It likewise requires real helper assignments from the packaged
-constants plus actual exact/range offline self-check invocations.
+commands and their immediate control edges, then checks that data flow. An unrelated
+compatibility command elsewhere in the same `RUN` may use `|| true`, but the recognized
+acquisition/delegation itself must remain fail-closed: pipelines, background/conditional
+execution, and `|| true` masks do not count. A direct `|| { ...; exit <nonzero>; }`
+failure branch does count. `bash -n`, `bash --noexec`, `sh -n`, comments, and `echo`
+markers are not helper execution. The packaged helper must likewise make real assignments
+from the constants and leave both exact/range offline self-checks unmasked; its explicit
+non-zero failure branches are accepted.
+
+The same-repository self-test also reads the four official immutable consumer refs from
+`scripts/fixtures/meta-ci/official-consumers.json`, fetches each anonymously, exports a
+clean tree with `git archive`, and runs the checkout's canonical router against all four.
+This archive regression is an implementation gate for changes to the router; it does not
+promote the consumer advisory context or replace any template's live Tier-4 Docker gate.
 
 All reads are anonymous, size/decompression bounded, and restricted to the exact public
 Molecule Gitea package origin (default/443 only, no userinfo). Every redirect is checked
