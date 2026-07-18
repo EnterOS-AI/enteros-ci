@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as _dt
 import base64
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -331,7 +332,12 @@ def test_node_step_timeout_fails_not_hangs(tmp_path, monkeypatch):
 
 
 # --- mcp-pin-lockstep bundle runner ----------------------------------------
-def _runtime_wheel(version="0.4.25", pinned="1.8.3", compatible="^1.8.0"):
+def _runtime_wheel(
+    version="0.4.25",
+    pinned="1.8.3",
+    compatible="^1.8.0",
+    helper=None,
+):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as wheel:
         wheel.writestr(
@@ -348,12 +354,16 @@ def _runtime_wheel(version="0.4.25", pinned="1.8.3", compatible="^1.8.0"):
         )
         wheel.writestr(
             "molecule_runtime/scripts/prebake-mgmt-mcp.sh",
-            "\n".join(
+            helper
+            or "\n".join(
                 [
                     "#!/usr/bin/env bash",
+                    "PKG=\"$(_read MANAGEMENT_MCP_NPM_PACKAGE)\"",
                     "VER=\"$(_read MANAGEMENT_MCP_PINNED_VERSION)\"",
+                    "RANGE=\"$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)\"",
                     'SPEC="${PKG}@${VER}"',
                     '_prebake_self_check "${SPEC}"',
+                    '_prebake_self_check "${PKG}@${RANGE}"',
                 ]
             ),
         )
@@ -385,7 +395,10 @@ def _mcp_lockstep_fixture(tmp_path, *, runtime_version="0.4.25", pinned="1.8.3")
     (tmp_path / "Dockerfile").write_text(
         "FROM python:3.11-slim\n"
         "ARG RUNTIME_VERSION=\n"
-        "RUN test -n \"${RUNTIME_VERSION}\"\n"
+        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
+        "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
+        "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
         "RUN bash \"$(python3 -c 'import molecule_runtime')/scripts/prebake-mgmt-mcp.sh\"\n"
     )
 
@@ -457,7 +470,12 @@ def test_mcp_pin_lockstep_verifies_exact_immutable_runtime_and_mcp_artifacts(tmp
         (".runtime-version", "not-a-version\n", "exact stable semver"),
         (
             "Dockerfile",
-            "FROM scratch\nARG RUNTIME_VERSION=\nRUN test -n \"${RUNTIME_VERSION}\"\n",
+            "FROM scratch\n"
+            "ARG RUNTIME_VERSION=\n"
+            "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+            "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
+            "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
+            "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n",
             "prebake-mgmt-mcp.sh",
         ),
     ],
@@ -552,7 +570,7 @@ def test_package_fetch_retries_only_transient_http_failures(monkeypatch):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(meta, "_open_package_url", urlopen)
     monkeypatch.setattr(meta.time, "sleep", sleeps.append)
 
     assert meta._fetch_bytes(url) == b"eventual success"
@@ -572,7 +590,7 @@ def test_package_fetch_does_not_retry_auth_or_other_client_errors(monkeypatch, s
         calls += 1
         raise urllib.error.HTTPError(url, status, "client error", {}, None)
 
-    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(meta, "_open_package_url", urlopen)
 
     with pytest.raises(meta.MCPPinLockstepError, match=f"HTTP {status}"):
         meta._fetch_bytes(url)
@@ -588,12 +606,66 @@ def test_package_fetch_fails_closed_after_bounded_transport_retries(monkeypatch)
         calls += 1
         raise urllib.error.URLError("connection reset")
 
-    monkeypatch.setattr(meta.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(meta, "_open_package_url", urlopen)
     monkeypatch.setattr(meta.time, "sleep", lambda _delay: None)
 
     with pytest.raises(meta.MCPPinLockstepError, match="after 3 attempts"):
         meta._fetch_bytes(url)
     assert calls == meta._HTTP_MAX_ATTEMPTS == 3
+
+
+def test_package_fetch_retries_truncated_http_response(monkeypatch):
+    url = meta.MOLECULE_RUNTIME_INDEX_URL
+    calls = 0
+
+    def urlopen(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise http.client.IncompleteRead(b"partial", 100)
+
+    monkeypatch.setattr(meta, "_open_package_url", urlopen)
+    monkeypatch.setattr(meta.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="after 3 attempts"):
+        meta._fetch_bytes(url)
+    assert calls == meta._HTTP_MAX_ATTEMPTS == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://git.moleculesai.app:8443/api/packages/molecule-ai/pypi/simple/",
+        "https://reviewer@git.moleculesai.app/api/packages/molecule-ai/pypi/simple/",
+    ],
+)
+def test_package_fetch_rejects_noncanonical_origin_before_open(monkeypatch, url):
+    calls = 0
+
+    def urlopen(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        return _FakeHTTPResponse(url)
+
+    monkeypatch.setattr(meta, "_open_package_url", urlopen)
+
+    with pytest.raises(meta.MCPPinLockstepError, match="untrusted package URL"):
+        meta._fetch_bytes(url)
+    assert calls == 0
+
+
+def test_package_redirect_handler_rejects_off_origin_before_follow():
+    request = urllib.request.Request(meta.MOLECULE_RUNTIME_INDEX_URL)
+    handler = meta._SameOriginRedirectHandler()
+
+    with pytest.raises(meta.MCPPinLockstepError, match="redirected off origin"):
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://packages.invalid/runtime.whl",
+        )
 
 
 def test_runtime_wheel_rejects_oversized_member_before_decompression(monkeypatch):
@@ -642,6 +714,77 @@ def test_mcp_tarball_rejects_oversized_member(monkeypatch):
             integrity=integrity,
             shasum=hashlib.sha1(tarball).hexdigest(),
         )
+
+
+def test_dockerfile_rejects_runtime_pin_without_effective_wheel_acquisition(tmp_path):
+    (tmp_path / ".runtime-version").write_text("0.4.25\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN echo \"${RUNTIME_VERSION}\"\n"
+        "RUN bash /opt/molecule/prebake-mgmt-mcp.sh\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="runtime wheel acquisition"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_rejects_echo_only_prebake_marker(tmp_path):
+    (tmp_path / ".runtime-version").write_text("0.4.25\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
+        "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
+        "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
+        "RUN echo prebake-mgmt-mcp.sh\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="executable RUN delegation"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_accepts_positional_runtime_prepare_contract(tmp_path):
+    (tmp_path / ".runtime-version").write_text("0.4.25\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
+        "requirements.txt /tmp/public.txt \"${RUNTIME_VERSION}\")\"; \\\n"
+        "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
+        "RUN bash /opt/molecule/scripts/prebake-mgmt-mcp.sh\n"
+    )
+
+    assert meta._template_runtime_pin(tmp_path) == "0.4.25"
+
+
+def test_dockerfile_rejects_optional_runtime_acquisition(tmp_path):
+    (tmp_path / ".runtime-version").write_text("0.4.25\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN pip download \"molecules-workspace-runtime==${RUNTIME_VERSION}\" || true\n"
+        "RUN bash /opt/molecule/scripts/prebake-mgmt-mcp.sh\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="runtime wheel acquisition"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_runtime_wheel_rejects_helper_markers_in_comments_and_echoes():
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "# _read MANAGEMENT_MCP_PINNED_VERSION",
+            "echo 'SPEC=\"${PKG}@${VER}\"'",
+            "echo '_prebake_self_check \"${SPEC}\"'",
+        ]
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="does not consume"):
+        meta._runtime_contract(_runtime_wheel(helper=helper), "0.4.25")
 
 
 def test_mcp_pin_lockstep_fails_closed_when_pin_is_outside_compatible_range(tmp_path):

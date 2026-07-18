@@ -63,9 +63,11 @@ import datetime as _dt
 import gzip
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -131,6 +133,7 @@ MOLECULE_RUNTIME_INDEX_URL = (
     "molecules-workspace-runtime/"
 )
 _PACKAGE_HOST = "git.moleculesai.app"
+_PACKAGE_ORIGIN = ("https", _PACKAGE_HOST, 443)
 _HTTP_ATTEMPT_TIMEOUT_SECONDS = 10
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_SECONDS = 0.25
@@ -466,10 +469,46 @@ class _RuntimeWheelLinks(HTMLParser):
             self.hrefs.append(href)
 
 
+def _https_origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return None
+    return ("https", parsed.hostname.lower(), port or 443)
+
+
 def _same_origin(left: str, right: str) -> bool:
-    a = urllib.parse.urlsplit(left)
-    b = urllib.parse.urlsplit(right)
-    return a.scheme == b.scheme == "https" and a.netloc == b.netloc
+    origin = _https_origin(left)
+    return origin is not None and origin == _https_origin(right)
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject an off-origin Location before urllib issues the next request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _https_origin(newurl) != _PACKAGE_ORIGIN or not _same_origin(
+            req.full_url, newurl
+        ):
+            raise MCPPinLockstepError(
+                f"package request redirected off origin: {req.full_url} -> {newurl}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_PACKAGE_OPENER = urllib.request.build_opener(_SameOriginRedirectHandler())
+
+
+def _open_package_url(request: urllib.request.Request, *, timeout: int):
+    return _PACKAGE_OPENER.open(request, timeout=timeout)
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -478,16 +517,13 @@ def _fetch_bytes(url: str) -> bytes:
     Transport failures, 429, and 5xx retry up to three 10-second attempts.
     Authentication and all other 4xx responses fail immediately.
     """
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname != _PACKAGE_HOST:
+    if _https_origin(url) != _PACKAGE_ORIGIN:
         raise MCPPinLockstepError(f"refusing untrusted package URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "curl/8.4.0"})
     last_error: Exception | None = None
     for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
         try:
-            with urllib.request.urlopen(
-                request, timeout=_HTTP_ATTEMPT_TIMEOUT_SECONDS
-            ) as response:
+            with _open_package_url(request, timeout=_HTTP_ATTEMPT_TIMEOUT_SECONDS) as response:
                 final_url = response.geturl()
                 if not _same_origin(url, final_url):
                     raise MCPPinLockstepError(
@@ -510,7 +546,13 @@ def _fetch_bytes(url: str) -> bytes:
                     f"package fetch failed for {url}: HTTP {exc.code} (not retryable)"
                 ) from exc
             last_error = exc
-        except (TimeoutError, ConnectionError, urllib.error.URLError, OSError) as exc:
+        except (
+            TimeoutError,
+            ConnectionError,
+            urllib.error.URLError,
+            OSError,
+            http.client.HTTPException,
+        ) as exc:
             last_error = exc
         except ValueError as exc:
             raise MCPPinLockstepError(f"malformed package response for {url}: {exc}") from exc
@@ -544,19 +586,10 @@ def _caret_contains(compatible: str, pinned: str) -> bool:
     return floor <= version < ceiling
 
 
-def _template_runtime_pin(repo_root: Path) -> str:
-    pin_path = repo_root / ".runtime-version"
-    if not pin_path.is_file():
-        raise MCPPinLockstepError("missing .runtime-version exact runtime pin")
-    pin = pin_path.read_text(encoding="utf-8").strip()
-    _exact_semver(pin, ".runtime-version")
-
-    dockerfile = repo_root / "Dockerfile"
-    if not dockerfile.is_file():
-        raise MCPPinLockstepError("missing Dockerfile for mcp-server-bake capability")
+def _continued_lines(contents: str) -> list[str]:
     logical: list[str] = []
     pending = ""
-    for raw in dockerfile.read_text(encoding="utf-8").splitlines():
+    for raw in contents.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -567,19 +600,192 @@ def _template_runtime_pin(repo_root: Path) -> str:
         pending = ""
     if pending:
         logical.append(pending)
+    return logical
+
+
+def _shell_segments(command: str, *, reject_or_fallback: bool = False) -> list[list[str]]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for word in lexer:
+        if re.fullmatch(r"[;&|]+", word):
+            if reject_or_fallback and word == "||":
+                return []
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(word)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _assignment(word: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", word, re.S)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _command_words(segment: list[str]) -> list[str]:
+    index = 0
+    while index < len(segment) and _assignment(segment[index]) is not None:
+        index += 1
+    return segment[index:]
+
+
+def _runtime_prepare_assignment(value: str) -> bool:
+    if not value.startswith("$(") or not value.endswith(")"):
+        return False
+    nested = _shell_segments(value[2:-1])
+    if len(nested) != 1:
+        return False
+    words = _command_words(nested[0])
+    if len(words) < 3 or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(words[0]).name):
+        return False
+    script = Path(words[1]).name.replace("_", "-")
+    if script != "prepare-runtime-requirements.py":
+        return False
+    for index, word in enumerate(words[2:], start=2):
+        if word == "--runtime-version" and index + 1 < len(words):
+            return words[index + 1] in {"$RUNTIME_VERSION", "${RUNTIME_VERSION}"}
+        if word.startswith("--runtime-version="):
+            return word.partition("=")[2] in {"$RUNTIME_VERSION", "${RUNTIME_VERSION}"}
+    return words[-1] in {"$RUNTIME_VERSION", "${RUNTIME_VERSION}"}
+
+
+def _pip_acquisition_arguments(words: list[str]) -> list[str] | None:
+    if not words:
+        return None
+    executable = Path(words[0]).name
+    if re.fullmatch(r"pip3?(?:\.\d+)?", executable) and len(words) >= 2:
+        return words[2:] if words[1] in {"download", "install"} else None
+    if (
+        re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable)
+        and len(words) >= 4
+        and words[1:3] == ["-m", "pip"]
+    ):
+        return words[4:] if words[3] in {"download", "install"} else None
+    return None
+
+
+def _run_acquires_pinned_runtime(run: str) -> bool:
+    segments = _shell_segments(run, reject_or_fallback=True)
+    prepared: dict[str, int] = {}
+    has_runtime_identity = False
+    for index, segment in enumerate(segments):
+        if len(segment) == 1:
+            assignment = _assignment(segment[0])
+            if assignment:
+                name, value = assignment
+                has_runtime_identity = has_runtime_identity or (
+                    value.replace("_", "-") == "molecules-workspace-runtime"
+                )
+                if _runtime_prepare_assignment(value):
+                    prepared[name] = index
+
+        arguments = _pip_acquisition_arguments(_command_words(segment))
+        if arguments is None:
+            continue
+        if any(
+            re.fullmatch(
+                r"molecules[-_]workspace[-_]runtime==\$\{?RUNTIME_VERSION\}?", argument
+            )
+            for argument in arguments
+        ):
+            return True
+        for name, assignment_index in prepared.items():
+            if assignment_index < index and any(
+                argument in {f"${name}", f"${{{name}}}"} for argument in arguments
+            ):
+                return has_runtime_identity
+    return False
+
+
+def _run_directly_executes_prebake(run: str) -> bool:
+    segments = _shell_segments(run)
+    if len(segments) != 1:
+        return False
+    words = _command_words(segments[0])
+    if not words:
+        return False
+    executable = Path(words[0]).name
+    if executable == "prebake-mgmt-mcp.sh":
+        return True
+    shell_options = [word for word in words[1:] if word.startswith("-")]
+    if executable not in {"bash", "sh"} or any(
+        option == "-c" or (not option.startswith("--") and "c" in option[1:])
+        for option in shell_options
+    ):
+        return False
+    script_arguments = [word for word in words[1:] if not word.startswith("-")]
+    return bool(
+        script_arguments
+        and script_arguments[0].endswith("/scripts/prebake-mgmt-mcp.sh")
+    )
+
+
+def _helper_consumes_mcp_contract(helper: str) -> bool:
+    assignments: dict[str, str] = {}
+    commands: list[list[str]] = []
+    for line in _continued_lines(helper):
+        for segment in _shell_segments(line):
+            if len(segment) == 1:
+                assignment = _assignment(segment[0])
+                if assignment:
+                    assignments[assignment[0]] = assignment[1]
+                    continue
+            words = _command_words(segment)
+            if words:
+                commands.append(words)
+
+    if assignments.get("PKG") != "$(_read MANAGEMENT_MCP_NPM_PACKAGE)":
+        return False
+    if assignments.get("VER") != "$(_read MANAGEMENT_MCP_PINNED_VERSION)":
+        return False
+    if assignments.get("RANGE") != "$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)":
+        return False
+    if assignments.get("SPEC") not in {"${PKG}@${VER}", "$PKG@$VER"}:
+        return False
+    invocations = {
+        words[1]
+        for words in commands
+        if len(words) >= 2 and words[0] == "_prebake_self_check"
+    }
+    return "${SPEC}" in invocations and "${PKG}@${RANGE}" in invocations
+
+
+def _template_runtime_pin(repo_root: Path) -> str:
+    pin_path = repo_root / ".runtime-version"
+    if not pin_path.is_file():
+        raise MCPPinLockstepError("missing .runtime-version exact runtime pin")
+    pin = pin_path.read_text(encoding="utf-8").strip()
+    _exact_semver(pin, ".runtime-version")
+
+    dockerfile = repo_root / "Dockerfile"
+    if not dockerfile.is_file():
+        raise MCPPinLockstepError("missing Dockerfile for mcp-server-bake capability")
+    logical = _continued_lines(dockerfile.read_text(encoding="utf-8"))
 
     if not any(re.match(r"^ARG\s+RUNTIME_VERSION(?:=|\s|$)", line, re.I) for line in logical):
         raise MCPPinLockstepError("Dockerfile is missing ARG RUNTIME_VERSION")
-    if not any(
-        re.search(r"\$\{?RUNTIME_VERSION\}?", line)
-        for line in logical
-        if not line.upper().startswith("ARG ")
-    ):
-        raise MCPPinLockstepError("Dockerfile does not consume its exact RUNTIME_VERSION pin")
-    if not any(
-        line.upper().startswith("RUN ") and "prebake-mgmt-mcp.sh" in line
-        for line in logical
-    ):
+    try:
+        runtime_acquisition = any(
+            line.upper().startswith("RUN ") and _run_acquires_pinned_runtime(line[4:])
+            for line in logical
+        )
+        prebake_delegation = any(
+            line.upper().startswith("RUN ") and _run_directly_executes_prebake(line[4:])
+            for line in logical
+        )
+    except ValueError as exc:
+        raise MCPPinLockstepError(f"Dockerfile has malformed shell syntax: {exc}") from exc
+    if not runtime_acquisition:
+        raise MCPPinLockstepError(
+            "Dockerfile does not bind RUNTIME_VERSION to runtime wheel acquisition"
+        )
+    if not prebake_delegation:
         raise MCPPinLockstepError(
             "Dockerfile has no executable RUN delegation to prebake-mgmt-mcp.sh"
         )
@@ -702,12 +908,11 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
         raise MCPPinLockstepError(
             "runtime wheel lacks literal MCP contract constants: " + ", ".join(missing)
         )
-    helper_markers = (
-        "_read MANAGEMENT_MCP_PINNED_VERSION",
-        'SPEC="${PKG}@${VER}"',
-        '_prebake_self_check "${SPEC}"',
-    )
-    if any(marker not in helper for marker in helper_markers):
+    try:
+        helper_consumes_contract = _helper_consumes_mcp_contract(helper)
+    except ValueError as exc:
+        raise MCPPinLockstepError(f"runtime prebake helper is malformed: {exc}") from exc
+    if not helper_consumes_contract:
         raise MCPPinLockstepError(
             "runtime prebake helper does not consume and offline-check the exact MCP pin"
         )
@@ -726,9 +931,10 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
         raise MCPPinLockstepError("runtime MCP package and registry scope disagree")
     parsed_registry = urllib.parse.urlsplit(registry)
     if (
-        parsed_registry.scheme != "https"
-        or parsed_registry.hostname != _PACKAGE_HOST
+        _https_origin(registry) != _PACKAGE_ORIGIN
         or parsed_registry.path != "/api/packages/molecule-ai/npm/"
+        or parsed_registry.query
+        or parsed_registry.fragment
     ):
         raise MCPPinLockstepError(f"runtime wheel names an untrusted MCP registry: {registry}")
     return values

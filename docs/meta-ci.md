@@ -97,14 +97,20 @@ in the wheel, so this runner does not claim to inspect it; SDK/runtime contract 
 remains its own gate. This runner checks the executable constants and helper the image
 actually consumes.
 
-The template Dockerfile must consume `RUNTIME_VERSION` and execute the helper. All reads
-are anonymous, size/decompression bounded, and restricted to the public Molecule Gitea
-package origins. Transient transport errors, HTTP 429, and HTTP 5xx receive at most three
-10-second attempts; authentication and other 4xx responses fail immediately. Missing
-metadata, unavailable or malformed responses, compressed-archive expansion beyond the
-per-member/total caps, hash mismatch, pin/range skew, and a missing exact package all fail
-closed. This does not replace or relax the runtime-template's existing live Tier-4 Docker
-conformance gate.
+The template Dockerfile must bind `RUNTIME_VERSION` to an effective runtime-wheel
+download/install and directly execute the helper. The runner tokenizes the relevant shell
+commands and checks that data flow; comments, `echo` markers, and optional `|| true`
+acquisition do not count. It likewise requires real helper assignments from the packaged
+constants plus actual exact/range offline self-check invocations.
+
+All reads are anonymous, size/decompression bounded, and restricted to the exact public
+Molecule Gitea package origin (default/443 only, no userinfo). Every redirect is checked
+before it is followed. Transient transport failures, including truncated HTTP bodies,
+HTTP 429, and HTTP 5xx receive at most three 10-second attempts; authentication and other
+4xx responses fail immediately. Missing metadata, unavailable or malformed responses,
+compressed-archive expansion beyond the per-member/total caps, hash mismatch, pin/range
+skew, and a missing exact package all fail closed. This does not replace or relax the
+runtime-template's existing live Tier-4 Docker conformance gate.
 
 The heavier language bundles
 (`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
