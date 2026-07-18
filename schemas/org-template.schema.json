@@ -17,7 +17,7 @@
     "defaults": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Core does not apply `defaults.channels`; native channel bindings belong on individual workspace nodes. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
+      "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Channel connections are ordinary `kind: channel` plugins in this list; the retired native `channels` key is rejected. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
       "not": { "required": ["channels"] },
       "allOf": [
         {
@@ -58,6 +58,7 @@
       "type": "object",
       "additionalProperties": true,
       "required": ["repo", "ref", "path"],
+      "not": { "required": ["channels"] },
       "description": "An UNRESOLVED `!external` workspace reference, as it appears in a folder-tree org.yaml AFTER the custom `!external` YAML tag is stripped at load time (molecule-dev pins the dev department, molecule-core#105 / internal#77). core's gitops resolver fetches `repo` at `ref` and expands `path` into a workspaceNode at platform import time; this object is the PRE-RESOLUTION ref, not the resolved node. Distinct oneOf branch from workspaceNode (which requires `name`, absent here).",
       "properties": {
         "repo": { "type": "string", "minLength": 1, "description": "Source repo holding the external workspace, e.g. `molecule-ai/molecule-dev-department`." },
@@ -69,6 +70,7 @@
       "type": "object",
       "additionalProperties": true,
       "required": ["name"],
+      "not": { "required": ["channels"] },
       "description": "A single workspace (agent) node. Recursive via `children[]`. Fields derived from the inline nodes (gemini-growth-team) and the folder-tree workspace.yaml (molecule-dev/community-manager). `name` is the only field validate-org-template.py requires; `plugins` must be a list when present.",
       "properties": {
         "name": { "type": "string", "minLength": 1, "description": "Workspace/agent name (required)." },
@@ -81,11 +83,6 @@
           "type": "array",
           "description": "Per-workspace plugins (UNIONed with defaults.plugins). Must be a list (validate-org-template.py enforces). Bare names or source-contract strings; prefix `!`/`-` to opt a default OUT.",
           "items": { "type": "string", "description": "A plugin name or source-contract string (optionally `!`/`-` prefixed to opt out a default)." }
-        },
-        "channels": {
-          "type": "array",
-          "description": "Native Core channel bindings provisioned during org import. Retained until the guarded plugin cutover completes (molecule-core#4267, internal#988). New integrations should prefer kind:channel plugins.",
-          "items": { "$ref": "#/$defs/channel" }
         },
         "schedules": {
           "type": "array",
@@ -114,72 +111,6 @@
         "pattern": "[^a-z0-9_-]"
       },
       "description": "Open, bounded, path-safe runtime identifier. Official first-party support is discovered separately; known aliases normalize without restricting third-party IDs."
-    },
-    "channel": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type"],
-      "description": "A native Core channel binding retained during the channel-plugin migration window.",
-      "properties": {
-        "type": { "type": "string", "enum": ["telegram", "slack", "discord", "lark"], "description": "A native adapter currently registered by Core." },
-        "config": {
-          "type": "object",
-          "additionalProperties": { "type": "string" },
-          "description": "Adapter-specific string config. Values may contain `${VAR_NAME}` references expanded from the workspace environment during org import. Core performs provider-specific format validation after expansion."
-        },
-        "allowed_users": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Optional adapter user/chat allow-list. SECURITY: omitted or empty means Core accepts every sender in the configured chat/channel; use a non-empty list for a private agent."
-        },
-        "enabled": { "type": "boolean", "description": "Whether the channel is enabled." }
-      },
-      "allOf": [
-        {
-          "if": { "properties": { "type": { "const": "telegram" } }, "required": ["type"] },
-          "then": {
-            "required": ["config"],
-            "properties": {
-              "config": {
-                "required": ["bot_token", "chat_id"],
-                "properties": { "bot_token": { "type": "string", "minLength": 1 }, "chat_id": { "type": "string" } }
-              }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "type": { "const": "slack" } }, "required": ["type"] },
-          "then": {
-            "required": ["config"],
-            "properties": {
-              "config": {
-                "anyOf": [
-                  { "required": ["webhook_url"], "properties": { "webhook_url": { "type": "string", "minLength": 1 } } },
-                  { "required": ["bot_token"], "properties": { "bot_token": { "type": "string", "minLength": 1 } } }
-                ],
-                "allOf": [
-                  {
-                    "if": { "required": ["bot_token"], "properties": { "bot_token": { "type": "string", "minLength": 1 } } },
-                    "then": { "required": ["channel_id"], "properties": { "channel_id": { "type": "string", "minLength": 1 } } }
-                  }
-                ]
-              }
-            }
-          }
-        },
-        {
-          "if": { "properties": { "type": { "enum": ["discord", "lark"] } }, "required": ["type"] },
-          "then": {
-            "required": ["config"],
-            "properties": {
-              "config": {
-                "required": ["webhook_url"],
-                "properties": { "webhook_url": { "type": "string", "minLength": 1 } }
-              }
-            }
-          }
-        }
-      ]
     },
     "schedule": {
       "type": "object",

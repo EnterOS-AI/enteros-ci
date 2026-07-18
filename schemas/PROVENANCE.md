@@ -9,14 +9,16 @@ repository (the marketplace-catalog contract family, RFC
 | --- | --- | --- |
 | `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `ce095d0146154cf82c7f44d200ce520b53cf02b6` (SDK PR #120 reviewed head; coordinated merge dependency) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 `molecule-ai-sdk` main at re-vendor time:
-`a51a008fc27abf3da599b95b5e101d5db5a7012c`. The source commits
-above are the latest contract-changing commits for each path and are all
-contained by that main: plugin-manifest from PR #121, workspace-template from
-PR #92, org-template from PR #98, and repo-meta from PR #116.
+`bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119). The source commits
+above are the latest contract-changing commits for each path. The org-template
+copy is staged byte-identically from reviewed SDK PR #120 and this molecule-ci
+change must remain unmerged until that exact source is contained by SDK main;
+the other sources are contained by the recorded main: plugin-manifest from PR
+#119, workspace-template from PR #92, and repo-meta from PR #116.
 
 > **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
 > capture heterogeneous *published artifacts* and are `additionalProperties:true`.
