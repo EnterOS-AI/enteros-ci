@@ -23,10 +23,9 @@
 # is in this job's LOG, not its status colour.
 #
 # PHASE 3 PROMOTION (owner-gated, later — NOT part of adopting this template):
-# to make meta-ci enforcing, switch to calling the reusable with `advisory: false`
-# (which posts a real-state `meta-ci / required` context and fails the job on red),
-# once cross-repo execution is proven or this inline form is given a status POST +
-# `exit`. Do NOT do that here.
+# keep the repository-local execution shape, fail the job on router red, assert
+# its sentinel, and add the emitted local job context to branch protection only
+# after it is proven. Do NOT introduce a remote reusable call.
 
 name: meta-ci-advisory
 
@@ -52,8 +51,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
       # Anon-clone the molecule-ci SSOT; run the CANONICAL scripts/meta-ci.py
       # (schemas/ is its sibling there, so schema validation is intact). Direct
-      # git-clone for the cross-repo fetch — see molecule-ci validate-plugin.yml
-      # for the Gitea 1.26.4 auth reason.
+      # git-clone avoids unsupported cross-repository workflow/action resolution
+      # on Gitea 1.26.4.
       # One guarded step that ALWAYS exits 0, so this job's auto commit-status is
       # always green and can never block a merge (Gitea does NOT green a red step via
       # job-level continue-on-error — the explicit `exit 0` is what guarantees it).
@@ -63,11 +62,12 @@ jobs:
           set +e
           python3 -m pip install --break-system-packages -q pyyaml jsonschema
           git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-          if [ -f .molecule-ci-canonical/scripts/meta-ci.py ]; then
-            python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root .
-            rc=$?
-            [ "$rc" -ne 0 ] && echo "::warning::meta-ci router exited $rc — ADVISORY (not blocking this PR). See log above."
-          else
-            echo "::warning::meta-ci router not yet on molecule-ci main (lands with molecule-ci#71) — advisory no-op this run."
-          fi
+          python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root . \
+            | tee /tmp/meta-ci.log
+          rc=${PIPESTATUS[0]}
+          grep -qxF 'meta-ci:sentinel:executed' /tmp/meta-ci.log || {
+            echo "::warning::meta-ci execution sentinel missing — ADVISORY (not blocking this PR)."
+            rc=1
+          }
+          [ "$rc" -ne 0 ] && echo "::warning::meta-ci router exited $rc — ADVISORY (not blocking this PR). See log above."
           exit 0

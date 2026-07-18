@@ -1,54 +1,47 @@
-# Self-test for the reusable meta-ci router.
-#
-# Calls the reusable against a committed fixture (scripts/fixtures/meta-ci, a valid
-# runtime-template manifest) in ENFORCING mode with a distinct, NON-required context
-# name (`meta-ci / selftest`). A green run proves end-to-end on the LIVE Gitea 1.26.4
-# runner that:
-#   * the reusable loads + the script executes (same-repo `uses:` DOES run, unlike
-#     cross-repo workflow_call — internal#1000), and
-#   * exactly ONE aggregate commit-status context is POSTed (answers the design
-#     question "can meta-ci cleanly emit a single aggregate context on 1.26.4").
-#
-# The fixture is valid, so the posted `meta-ci / selftest` context is GREEN and thus
-# never blocks a molecule-ci merge (R1: only a non-green emitted context blocks under
-# `["*"]`). It is a DISTINCT name from the consumer `meta-ci / required` so this
-# self-test never becomes an accidental fleet-required context.
-#
-# Path-filtered + additive: only spends a runner when the router or this self-test
-# changes; does not touch molecule-ci's existing ci.yml.
-
 name: meta-ci-selftest
+
+# Direct, read-only proof of the canonical router and its execution sentinel.
+# Consumers use the inline templates/ci-meta.yml shape; no workflow_call is
+# exposed or relied upon.
 
 on:
   pull_request:
     paths:
       - "scripts/meta-ci.py"
+      - "scripts/test_meta_ci.py"
       - "schemas/repo-meta.schema.json"
-      - ".gitea/workflows/meta-ci.yml"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
   push:
     branches: [main]
     paths:
       - "scripts/meta-ci.py"
+      - "scripts/test_meta_ci.py"
       - "schemas/repo-meta.schema.json"
-      - ".gitea/workflows/meta-ci.yml"
       - ".gitea/workflows/meta-ci-selftest.yml"
+      - "scripts/fixtures/meta-ci/**"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
-  statuses: write
+  contents: read
 
 jobs:
   selftest:
-    uses: ./.gitea/workflows/meta-ci.yml
-    with:
-      repo_root: "scripts/fixtures/meta-ci"
-      context_name: "meta-ci / selftest"
-      advisory: false
-    permissions:
-      contents: write
-      statuses: write
+    name: required
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - run: pip install --break-system-packages pyyaml jsonschema -q
+      - name: Execute canonical router
+        run: |
+          set -o pipefail
+          python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci \
+            | tee /tmp/meta-ci.log
+      - name: Assert execution sentinel
+        run: grep -qxF 'meta-ci:sentinel:executed' /tmp/meta-ci.log
 
-# reschedule: prior run stuck on the docker-less deploy runner (infra issue internal#1058)
+# reschedule: prior run stuck on the docker-less deploy runner (internal#1058)

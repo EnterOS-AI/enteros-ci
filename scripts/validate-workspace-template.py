@@ -682,7 +682,7 @@ def check_adapter_runtime_load() -> None:
     does at workspace boot, and assert at least one class in it inherits
     from molecule_runtime.adapters.base.BaseAdapter.
 
-    The Docker build smoke test in validate-workspace-template.yml builds
+    The Docker build smoke test in templates/ci-workspace-template.yml builds
     the image but doesn't RUN it — adapter.py is only imported at
     container startup. So a template with a syntactically-valid Dockerfile
     + a broken adapter.py (wrong base class, ImportError on a missing
@@ -700,7 +700,7 @@ def check_adapter_runtime_load() -> None:
         first. Warn loudly so the misconfiguration surfaces, but don't
         hard-fail (we'd be saying "your adapter is broken" when the
         actual cause is missing infra). The source-pinned dependency-install
-        step in validate-workspace-template.yml
+        step in templates/ci-workspace-template.yml
         normally satisfies this transitively.
 
     Hard-error conditions:

@@ -9,13 +9,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
-REUSABLE_WORKSPACE_WORKFLOW = (
-    REPO_ROOT / ".gitea" / "workflows" / "validate-workspace-template.yml"
-)
+CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SECRET_SCANNING_WORKFLOWS = (
-    REUSABLE_WORKSPACE_WORKFLOW,
-    REPO_ROOT / ".gitea" / "workflows" / "validate-plugin.yml",
-    REPO_ROOT / ".gitea" / "workflows" / "validate-org-template.yml",
     WORKSPACE_TEMPLATE,
     REPO_ROOT / "templates" / "ci-plugin.yml",
     REPO_ROOT / "templates" / "ci-org-template.yml",
@@ -53,9 +48,23 @@ def test_workspace_template_only_invokes_scripts_present_in_cloned_ci_repo() -> 
         assert source_path.is_file(), f"template references missing {source_path}"
 
 
+@pytest.mark.parametrize("path", CONSUMER_TEMPLATES)
+def test_consumer_templates_only_invoke_scripts_present_in_cloned_ci_repo(
+    path: Path,
+) -> None:
+    references = {
+        match
+        for command in _all_run_steps(path)
+        for match in re.findall(r"\.molecule-ci/[^\s]+\.py", command)
+    }
+    for reference in references:
+        source_path = REPO_ROOT / reference.removeprefix(".molecule-ci/")
+        assert source_path.is_file(), f"{path.name} references missing {source_path}"
+
+
 @pytest.mark.parametrize(
     "path",
-    (WORKSPACE_TEMPLATE, REUSABLE_WORKSPACE_WORKFLOW),
+    (WORKSPACE_TEMPLATE,),
 )
 def test_workspace_runtime_install_uses_source_pinned_installer(path: Path) -> None:
     commands = _all_run_steps(path)

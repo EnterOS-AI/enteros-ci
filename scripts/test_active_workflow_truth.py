@@ -14,6 +14,11 @@ def test_unsupported_reusable_workflows_are_not_active() -> None:
         "auto-promote-staging-pr.yml",
         "auto-promote-staging.yml",
         "disable-auto-merge-on-push.yml",
+        "validate-org-template.yml",
+        "validate-plugin.yml",
+        "validate-workspace-template.yml",
+        "_reusable-minimal-validate.yml",
+        "meta-ci.yml",
     }
 
     active = {path.name for path in WORKFLOWS.glob("*.yml")}
@@ -34,6 +39,18 @@ def test_active_workflows_do_not_call_the_github_cli() -> None:
                 violations.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
 
     assert not violations, "GitHub-only commands remain in active workflows:\n" + "\n".join(violations)
+
+
+def test_active_workflows_do_not_expose_workflow_call() -> None:
+    violations: list[str] = []
+    workflow_call = re.compile(r"^\s+workflow_call\s*:", re.MULTILINE)
+    remote_use = re.compile(r"uses:\s+\S+/\.gitea/workflows/\S+@")
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        content = path.read_text()
+        if workflow_call.search(content) or remote_use.search(content):
+            violations.append(str(path.relative_to(ROOT)))
+
+    assert not violations, "unsupported reusable workflow surface remains: " + ", ".join(violations)
 
 
 def test_readme_does_not_claim_the_retired_guard_is_active() -> None:

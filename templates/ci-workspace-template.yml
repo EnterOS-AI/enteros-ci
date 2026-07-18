@@ -12,8 +12,8 @@
 # WHY INLINE (not `uses: molecule-ai/molecule-ci/.gitea/workflows/...`):
 # cross-repo `uses:` (workflow_call) does NOT execute in Gitea Actions 1.26.4;
 # a consumer job can be recorded as successful without running the referenced
-# steps. The reusable validate-workspace-template.yml is therefore not a valid
-# remote gate. This template instead INLINES the validate job: it
+# steps. The former remote definition was removed from active workflows. This
+# template instead INLINES the validate job: it
 # anon-clones the public molecule-ci SSOT at CI time and runs the canonical
 # validator script directly. Same single-source-of-truth (the validator
 # lives in molecule-ci, fetched fresh on every run), no cross-repo `uses:`.
@@ -26,8 +26,7 @@
 # mode (no pip install of the template's requirements.txt, no adapter.py
 # import, no docker build) — those are arbitrary-code-execution primitives
 # from an untrusted PR's perspective. Internal PRs and pushes get the full
-# runtime validation. This mirrors the static/runtime split in the reusable
-# validate-workspace-template.yml while still emitting the single
+# runtime validation. The split preserves one emitted
 # `CI / validate` context.
 #
 # The SSOT is cloned into `.molecule-ci` (NOT `.molecule-ci-canonical`) so
@@ -52,10 +51,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
-      # Fetch the canonical validator from the molecule-ci SSOT. Anonymous
-      # clone of the public repo — see molecule-ci/.gitea/workflows/
-      # validate-plugin.yml for why a direct git-clone is used instead of
-      # actions/checkout for the cross-repo fetch on Gitea Actions 1.26.4.
+      # Fetch the canonical validator from the public molecule-ci SSOT. A
+      # direct anonymous clone avoids cross-repo workflow/action resolution on
+      # Gitea 1.26.4 while still executing one canonical script implementation.
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
