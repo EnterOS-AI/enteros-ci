@@ -92,10 +92,11 @@ AND every executed runner green. This is deliberately capture-first / enforce-la
 ## Adoption (advisory)
 
 Copy `templates/ci-meta.yml` into a repo as `.gitea/workflows/meta-ci-advisory.yml` and
-commit a `repo-meta.yaml`. It anon-clones this SSOT and runs the canonical router with
-`continue-on-error: true` and **no commit-status POST**, so it can never block a merge
-(its result lives in the job log). Do **not** add it to branch-protection required
-contexts.
+commit a `repo-meta.yaml`. It anonymously fetches an immutable, verified commit
+of this SSOT and runs the canonical router with `continue-on-error: true` and
+**no explicit commit-status POST**, so it can never block a merge (its real
+router result lives in the job log while the advisory job exits green). Do
+**not** add it to branch-protection required contexts.
 
 ### Why inline, not cross-repo `uses:`
 

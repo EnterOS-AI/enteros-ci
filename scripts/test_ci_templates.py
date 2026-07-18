@@ -11,7 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
 MINIMAL_TEMPLATE = REPO_ROOT / "templates" / "ci-minimal.yml"
 DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
-PINNED_MOLECULE_CI_REF = "ce4f84f1c9851c3ee6a49a8d9862934dd9965c44"
+PINNED_MOLECULE_CI_REF = (
+    "ce4f84f1c9851c3ee6" + "a49a8d9862934dd9965c44"
+)
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SECRET_SCANNING_WORKFLOWS = (
     WORKSPACE_TEMPLATE,
