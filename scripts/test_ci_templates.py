@@ -11,24 +11,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
 MINIMAL_TEMPLATE = REPO_ROOT / "templates" / "ci-minimal.yml"
 DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
+CONFORMANCE_TEMPLATE = REPO_ROOT / "templates" / "ci-conformance-gate.yml"
 PINNED_MOLECULE_CI_REF = (
     "ce4f84f1c9851c3ee6" + "a49a8d9862934dd9965c44"
 )
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
+SCRIPT_FETCH_TEMPLATES = tuple(
+    path for path in CONSUMER_TEMPLATES if path != CONFORMANCE_TEMPLATE
+)
 SECRET_SCANNING_WORKFLOWS = (
     WORKSPACE_TEMPLATE,
     REPO_ROOT / "templates" / "ci-plugin.yml",
     REPO_ROOT / "templates" / "ci-org-template.yml",
 )
-
-
-def _workspace_run_steps() -> list[str]:
-    workflow = yaml.safe_load(WORKSPACE_TEMPLATE.read_text())
-    return [
-        step["run"]
-        for step in workflow["jobs"]["validate"]["steps"]
-        if "run" in step
-    ]
 
 
 def _all_run_steps(path: Path) -> list[str]:
@@ -41,15 +36,22 @@ def _all_run_steps(path: Path) -> list[str]:
     ]
 
 
-def test_workspace_template_only_invokes_scripts_present_in_cloned_ci_repo() -> None:
-    references = {
+def _canonical_script_references(path: Path) -> set[str]:
+    return {
         match
-        for command in _workspace_run_steps()
-        for match in re.findall(r"\.molecule-ci/[^\s]+\.py", command)
+        for command in _all_run_steps(path)
+        for match in re.findall(
+            r'molecule-ci-ssot/((?:\.molecule-ci/)?scripts/[^\s"]+\.py)',
+            command,
+        )
     }
+
+
+def test_workspace_template_only_invokes_scripts_present_in_fetched_ci_repo() -> None:
+    references = _canonical_script_references(WORKSPACE_TEMPLATE)
     assert references
     for reference in references:
-        source_path = REPO_ROOT / reference.removeprefix(".molecule-ci/")
+        source_path = REPO_ROOT / reference
         assert source_path.is_file(), f"template references missing {source_path}"
 
 
@@ -57,13 +59,9 @@ def test_workspace_template_only_invokes_scripts_present_in_cloned_ci_repo() -> 
 def test_consumer_templates_only_invoke_scripts_present_in_cloned_ci_repo(
     path: Path,
 ) -> None:
-    references = {
-        match
-        for command in _all_run_steps(path)
-        for match in re.findall(r"\.molecule-ci/[^\s]+\.py", command)
-    }
+    references = _canonical_script_references(path)
     for reference in references:
-        source_path = REPO_ROOT / reference.removeprefix(".molecule-ci/")
+        source_path = REPO_ROOT / reference
         assert source_path.is_file(), f"{path.name} references missing {source_path}"
 
 
@@ -90,6 +88,22 @@ def test_inline_ssot_templates_pin_and_verify_an_immutable_ref(path: Path) -> No
 def test_inline_ssot_templates_assert_execution_sentinels() -> None:
     assert "minimal-validate:sentinel:executed" in MINIMAL_TEMPLATE.read_text()
     assert "secret-scan:sentinel:executed" in DIFF_SECRET_TEMPLATE.read_text()
+
+
+@pytest.mark.parametrize("path", SCRIPT_FETCH_TEMPLATES)
+def test_script_templates_fetch_outside_the_consumer_checkout(path: Path) -> None:
+    commands = "\n".join(_all_run_steps(path))
+    assert "$RUNNER_TEMP/molecule-ci-ssot" in commands
+    assert "git init -q .molecule-ci" not in commands
+    assert "git init -q .molecule-ci-canonical" not in commands
+
+
+def test_local_action_template_uses_a_guarded_dedicated_checkout() -> None:
+    content = CONFORMANCE_TEMPLATE.read_text()
+    commands = "\n".join(_all_run_steps(CONFORMANCE_TEMPLATE))
+    assert "test ! -e .molecule-ci-ssot" in commands
+    assert "git init -q .molecule-ci-ssot" in commands
+    assert "uses: ./.molecule-ci-ssot/.gitea/actions/conformance-gate" in content
 
 
 @pytest.mark.parametrize(

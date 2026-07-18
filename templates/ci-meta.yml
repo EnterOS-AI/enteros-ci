@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
       # Fetch the molecule-ci SSOT by immutable SHA; run the CANONICAL scripts/meta-ci.py
       # (schemas/ is its sibling there, so schema validation is intact). Direct
-      # git-clone avoids unsupported cross-repository workflow/action resolution
+      # immutable SHA fetch avoids unsupported cross-repository workflow/action resolution
       # on Gitea 1.26.4.
       # One guarded step that ALWAYS exits 0, so this job's auto commit-status is
       # always green and can never block a merge (Gitea does NOT green a red step via
@@ -62,16 +62,34 @@ jobs:
       - name: meta-ci router (advisory — never blocks)
         run: |
           set +e
-          python3 -m pip install --break-system-packages -q pyyaml jsonschema
-          git init -q .molecule-ci-canonical
-          git -C .molecule-ci-canonical remote add origin \
-            https://git.moleculesai.app/molecule-ai/molecule-ci.git
-          git -C .molecule-ci-canonical fetch -q --depth 1 origin "$MOLECULE_CI_REF"
-          git -C .molecule-ci-canonical checkout -q --detach FETCH_HEAD
-          test "$(git -C .molecule-ci-canonical rev-parse HEAD)" = "$MOLECULE_CI_REF"
-          python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root . \
-            | tee /tmp/meta-ci.log
-          rc=${PIPESTATUS[0]}
+          rc=0
+          if ! python3 -m pip install --break-system-packages -q pyyaml jsonschema; then
+            rc=1
+          fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::warning::RUNNER_TEMP is missing — ADVISORY (not blocking this PR)."
+            rc=1
+          else
+            CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
+            if [ -e "$CI_ROOT" ]; then
+              echo "::warning::isolated molecule-ci path already exists — ADVISORY (not blocking this PR)."
+              rc=1
+            elif [ "$rc" -eq 0 ]; then
+              if ! git init -q "$CI_ROOT" ||
+                ! git -C "$CI_ROOT" remote add origin \
+                  https://git.moleculesai.app/molecule-ai/molecule-ci.git ||
+                ! git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF" ||
+                ! git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD ||
+                ! test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"; then
+                rc=1
+              fi
+            fi
+          fi
+          if [ "$rc" -eq 0 ]; then
+            python3 "$CI_ROOT/scripts/meta-ci.py" --repo-root . \
+              | tee /tmp/meta-ci.log
+            rc=${PIPESTATUS[0]}
+          fi
           grep -qxF 'meta-ci:sentinel:executed' /tmp/meta-ci.log || {
             echo "::warning::meta-ci execution sentinel missing — ADVISORY (not blocking this PR)."
             rc=1
