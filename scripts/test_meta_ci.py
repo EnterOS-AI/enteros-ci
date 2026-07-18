@@ -502,6 +502,88 @@ def test_dockerfile_rejects_lockstep_proof_absent_from_final_stage(tmp_path):
         meta._template_runtime_pin(tmp_path)
 
 
+def test_dockerfile_rejects_heredoc_instruction_spoofing(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    (tmp_path / "Dockerfile").write_text(
+        "# syntax=docker/dockerfile:1\n"
+        "FROM python:3.11-slim\n"
+        'SHELL ["/bin/true"]\n'
+        "RUN <<'PROOF'\n"
+        "FROM scratch AS fake\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN set -e; runtime_project=molecules-workspace-runtime; "
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version ${RUNTIME_VERSION})"; pip download "$runtime_requirement"\n'
+        "RUN bash /opt/molecule/scripts/prebake-mgmt-mcp.sh\n"
+        "PROOF\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="heredoc"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_rejects_nondefault_escape_instruction_spoofing(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    (tmp_path / "Dockerfile").write_text(
+        "# escape=`\n"
+        "FROM python:3.11-slim\n"
+        'SHELL ["/bin/true"]\n'
+        "RUN echo ignored `\n"
+        "FROM scratch AS fake\n"
+        "ARG RUNTIME_VERSION=\n"
+        "RUN set -e; runtime_project=molecules-workspace-runtime; "
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version ${RUNTIME_VERSION})"; pip download "$runtime_requirement"\n'
+        "RUN bash /opt/molecule/scripts/prebake-mgmt-mcp.sh\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="escape"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_rejects_runtime_env_override(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        dockerfile.read_text().replace(
+            "ARG RUNTIME_VERSION=\n",
+            "ARG RUNTIME_VERSION=\nENV RUNTIME_VERSION=9.9.9\n",
+        )
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="ENV RUNTIME_VERSION"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_requires_runtime_arg_before_acquisition(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    contents = dockerfile.read_text().replace("ARG RUNTIME_VERSION=\n", "")
+    dockerfile.write_text(
+        contents.replace(
+            "RUN bash ",
+            "ARG RUNTIME_VERSION=\nRUN bash ",
+        )
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="precede"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_rejects_runtime_arg_redefinition(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        dockerfile.read_text().replace(
+            "RUN bash ",
+            "ARG RUNTIME_VERSION=9.9.9\nRUN bash ",
+        )
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="exactly one"):
+        meta._template_runtime_pin(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("filename", "contents", "message"),
     [
@@ -993,6 +1075,149 @@ def test_runtime_helper_rejects_positional_set_decoy_errexit(positional_set):
 
 
 @pytest.mark.parametrize(
+    "invalid_set",
+    ["set -eZ", "set -e +Z", "set -e -O extglob +e"],
+)
+def test_runtime_acquisition_rejects_invalid_set_decoy_errexit(invalid_set):
+    run = (
+        f"set +e; {invalid_set}; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"; true'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "invalid_set",
+    ["set -eZ", "set -e +Z", "set -e -O extglob +e"],
+)
+def test_runtime_helper_rejects_invalid_set_decoy_errexit(invalid_set):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -e",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            "set +e",
+            invalid_set,
+            '_prebake_self_check "${SPEC}"; true',
+            '_prebake_self_check "${PKG}@${RANGE}"; true',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize(
+    "noexec_set",
+    [
+        "set -en",
+        "set -e -o noexec",
+        "time set -en",
+        "command set -en",
+        "builtin set -en",
+        "! set -en",
+    ],
+)
+def test_runtime_acquisition_rejects_noexec_shell(noexec_set):
+    run = (
+        f"{noexec_set}; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "noexec_set",
+    [
+        "set -en",
+        "set -e -o noexec",
+        "time set -en",
+        "command set -en",
+        "builtin set -en",
+        "! set -en",
+    ],
+)
+def test_prebake_delegation_rejects_noexec_shell(noexec_set):
+    run = f"{noexec_set}; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+@pytest.mark.parametrize(
+    "noexec_set",
+    [
+        "set -en",
+        "set -e -o noexec",
+        "time set -en",
+        "command set -en",
+        "builtin set -en",
+        "! set -en",
+    ],
+)
+def test_runtime_helper_rejects_noexec_shell(noexec_set):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            noexec_set,
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize(
+    "terminal", ["exit 0", "exit 256", "exec true", "{ exit 0; }"]
+)
+def test_runtime_acquisition_rejects_prior_green_terminal_control(terminal):
+    run = (
+        f"{terminal}; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "terminal", ["exit 0", "exit 256", "exec true", "{ exit 0; }"]
+)
+def test_prebake_delegation_rejects_prior_green_terminal_control(terminal):
+    run = f"{terminal}; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+@pytest.mark.parametrize(
+    "terminal", ["exit 0", "exit 256", "exec true", "{ exit 0; }"]
+)
+def test_runtime_helper_rejects_prior_green_terminal_control(terminal):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -e",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            terminal,
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize(
     "invocation",
     [
         "bash -n /opt/molecule/scripts/prebake-mgmt-mcp.sh",
@@ -1059,6 +1284,27 @@ def test_prebake_delegation_rejects_command_inside_never_called_function():
         "set -e; bake_runtime() { :; "
         "bash /opt/molecule/scripts/prebake-mgmt-mcp.sh; }; true"
     )
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+def test_prebake_delegation_rejects_called_function_control_before_execution():
+    run = (
+        "disable_execution() { set -n; }; disable_execution; "
+        "bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+    )
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+@pytest.mark.parametrize(
+    "dynamic_control",
+    ["eval 'exit 0'", "source /tmp/unverifiable-prebake-control.sh"],
+)
+def test_prebake_delegation_rejects_dynamic_control_before_execution(
+    dynamic_control,
+):
+    run = f"{dynamic_control}; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
 
     assert not meta._run_directly_executes_prebake(run)
 

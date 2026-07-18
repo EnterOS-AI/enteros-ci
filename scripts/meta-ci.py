@@ -143,6 +143,37 @@ _MAX_TAR_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_MEMBER_BYTES = 2 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 10_000
 _STABLE_SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+_BASH_SET_SHORT_OPTIONS = frozenset("abefhkmnptuvxBCEHPT")
+_BASH_SET_LONG_OPTIONS = frozenset(
+    {
+        "allexport",
+        "braceexpand",
+        "emacs",
+        "errexit",
+        "errtrace",
+        "functrace",
+        "hashall",
+        "histexpand",
+        "history",
+        "ignoreeof",
+        "keyword",
+        "monitor",
+        "noclobber",
+        "noexec",
+        "noglob",
+        "nolog",
+        "notify",
+        "nounset",
+        "onecmd",
+        "physical",
+        "pipefail",
+        "posix",
+        "privileged",
+        "verbose",
+        "vi",
+        "xtrace",
+    }
+)
 
 
 class MetaCIError(Exception):
@@ -668,6 +699,34 @@ def _timed_command_words(words: list[str]) -> tuple[list[str], bool]:
     return words[index:], True
 
 
+def _effective_shell_command_words(segment: list[str]) -> tuple[list[str], bool]:
+    """Strip shell keywords/builtins that execute the following command in-process."""
+    words = _command_words(segment)
+    while words:
+        if words[0] == "!":
+            words = words[1:]
+            continue
+        if words[0] == "time":
+            words, valid = _timed_command_words(words)
+            if not valid:
+                return [], False
+            continue
+        if words[0] not in {"builtin", "command"}:
+            break
+        wrapper = words[0]
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            option = words[index]
+            if option == "--":
+                index += 1
+                break
+            if wrapper == "command" and set(option[1:]) & {"v", "V"}:
+                return [], True
+            index += 1
+        words = words[index:]
+    return words, True
+
+
 def _assignment_updates(
     segment: list[str],
 ) -> list[tuple[str, str, bool, bool, bool]]:
@@ -1053,8 +1112,8 @@ def _pip_acquisition_arguments(words: list[str]) -> list[str] | None:
 
 
 def _set_errexit(words: list[str], enabled: bool) -> bool:
-    words = _command_words(words)
-    if not words or words[0] != "set":
+    words, valid = _effective_shell_command_words(words)
+    if not valid or not words or words[0] != "set":
         return enabled
     index = 1
     while index < len(words):
@@ -1063,17 +1122,77 @@ def _set_errexit(words: list[str], enabled: bool) -> bool:
         # option-looking values after that point do not change shell flags.
         if option == "--" or option in {"-", "+"} or not option.startswith(("-", "+")):
             break
-        if option in {"-o", "+o"} and index + 1 < len(words):
-            if words[index + 1] == "errexit":
+        if option in {"-o", "+o"}:
+            if index + 1 >= len(words):
+                break
+            option_name = words[index + 1]
+            if option_name not in _BASH_SET_LONG_OPTIONS:
+                return False
+            if option_name == "errexit":
                 enabled = option == "-o"
             index += 2
             continue
-        if re.fullmatch(r"-[A-Za-z]+", option) and "e" in option[1:]:
-            enabled = True
-        elif re.fullmatch(r"\+[A-Za-z]+", option) and "e" in option[1:]:
-            enabled = False
+        if option in {"-O", "+O"}:
+            return False
+        short_match = re.fullmatch(r"([-+])([A-Za-z]+)", option)
+        if short_match is None or not set(short_match.group(2)) <= _BASH_SET_SHORT_OPTIONS:
+            return False
+        if "e" in short_match.group(2):
+            enabled = short_match.group(1) == "-"
         index += 1
     return enabled
+
+
+def _set_enables_noexec(words: list[str]) -> bool:
+    """Whether one ``set`` command leaves shell no-exec mode enabled."""
+    words, valid = _effective_shell_command_words(words)
+    if not valid or not words or words[0] != "set":
+        return False
+    enabled = False
+    index = 1
+    while index < len(words):
+        option = words[index]
+        if option == "--" or option in {"-", "+"} or not option.startswith(("-", "+")):
+            break
+        if option in {"-o", "+o"}:
+            if index + 1 >= len(words):
+                break
+            if words[index + 1] == "noexec":
+                enabled = option == "-o"
+            index += 2
+            continue
+        short_match = re.fullmatch(r"([-+])([A-Za-z]+)", option)
+        if short_match is not None and "n" in short_match.group(2):
+            enabled = short_match.group(1) == "-"
+        index += 1
+    return enabled
+
+
+def _has_unsafe_terminal_before(
+    commands: list[tuple[list[str], str | None]], stop: int
+) -> bool:
+    """Reject reachable green exits/replacements before claimed proof evidence."""
+    top_level = _top_level_shell_commands(commands)
+    for index, (segment, _) in enumerate(commands[:stop]):
+        if not top_level[index]:
+            continue
+        raw_words = _command_words(segment)
+        previous = commands[index - 1][1] if index else None
+        if raw_words and raw_words[0] == "{":
+            if (
+                previous == "||"
+                and index > 0
+                and _or_fallback_exits_nonzero(commands, index - 1)
+            ):
+                continue
+            return True
+        words, valid = _effective_shell_command_words(segment)
+        if not valid or not words or words[0] not in {"exit", "exec"}:
+            continue
+        if previous == "||" and words[0] == "exit" and _nonzero_exit(words):
+            continue
+        return True
+    return False
 
 
 def _errexit_enabled_before(
@@ -1156,6 +1275,8 @@ def _command_failure_is_unmasked(
 
 def _run_acquires_pinned_runtime(run: str) -> bool:
     commands = _shell_commands(run)
+    if any(_set_enables_noexec(segment) for segment, _ in commands):
+        return False
     top_level = _top_level_shell_commands(commands)
     if any(_opens_function_scope(_command_words(segment)) for segment, _ in commands):
         return False
@@ -1220,18 +1341,31 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
             )
             for argument in arguments
         ):
+            if _has_unsafe_terminal_before(commands, index):
+                return False
             return True
         for name, assignment_index in prepared.items():
             if assignment_index < index and any(
                 argument in {f"${name}", f"${{{name}}}"} for argument in arguments
             ):
+                if _has_unsafe_terminal_before(commands, index):
+                    return False
                 return runtime_version_pristine and runtime_project_is_runtime
     return False
 
 
 def _run_directly_executes_prebake(run: str) -> bool:
     commands = _shell_commands(run)
+    if any(_set_enables_noexec(segment) for segment, _ in commands):
+        return False
     top_level = _top_level_shell_commands(commands)
+    if any(_opens_function_scope(_command_words(segment)) for segment, _ in commands):
+        return False
+    namerefs: dict[str, str | None] = {}
+    for segment, _ in commands:
+        _, unknown_write = _stateful_shell_writes(segment, namerefs)
+        if unknown_write:
+            return False
     for index, (segment, _) in enumerate(commands):
         if not top_level[index] or not _command_failure_is_unmasked(commands, index):
             continue
@@ -1240,6 +1374,8 @@ def _run_directly_executes_prebake(run: str) -> bool:
             continue
         executable = Path(words[0]).name
         if executable == "prebake-mgmt-mcp.sh":
+            if _has_unsafe_terminal_before(commands, index):
+                return False
             return True
         if executable not in {"bash", "sh"}:
             continue
@@ -1259,6 +1395,8 @@ def _run_directly_executes_prebake(run: str) -> bool:
             script_index < len(words)
             and words[script_index].endswith("/scripts/prebake-mgmt-mcp.sh")
         ):
+            if _has_unsafe_terminal_before(commands, index):
+                return False
             return True
     return False
 
@@ -1275,6 +1413,8 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
     exact_checked = False
     range_checked = False
     commands = _shell_commands(" ; ".join(_continued_lines(helper)))
+    if any(_set_enables_noexec(segment) for segment, _ in commands):
+        return False
     top_level = _top_level_shell_commands(commands)
     function_names = {
         name
@@ -1330,6 +1470,8 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
             or not _command_failure_is_unmasked(commands, index)
         ):
             continue
+        if _has_unsafe_terminal_before(commands, index):
+            return False
         if words[1] == "${SPEC}":
             if bindings.get("SPEC") != "canonical-exact-spec":
                 return False
@@ -1354,7 +1496,19 @@ def _template_runtime_pin(repo_root: Path) -> str:
     dockerfile = repo_root / "Dockerfile"
     if not dockerfile.is_file():
         raise MCPPinLockstepError("missing Dockerfile for mcp-server-bake capability")
-    logical = _continued_lines(dockerfile.read_text(encoding="utf-8"))
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    escape_directives = re.findall(
+        r"^\s*#\s*escape\s*=\s*(\S+)\s*$", dockerfile_text, re.I | re.M
+    )
+    if any(value != "\\" for value in escape_directives):
+        raise MCPPinLockstepError(
+            "Dockerfile uses a non-default escape directive unsupported by lockstep proof"
+        )
+    logical = _continued_lines(dockerfile_text)
+    if any("<<" in line for line in logical):
+        raise MCPPinLockstepError(
+            "Dockerfile heredoc instructions are unsupported by lockstep proof"
+        )
     from_indexes = [
         index
         for index, line in enumerate(logical)
@@ -1373,27 +1527,50 @@ def _template_runtime_pin(repo_root: Path) -> str:
             "default shell-form RUN executor"
         )
 
-    if not any(
-        re.match(r"^ARG\s+RUNTIME_VERSION(?:=|\s|$)", line, re.I)
+    runtime_arg_indexes = [
+        index
+        for index, line in enumerate(final_stage)
+        if re.match(r"^ARG\s+RUNTIME_VERSION(?:=[^\s]*)?\s*$", line, re.I)
+    ]
+    if len(runtime_arg_indexes) != 1:
+        raise MCPPinLockstepError(
+            "final Dockerfile stage must declare exactly one ARG RUNTIME_VERSION"
+        )
+    if any(
+        re.match(r"^ENV(?:\s|$)", line, re.I)
+        and re.search(
+            r"(?:^|\s)RUNTIME_VERSION(?:=|\s|$)",
+            re.sub(r"^ENV\s+", "", line, flags=re.I),
+        )
         for line in final_stage
     ):
         raise MCPPinLockstepError(
-            "final Dockerfile stage is missing ARG RUNTIME_VERSION"
+            "final Dockerfile stage must not override ARG with ENV RUNTIME_VERSION"
         )
     try:
-        runtime_acquisition = any(
-            line.upper().startswith("RUN ") and _run_acquires_pinned_runtime(line[4:])
-            for line in final_stage
-        )
+        runtime_acquisition_indexes = [
+            index
+            for index, line in enumerate(final_stage)
+            if line.upper().startswith("RUN ")
+            and _run_acquires_pinned_runtime(line[4:])
+        ]
         prebake_delegation = any(
-            line.upper().startswith("RUN ") and _run_directly_executes_prebake(line[4:])
+            line.upper().startswith("RUN ")
+            and _run_directly_executes_prebake(line[4:])
             for line in final_stage
         )
     except ValueError as exc:
         raise MCPPinLockstepError(f"Dockerfile has malformed shell syntax: {exc}") from exc
-    if not runtime_acquisition:
+    if not runtime_acquisition_indexes:
         raise MCPPinLockstepError(
             "final Dockerfile stage does not bind RUNTIME_VERSION to runtime wheel "
+            "acquisition"
+        )
+    if not any(
+        index > runtime_arg_indexes[0] for index in runtime_acquisition_indexes
+    ):
+        raise MCPPinLockstepError(
+            "final Dockerfile stage ARG RUNTIME_VERSION must precede runtime wheel "
             "acquisition"
         )
     if not prebake_delegation:

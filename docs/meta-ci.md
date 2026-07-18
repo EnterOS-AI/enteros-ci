@@ -97,11 +97,15 @@ in the wheel, so this runner does not claim to inspect it; SDK/runtime contract 
 remains its own gate. This runner checks the executable constants and helper the image
 actually consumes.
 
-The template Dockerfile's **final delivered stage** must declare `ARG RUNTIME_VERSION`,
-bind it to an effective runtime-wheel download/install, and directly execute the helper.
+The template Dockerfile's **final delivered stage** must declare exactly one
+`ARG RUNTIME_VERSION` before the effective runtime-wheel download/install and directly
+execute the helper. A final-stage `ENV RUNTIME_VERSION` override or later ARG
+redefinition is rejected because it breaks the checked `.runtime-version` data flow.
 Proof found only in an earlier stage is rejected. The final stage must use Docker's
 default shell-form `RUN` executor; a custom `SHELL` is rejected because arbitrary shell
-executors cannot be proven from the command text alone. The runner tokenizes the relevant
+executors cannot be proven from the command text alone. Docker heredoc instructions and
+non-default `# escape=` directives are likewise rejected so their bodies/continuations
+cannot masquerade as final-stage Docker instructions. The runner tokenizes the relevant
 shell commands and their immediate control edges, then checks that data flow. An unrelated
 compatibility command elsewhere in the same `RUN` may use `|| true`, but the recognized
 acquisition/delegation itself must remain fail-closed: pipelines, background/conditional
@@ -120,7 +124,12 @@ arithmetic mutation, traps, and `eval`/`source` forms invalidate proof instead o
 guessed. Stateful builtins retain the same treatment when prefixed by the shell's
 `time` keyword; timing a mutation cannot hide it from the reaching-state gate. Errexit
 proof follows `set` option parsing only until `--` or the first positional argument, so
-a positional `-e` cannot masquerade as an enabled fail-closed shell. A direct
+a positional `-e` cannot masquerade as an enabled fail-closed shell. Only known Bash
+short/long `set` flags establish state; invalid flags and unsupported `-O` shopt forms
+cannot manufacture errexit evidence. A `set` command that enables no-exec mode rejects
+the whole shell proof because subsequent acquisition/delegation/check commands would be
+parsed but never run. Unconditional top-level green `exit`/`exec` controls and dynamic
+`eval`/`source` control before evidence are rejected for the same reason. A direct
 `|| { ...; exit <status>; }` branch counts only when the shell-normalized status is
 nonzero. `bash`/`sh` invocations accept only path-executing `-e`/`-u`/`-x` options;
 stdin, help/version, no-exec, command-string, comments, and `echo` forms are not helper
