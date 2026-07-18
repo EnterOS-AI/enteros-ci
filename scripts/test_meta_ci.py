@@ -474,6 +474,34 @@ def test_mcp_pin_lockstep_verifies_exact_immutable_runtime_and_mcp_artifacts(tmp
     assert "@molecule-ai/mcp-server@1.8.3" in detail
 
 
+def test_dockerfile_rejects_nonexecuting_shell_for_lockstep_proof(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        dockerfile.read_text().replace(
+            "FROM python:3.11-slim\n",
+            'FROM python:3.11-slim\nSHELL ["/bin/true"]\n',
+        )
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="SHELL"):
+        meta._template_runtime_pin(tmp_path)
+
+
+def test_dockerfile_rejects_lockstep_proof_absent_from_final_stage(tmp_path):
+    _mcp_lockstep_fixture(tmp_path)
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        dockerfile.read_text().replace(
+            "FROM python:3.11-slim\n", "FROM python:3.11-slim AS proof\n"
+        )
+        + "FROM scratch AS final\n"
+    )
+
+    with pytest.raises(meta.MCPPinLockstepError, match="final Dockerfile stage"):
+        meta._template_runtime_pin(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("filename", "contents", "message"),
     [
@@ -934,6 +962,36 @@ def test_runtime_acquisition_accepts_fallback_with_effective_nonzero_exit():
     assert meta._run_acquires_pinned_runtime(run)
 
 
+@pytest.mark.parametrize("positional_set", ["set -- -e", "set positional -e"])
+def test_runtime_acquisition_rejects_positional_set_decoy_errexit(positional_set):
+    run = (
+        f"set +e; {positional_set}; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"; true'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize("positional_set", ["set -- -e", "set positional -e"])
+def test_runtime_helper_rejects_positional_set_decoy_errexit(positional_set):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -e",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            "set +e",
+            positional_set,
+            '_prebake_self_check "${SPEC}"; true',
+            '_prebake_self_check "${PKG}@${RANGE}"; true',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
 @pytest.mark.parametrize(
     "invocation",
     [
@@ -1169,6 +1227,8 @@ def test_runtime_helper_accepts_exporting_existing_canonical_bindings():
     "mutation",
     [
         "printf -v VER %s 9.9.9",
+        "time printf -v VER %s 9.9.9",
+        "time -p read -r VER <<< 9.9.9",
         "read -r VER <<< 9.9.9",
         "read -ra VER <<< 9.9.9",
         "read -aVER",
@@ -1446,6 +1506,8 @@ def test_runtime_acquisition_rejects_augmented_protected_assignment(run):
     "mutation",
     [
         "printf -v RUNTIME_VERSION %s 9.9.9",
+        "time printf -v RUNTIME_VERSION %s 9.9.9",
+        "time -p read -r RUNTIME_VERSION <<< 9.9.9",
         "read -r RUNTIME_VERSION <<< 9.9.9",
         "read -ra RUNTIME_VERSION <<< 9.9.9",
         "read -aRUNTIME_VERSION",
@@ -1481,6 +1543,8 @@ def test_runtime_acquisition_rejects_implicit_or_indirect_runtime_version_write(
     "mutation",
     [
         "printf -v runtime_requirement %s requests==2.32.0",
+        "time printf -v runtime_requirement %s requests==2.32.0",
+        "time -p read -r runtime_requirement <<< requests==2.32.0",
         "read -r runtime_requirement <<< requests==2.32.0",
         "read -a runtime_requirement <<< requests==2.32.0",
         "read -aruntime_requirement",

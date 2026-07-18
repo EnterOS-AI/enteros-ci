@@ -654,6 +654,20 @@ def _command_words(segment: list[str]) -> list[str]:
     return segment[index:]
 
 
+def _timed_command_words(words: list[str]) -> tuple[list[str], bool]:
+    """Unwrap Bash/POSIX ``time``; flag an unsupported or empty invocation."""
+    if not words or words[0] != "time":
+        return words, True
+    index = 1
+    while index < len(words) and words[index] == "-p":
+        index += 1
+    if index < len(words) and words[index] == "--":
+        index += 1
+    if index >= len(words) or words[index].startswith("-"):
+        return [], False
+    return words[index:], True
+
+
 def _assignment_updates(
     segment: list[str],
 ) -> list[tuple[str, str, bool, bool, bool]]:
@@ -779,6 +793,15 @@ def _stateful_shell_writes(
 
     if not words:
         return writes, unknown
+    if words[0] == "time":
+        timed_words, valid = _timed_command_words(words)
+        if not valid:
+            return writes, True
+        timed_writes, timed_unknown = _stateful_shell_writes(
+            timed_words, namerefs
+        )
+        writes.update(timed_writes)
+        return writes, unknown or timed_unknown
     if words[0] in {"!", "elif", "if", "until", "while"}:
         condition = words[1:]
         if condition and condition[0] == "!":
@@ -973,9 +996,10 @@ def _top_level_shell_commands(
         while scope_index < len(words) and words[scope_index] == "!":
             scope_index += 1
         if scope_index < len(words) and words[scope_index] == "time":
-            scope_index += 1
-            while scope_index < len(words) and words[scope_index] in {"--", "-p"}:
-                scope_index += 1
+            timed_words, valid = _timed_command_words(words[scope_index:])
+            if not valid:
+                return [False] * len(commands)
+            scope_index = len(words) - len(timed_words)
         scope_first = words[scope_index] if scope_index < len(words) else ""
         if scope_first.startswith("(") and scope_first != "(":
             return [False] * len(commands)
@@ -1035,6 +1059,10 @@ def _set_errexit(words: list[str], enabled: bool) -> bool:
     index = 1
     while index < len(words):
         option = words[index]
+        # ``set -- ...`` and the first non-option start positional parameters;
+        # option-looking values after that point do not change shell flags.
+        if option == "--" or option in {"-", "+"} or not option.startswith(("-", "+")):
+            break
         if option in {"-o", "+o"} and index + 1 < len(words):
             if words[index + 1] == "errexit":
                 enabled = option == "-o"
@@ -1327,27 +1355,51 @@ def _template_runtime_pin(repo_root: Path) -> str:
     if not dockerfile.is_file():
         raise MCPPinLockstepError("missing Dockerfile for mcp-server-bake capability")
     logical = _continued_lines(dockerfile.read_text(encoding="utf-8"))
+    from_indexes = [
+        index
+        for index, line in enumerate(logical)
+        if re.match(r"^FROM(?:\s|$)", line, re.I)
+    ]
+    if not from_indexes:
+        raise MCPPinLockstepError("Dockerfile has no FROM instruction")
+    final_stage = logical[from_indexes[-1] + 1 :]
 
-    if not any(re.match(r"^ARG\s+RUNTIME_VERSION(?:=|\s|$)", line, re.I) for line in logical):
-        raise MCPPinLockstepError("Dockerfile is missing ARG RUNTIME_VERSION")
+    # Proof belongs to the delivered stage and assumes Docker's default shell-form
+    # execution. A custom SHELL can turn syntactically valid RUN text into a no-op;
+    # fail closed instead of attempting to emulate arbitrary executors.
+    if any(re.match(r"^SHELL(?:\s|$)", line, re.I) for line in final_stage):
+        raise MCPPinLockstepError(
+            "final Dockerfile stage declares SHELL; lockstep proof requires the "
+            "default shell-form RUN executor"
+        )
+
+    if not any(
+        re.match(r"^ARG\s+RUNTIME_VERSION(?:=|\s|$)", line, re.I)
+        for line in final_stage
+    ):
+        raise MCPPinLockstepError(
+            "final Dockerfile stage is missing ARG RUNTIME_VERSION"
+        )
     try:
         runtime_acquisition = any(
             line.upper().startswith("RUN ") and _run_acquires_pinned_runtime(line[4:])
-            for line in logical
+            for line in final_stage
         )
         prebake_delegation = any(
             line.upper().startswith("RUN ") and _run_directly_executes_prebake(line[4:])
-            for line in logical
+            for line in final_stage
         )
     except ValueError as exc:
         raise MCPPinLockstepError(f"Dockerfile has malformed shell syntax: {exc}") from exc
     if not runtime_acquisition:
         raise MCPPinLockstepError(
-            "Dockerfile does not bind RUNTIME_VERSION to runtime wheel acquisition"
+            "final Dockerfile stage does not bind RUNTIME_VERSION to runtime wheel "
+            "acquisition"
         )
     if not prebake_delegation:
         raise MCPPinLockstepError(
-            "Dockerfile has no executable RUN delegation to prebake-mgmt-mcp.sh"
+            "final Dockerfile stage has no executable RUN delegation to "
+            "prebake-mgmt-mcp.sh"
         )
     return pin
 
