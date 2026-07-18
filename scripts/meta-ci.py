@@ -1565,7 +1565,10 @@ def _verify_mcp_tarball(
         raise MCPPinLockstepError("exact MCP tarball sha512 integrity mismatch")
     if not re.fullmatch(r"[0-9a-f]{40}", shasum):
         raise MCPPinLockstepError("exact MCP artifact has malformed sha1 shasum")
-    if not hmac.compare_digest(hashlib.sha1(tarball).hexdigest(), shasum):
+    # npm's legacy shasum is an additional metadata consistency check; the
+    # security integrity boundary above is SHA-512.
+    legacy_sha1 = hashlib.sha1(tarball, usedforsecurity=False).hexdigest()
+    if not hmac.compare_digest(legacy_sha1, shasum):
         raise MCPPinLockstepError("exact MCP tarball sha1 shasum mismatch")
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(tarball), mode="rb") as compressed:
