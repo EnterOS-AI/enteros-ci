@@ -69,7 +69,7 @@ def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str], tuple[s
             repo,
             "diff",
             "--name-only",
-            "--diff-filter=AM",
+            "--diff-filter=ACMRT",
             "-z",
             base,
             head,

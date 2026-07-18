@@ -87,3 +87,26 @@ def test_deleted_secret_is_not_a_new_leak(tmp_path: Path) -> None:
     _git(repo, "add", "old.txt")
     _git(repo, "commit", "-qm", "remove")
     assert _scan(repo, base, _git(repo, "rev-parse", "HEAD")).returncode == 0
+
+
+def test_secret_added_while_renaming_file_is_scanned(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    original = repo / "safe.txt"
+    original.write_text("ordinary content\n" * 100)
+    _git(repo, "add", "safe.txt")
+    _git(repo, "commit", "-qm", "add safe file")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    secret = "ghp_" + "D" * 40
+    original.rename(repo / "renamed.txt")
+    with (repo / "renamed.txt").open("a") as handle:
+        handle.write(f"TOKEN={secret}\n")
+    _git(repo, "add", "--all")
+    _git(repo, "commit", "-qm", "rename and modify")
+    head = _git(repo, "rev-parse", "HEAD")
+    assert _git(repo, "diff", "--name-status", base, head).startswith("R")
+
+    result = _scan(repo, base, head)
+    assert result.returncode == 1
+    assert "renamed.txt (GitHub classic PAT)" in result.stdout
+    assert secret not in result.stdout
