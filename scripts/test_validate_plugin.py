@@ -173,3 +173,45 @@ def test_unsafe_runtime_id_fails(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 1
     assert "runtimes/0" in r.stdout
+
+
+@pytest.mark.parametrize("audience", ["self", "org"])
+def test_mcp_server_declared_audience_passes(tmp_path, audience):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            contributes={
+                "mcpServers": [
+                    {
+                        "name": "molecule-platform",
+                        "command": "molecule-mcp-server",
+                        "audience": audience,
+                    }
+                ]
+            }
+        ),
+    )
+    (tmp_path / "SKILL.md").write_text("# Test Plugin\n")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_mcp_server_unknown_audience_fails(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            contributes={
+                "mcpServers": [
+                    {
+                        "name": "molecule-platform",
+                        "command": "molecule-mcp-server",
+                        "audience": "tenant-admin",
+                    }
+                ]
+            }
+        ),
+    )
+    (tmp_path / "SKILL.md").write_text("# Test Plugin\n")
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "contributes/mcpServers/0/audience" in r.stdout

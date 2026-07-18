@@ -7,19 +7,16 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `68f89520e508d6581fa522ac62b0074bd888dd96` (SDK PR #109) |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119 merge) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
-`molecule-ai-sdk` main at re-vendor time: `0ff6e1bf09c2be6d08b56a53e88cffd7354ef9b0`
-(SDK PR #98) for the three marketplace-artifact schemas;
-`d60c7acf53dae697d1c061505e5ba9254ae474db` for `repo-meta.schema.json` (that main
-contains `0d275cc`, the reviewed head of SDK PR #85). The source commits above are
-reviewed PR heads contained by their re-vendor main: plugin-manifest re-vendored
-from SDK PR #109 (contributes.digestProviders — this copy had drifted stale before
-this re-vendor), workspace-template from SDK PR #92, org-template from SDK PR #98,
-repo-meta from SDK PR #85.
+`molecule-ai-sdk` main at re-vendor time:
+`bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119). The source commits
+above are the latest contract-changing commits for each path and are all
+contained by that main: plugin-manifest from PR #119, workspace-template from
+PR #92, org-template from PR #98, and repo-meta from PR #116.
 
 > **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
 > capture heterogeneous *published artifacts* and are `additionalProperties:true`.
@@ -36,10 +33,10 @@ IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 `scripts/validate-plugin.py`, `scripts/validate-workspace-template.py` and
 `scripts/validate-org-template.py` validate the REAL artifact manifests
 (`plugin.yaml` / `config.yaml` / `org.yaml`) against these schemas with
-`jsonschema`'s `Draft202012Validator`. The validators run inside each artifact
-repo's CI **offline** (anonymous `git clone` of `molecule-ci` only — no
-authenticated cross-repo fetch of `molecule-ai-sdk (contracts/)`), so the schemas are
-vendored here rather than pulled at validate time.
+`jsonschema`'s `Draft202012Validator`. Consumer CI anonymously fetches an
+immutable, verified `molecule-ci` commit; the validator itself performs no
+authenticated cross-repo fetch of `molecule-ai-sdk (contracts/)`. The schemas
+are therefore vendored here rather than pulled at validate time.
 
 These copies are the **SSOT mirror, not a fork**. They MUST stay byte-identical
 to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
@@ -57,11 +54,16 @@ to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
 When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
-# from a molecule-ci checkout, with molecule-ai-sdk main cloned alongside
-for s in plugin-manifest workspace-template org-template; do
+# Pin this to the exact molecule-ai-sdk main verified before the update.
+SDK_COMMIT=bdf41eb0517087acc47c74233755a37425fcd1b7
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+for s in plugin-manifest workspace-template org-template repo-meta; do
   curl -fsS -A "curl/8.4.0" \
-    "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/$s/$s.schema.json" \
-    -o "schemas/$s.schema.json"
+    "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/commit/$SDK_COMMIT/contracts/$s/$s.schema.json" \
+    -o "$tmp/$s.schema.json"
+  python3 -m json.tool "$tmp/$s.schema.json" >/dev/null
+  cp "$tmp/$s.schema.json" "schemas/$s.schema.json"
 done
 # then bump the source-commit SHAs in the table above
 bash scripts/check-schemas-in-sync.sh   # must pass
