@@ -77,7 +77,9 @@ Every template repo installs `templates/ci-workspace-template.yml` as
 `.gitea/workflows/ci.yml`. On the current Gitea deployment a cross-repository
 `workflow_call` can be recorded green without executing referenced steps, so
 the canonical inline template anonymously fetches an immutable, verified
-`molecule-ci` commit under the job-isolated `RUNNER_TEMP` and runs
+`molecule-ci` commit under the job-isolated `RUNNER_TEMP`, atomically allocates
+the dependency directory with plain `mkdir` (so any file, directory, or symlink
+collision fails closed), and runs
 `scripts/validate-workspace-template.py` from that checkout. This deliberately
 leaves any consumer-owned `.molecule-ci/` tree untouched. No validator script
 is vendored into the consumer repository; changing the pin is a reviewed

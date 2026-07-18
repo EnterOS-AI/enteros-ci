@@ -125,7 +125,7 @@ env:
   MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
 steps:
   - run: |
-      test ! -e .molecule-ci-ssot
+      mkdir .molecule-ci-ssot
       git init -q .molecule-ci-ssot
       git -C .molecule-ci-ssot remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
       git -C .molecule-ci-ssot fetch -q --depth 1 origin "$MOLECULE_CI_REF"

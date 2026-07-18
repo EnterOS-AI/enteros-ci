@@ -63,7 +63,7 @@ jobs:
       # resolution: fetch the SSOT, then reference it by guarded LOCAL path.
       - name: Fetch immutable molecule-ci SSOT into guarded local-action path
         run: |
-          test ! -e .molecule-ci-ssot
+          mkdir .molecule-ci-ssot
           git init -q .molecule-ci-ssot
           git -C .molecule-ci-ssot remote add origin \
             https://git.moleculesai.app/molecule-ai/molecule-ci.git

@@ -71,11 +71,11 @@ jobs:
             rc=1
           else
             CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
-            if [ -e "$CI_ROOT" ]; then
-              echo "::warning::isolated molecule-ci path already exists — ADVISORY (not blocking this PR)."
-              rc=1
-            elif [ "$rc" -eq 0 ]; then
-              if ! git init -q "$CI_ROOT" ||
+            if [ "$rc" -eq 0 ]; then
+              if ! mkdir "$CI_ROOT"; then
+                echo "::warning::could not atomically allocate isolated molecule-ci path — ADVISORY (not blocking this PR)."
+                rc=1
+              elif ! git init -q "$CI_ROOT" ||
                 ! git -C "$CI_ROOT" remote add origin \
                   https://git.moleculesai.app/molecule-ai/molecule-ci.git ||
                 ! git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF" ||

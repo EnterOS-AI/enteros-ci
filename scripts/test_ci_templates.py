@@ -94,6 +94,9 @@ def test_inline_ssot_templates_assert_execution_sentinels() -> None:
 def test_script_templates_fetch_outside_the_consumer_checkout(path: Path) -> None:
     commands = "\n".join(_all_run_steps(path))
     assert "$RUNNER_TEMP/molecule-ci-ssot" in commands
+    assert 'mkdir "$CI_ROOT"' in commands
+    assert 'mkdir -p "$CI_ROOT"' not in commands
+    assert 'rm -rf "$CI_ROOT"' not in commands
     assert "git init -q .molecule-ci" not in commands
     assert "git init -q .molecule-ci-canonical" not in commands
 
@@ -101,7 +104,9 @@ def test_script_templates_fetch_outside_the_consumer_checkout(path: Path) -> Non
 def test_local_action_template_uses_a_guarded_dedicated_checkout() -> None:
     content = CONFORMANCE_TEMPLATE.read_text()
     commands = "\n".join(_all_run_steps(CONFORMANCE_TEMPLATE))
-    assert "test ! -e .molecule-ci-ssot" in commands
+    assert "mkdir .molecule-ci-ssot" in commands
+    assert "mkdir -p .molecule-ci-ssot" not in commands
+    assert "rm -rf .molecule-ci-ssot" not in commands
     assert "git init -q .molecule-ci-ssot" in commands
     assert "uses: ./.molecule-ci-ssot/.gitea/actions/conformance-gate" in content
 
