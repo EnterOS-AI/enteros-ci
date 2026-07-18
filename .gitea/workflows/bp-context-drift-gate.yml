@@ -132,5 +132,5 @@ jobs:
           echo "DRIFT_BOT_TOKEN loaded from Infisical (len=${#DRIFT_BOT_TOKEN})"
           # Hand the token to the asserter as a DIRECT process env var. This is
           # the fix: it is never written to $GITHUB_ENV and never re-read via a
-          # `${{ env.* }}` expression, so `act` cannot substitute it with `***`.
+          # a runner template expression, so `act` cannot substitute it with `***`.
           GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 scripts/lint_bp_context_emit_match.py
