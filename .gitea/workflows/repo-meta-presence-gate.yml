@@ -1,0 +1,80 @@
+name: repo-meta-presence-gate
+
+# The repo-meta PRESENCE gate (CI-RFC Piece 3) — HARD, always-fire.
+#
+# Fails when a maintained known-layer repo lacks a valid repo-meta.yaml (the SSOT
+# manifest the meta-CI capability→bundle router reads). scripts/
+# check_repo_meta_presence.py holds the Phase-1 known-layer allowlist and is
+# fail-closed on auth/API errors. Plugins + retired templates are out of scope
+# for now — widen the allowlist as they adopt.
+#
+# HARD gate: no `paths:` filter (a required check must run on every PR, never go
+# absent) and no `continue-on-error` (a red blocks). The unit test runs with no
+# creds on every PR incl. forks; the LIVE org check needs DRIFT_BOT_TOKEN and is
+# gated to non-fork refs (fork PRs can't harvest INFISICAL_CI_*), mirroring
+# bp-context-drift-gate.yml.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  presence:
+    name: repo-meta presence (known-layer repos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Install PyYAML + pytest
+        run: pip install PyYAML==6.0.2 pytest -q
+
+      # Logic coverage — always runs, no creds, so fork PRs still exercise it.
+      - name: Unit-test the presence checker
+        run: python3 -m pytest scripts/test_check_repo_meta_presence.py -q
+
+      # LIVE org check. Token fetched AND the checker run IN THIS SAME step, with
+      # the token handed to python as a DIRECT process env var — never written to
+      # $GITHUB_ENV / re-read through a `${{ }}` expression (act masks it to `***`
+      # otherwise; root cause a542ba98). Gated to non-fork refs so an untrusted
+      # fork PR cannot harvest INFISICAL_CI_*.
+      - name: Live repo-meta presence check (token fetched in-step)
+        id: presence_check
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+          GITEA_HOST: git.moleculesai.app
+          ORG: molecule-ai
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          if [ -z "$TOK" ]; then
+            echo "::error::Infisical universal-auth login returned no accessToken — failing closed"
+            exit 1
+          fi
+          DRIFT_BOT_TOKEN=$(curl -fsS "$BASE/api/v3/secrets/raw/DRIFT_BOT_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fdrift-bot" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          echo "::add-mask::$DRIFT_BOT_TOKEN"
+          if [ -z "$DRIFT_BOT_TOKEN" ]; then
+            echo "::error::Infisical returned empty DRIFT_BOT_TOKEN at /shared/drift-bot (prod) — failing closed"
+            exit 1
+          fi
+          GITEA_TOKEN="$DRIFT_BOT_TOKEN" python3 scripts/check_repo_meta_presence.py
