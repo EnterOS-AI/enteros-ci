@@ -14,7 +14,7 @@
 # LOCAL path. Same single-source-of-truth (the action lives in molecule-ci),
 # with no mutable dependency or unverified remote `uses:` behavior.
 # When the Gitea deployment supports cross-repo local actions, this
-# inline-clone step can be dropped in favour of a direct
+# guarded local-fetch step can be dropped in favour of a direct
 # `uses: molecule-ai/molecule-ci/.gitea/actions/conformance-gate@v1` WITHOUT
 # changing the emitted `conformance-gate / conformance` context name.
 #
@@ -60,20 +60,21 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
 
       # Keep the gate independent of unverified cross-repo local-action
-      # resolution: clone the SSOT, then reference it by LOCAL path.
-      - name: Fetch immutable molecule-ci SSOT
+      # resolution: fetch the SSOT, then reference it by guarded LOCAL path.
+      - name: Fetch immutable molecule-ci SSOT into guarded local-action path
         run: |
-          git init -q .molecule-ci
-          git -C .molecule-ci remote add origin \
+          mkdir .molecule-ci-ssot
+          git init -q .molecule-ci-ssot
+          git -C .molecule-ci-ssot remote add origin \
             https://git.moleculesai.app/molecule-ai/molecule-ci.git
-          git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
-          git -C .molecule-ci checkout -q --detach FETCH_HEAD
-          test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
+          git -C .molecule-ci-ssot fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          git -C .molecule-ci-ssot checkout -q --detach FETCH_HEAD
+          test "$(git -C .molecule-ci-ssot rev-parse HEAD)" = "$MOLECULE_CI_REF"
 
       # ── EXAMPLE A: package-introspection (consumer side — e.g. molecule-core)
       # Asserts the PUBLISHED build's management manifest ⊇ the contract verbs.
       - name: Conformance gate (published manifest ⊇ contract)
-        uses: ./.molecule-ci/.gitea/actions/conformance-gate
+        uses: ./.molecule-ci-ssot/.gitea/actions/conformance-gate
         with:
           mode: package-introspection
           package: "@molecule-ai/mcp-server"
@@ -92,7 +93,7 @@ jobs:
       # Uncomment in the producer repo (and drop Example A there):
       #
       # - name: Conformance gate (publish provenance)
-      #   uses: ./.molecule-ci/.gitea/actions/conformance-gate
+      #   uses: ./.molecule-ci-ssot/.gitea/actions/conformance-gate
       #   with:
       #     mode: registry-provenance
       #     package: "@molecule-ai/mcp-server"

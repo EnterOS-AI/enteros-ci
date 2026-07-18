@@ -89,7 +89,8 @@ asserts it **satisfies** a consumer contract's required capabilities, evaluated
 Lives at `.gitea/actions/conformance-gate/` and is a **composite action** (not a
 `workflow_call` reusable workflow). Cross-repo action resolution is not part of
 the validated Gitea CI contract, so adopters must not assume it works: they
-inline-clone this SSOT and reference the action by local path. See
+fetch this SSOT at an immutable SHA into a guarded local path and reference the
+action there. See
 `templates/ci-conformance-gate.yml`.
 
 **Two modes** (`mode:` input):
@@ -124,12 +125,13 @@ env:
   MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
 steps:
   - run: |
-      git init -q .molecule-ci
-      git -C .molecule-ci remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
-      git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
-      git -C .molecule-ci checkout -q --detach FETCH_HEAD
-      test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
-  - uses: ./.molecule-ci/.gitea/actions/conformance-gate
+      mkdir .molecule-ci-ssot
+      git init -q .molecule-ci-ssot
+      git -C .molecule-ci-ssot remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+      git -C .molecule-ci-ssot fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+      git -C .molecule-ci-ssot checkout -q --detach FETCH_HEAD
+      test "$(git -C .molecule-ci-ssot rev-parse HEAD)" = "$MOLECULE_CI_REF"
+  - uses: ./.molecule-ci-ssot/.gitea/actions/conformance-gate
     with:
       mode: package-introspection
       package: "@molecule-ai/mcp-server"
