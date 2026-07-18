@@ -14,14 +14,30 @@ consumer repository:
 | `molecule-ai-plugin-*` | [`templates/ci-plugin.yml`](templates/ci-plugin.yml) |
 | `molecule-ai-workspace-template-*` | [`templates/ci-workspace-template.yml`](templates/ci-workspace-template.yml) |
 | `molecule-ai-org-template-*` | [`templates/ci-org-template.yml`](templates/ci-org-template.yml) |
+| satellite/channel/misc repositories | [`templates/ci-minimal.yml`](templates/ci-minimal.yml) |
+| repositories needing the canonical diff secret gate | [`templates/ci-secret-scan.yml`](templates/ci-secret-scan.yml) |
 
-The inline templates clone `molecule-ci` from `git.moleculesai.app` and execute the canonical validators from `scripts/`, so validator logic remains centralized without a cross-repository action fetch.
+The inline templates fetch an immutable, verified `molecule-ci` commit from
+`git.moleculesai.app` and execute the canonical validators from `scripts/`.
+Validator logic remains centralized without a cross-repository action fetch,
+while every consumer update stays an explicit reviewed pin change.
 
-### Any repo with auto-merge enabled
+### Merge and promotion automation
 
-The reusable `disable-auto-merge-on-push.yml` definition is retained for a
-future proven capability. Do not install a thin cross-repository caller before
-then; on the current deployment it can report success without running its guard.
+This repository does not publish a reusable auto-promote or
+disable-auto-merge workflow. The former definitions combined unsupported
+cross-repository `workflow_call` behavior with GitHub CLI commands, so Gitea
+could index or report them without providing the claimed protection. Git
+history preserves those designs; they are not active templates.
+
+Any future guard must be implemented as a repository-local, base-trusted Gitea
+workflow, use the `git.moleculesai.app` API with a least-privilege identity, and
+prove its emitted context before branch protection requires it. Until then,
+operators must treat every new PR head as a new review and CI boundary.
+
+Every inline consumer template pins an immutable molecule-ci commit and
+verifies the fetched SHA before execution. The minimal and secret-scan gates
+also assert script sentinels. Updating any pin is a reviewed dependency change.
 
 ## What each workflow validates
 
@@ -58,21 +74,6 @@ then; on the current deployment it can report success without running its guard.
 | SDK org schema | Error | Malformed workspace tree, defaults, plugins, or RuntimeIds |
 | Direct-workspace count | Notice | Resolved inline workspace inventory |
 | No committed secrets | Error | Leaked API keys |
-
-### disable-auto-merge-on-push
-
-PR-time safety guard. When `pull_request:synchronize` fires (= a new commit pushed to an open PR) and auto-merge is already enabled, this workflow disables auto-merge and posts a comment requiring the operator to re-engage explicitly.
-
-**Why it exists:** on 2026-04-27, molecule-core PR #2174 auto-merged with only its first commit because the second commit was pushed AFTER the merge queue had locked the PR's SHA. The second commit ended up orphaned on a merged-and-deleted branch.
-
-**Pairs with the org-wide repo setting** "Automatically delete head branches" (already enabled on all 10 Molecule-AI repos). Defense in depth:
-
-1. Repo setting blocks pushes to a merged-and-deleted branch (catches the post-merge orphan case).
-2. This workflow catches the in-queue race (push during queue processing) by force-disabling auto-merge.
-
-Together they cover the full lifecycle of "auto-merge enabled → new commits arrive" without operator discipline.
-
-**False-positive note:** if a CI bot pushes (dependency update, secret rotation), this also disables auto-merge. That's intentional — the operator who originally enabled auto-merge gets notified and re-engages, which is exactly the verify-after-machine-edits behavior we want.
 
 ## Composite actions
 
@@ -116,18 +117,26 @@ version/dist-tag — evaluation is version-specific), `contract-path` *or*
 `required-caps` (+`transitional-aliases`), `server-mode`, `expected-server-name`,
 `registry-token` (OPTIONAL read:package bearer), `require-token`, `is-trusted`.
 
-**Adoption** (clone-then-`uses:`-local; full example in `templates/ci-conformance-gate.yml`):
+**Adoption** (immutable-fetch-then-`uses:`-local; full example in `templates/ci-conformance-gate.yml`):
 
 ```yaml
-- run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
-- uses: ./.molecule-ci/.gitea/actions/conformance-gate
-  with:
-    mode: package-introspection
-    package: "@molecule-ai/mcp-server"
-    contract-path: contracts/mcp-plugin-delivery.contract.json
-    server-mode: management
-    require-token: "true"
-    registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
+env:
+  MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
+steps:
+  - run: |
+      git init -q .molecule-ci
+      git -C .molecule-ci remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+      git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+      git -C .molecule-ci checkout -q --detach FETCH_HEAD
+      test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
+  - uses: ./.molecule-ci/.gitea/actions/conformance-gate
+    with:
+      mode: package-introspection
+      package: "@molecule-ai/mcp-server"
+      contract-path: contracts/mcp-plugin-delivery.contract.json
+      server-mode: management
+      require-token: "true"
+      registry-token: ${{ secrets.MCP_SERVER_READPKG_TOKEN }}
 ```
 
 **Rollout** (soak-then-promote): ship the adopter caller as a STANDALONE

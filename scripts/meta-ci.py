@@ -38,10 +38,9 @@ fan-out and NOT via cross-repo ``workflow_call``. Two deployment facts force thi
     ``["*"]`` branch-protection posture) needs exactly ONE aggregate context; and
   * cross-repo ``workflow_call`` is NOT a trustworthy gate on this Gitea (internal#1000:
     a consumer can be recorded green with ``steps=[]``).
-So the reusable/inline workflow runs THIS one script in a single job and posts a single
-``meta-ci / required`` status — the same single-context pattern proven by
-``_reusable-minimal-validate.yml``. A ``--sentinel`` line is printed so a hollow no-op
-invocation (internal#1000) cannot be counted green.
+So the repository-local workflow runs THIS one script in a single job and emits one
+job context. A sentinel line is printed and asserted so a hollow/no-op invocation
+(internal#1000) cannot be counted green.
 
 Exit codes
 ----------

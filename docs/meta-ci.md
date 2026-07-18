@@ -92,18 +92,19 @@ AND every executed runner green. This is deliberately capture-first / enforce-la
 ## Adoption (advisory)
 
 Copy `templates/ci-meta.yml` into a repo as `.gitea/workflows/meta-ci-advisory.yml` and
-commit a `repo-meta.yaml`. It anon-clones this SSOT and runs the canonical router with
-`continue-on-error: true` and **no commit-status POST**, so it can never block a merge
-(its result lives in the job log). Do **not** add it to branch-protection required
-contexts.
+commit a `repo-meta.yaml`. It anonymously fetches an immutable, verified commit
+of this SSOT and runs the canonical router with `continue-on-error: true` and
+**no explicit commit-status POST**, so it can never block a merge (its real
+router result lives in the job log while the advisory job exits green). Do
+**not** add it to branch-protection required contexts.
 
 ### Why inline, not cross-repo `uses:`
 
 Cross-repo `workflow_call` is not a trustworthy gate on Gitea Actions 1.26.4 — a
-consumer job can be recorded green with `steps=[]` (internal#1000). The reusable
-`.gitea/workflows/meta-ci.yml` is retained for molecule-ci's own same-repo self-test
-(`meta-ci-selftest.yml`) and for the future once cross-repo execution is proven; the
-router prints a `meta-ci:sentinel:executed` line so a hollow no-op run is detectable.
+consumer job can be recorded green with `steps=[]` (internal#1000). The remote
+definition was removed. `meta-ci-selftest.yml` and consumer templates execute the
+router in ordinary repository-local jobs; the router prints a
+`meta-ci:sentinel:executed` line so a hollow/no-op run is detectable.
 
 ## R1: `["*"]` absent-context semantics (verified 2026-07-17, Gitea 1.26.4)
 

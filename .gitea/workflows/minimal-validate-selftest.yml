@@ -1,35 +1,41 @@
-# Self-test for the reusable _reusable-minimal-validate workflow.
-#
-# Calls the reusable against molecule-ci itself (which carries valid workflow
-# YAMLs + JSON schemas + a README) so a green run proves BOTH that the reusable
-# still loads/parses and that its baseline check passes on a healthy repo. It
-# also posts the stable "minimal-validate" commit-status context, letting us
-# confirm the context name/state end-to-end.
-#
-# Additive + path-filtered: only spends a runner when the reusable or this
-# self-test changes. Does not modify the repo's existing ci.yml.
-
 name: minimal-validate-selftest
+
+# Direct, read-only proof that the canonical baseline validator actually ran.
+# No workflow_call is used because Gitea 1.26.4 can report cross-repository
+# consumers green with zero steps.
 
 on:
   pull_request:
     paths:
-      - ".gitea/workflows/_reusable-minimal-validate.yml"
+      - "scripts/minimal_validate.py"
+      - "scripts/test_minimal_validate.py"
       - ".gitea/workflows/minimal-validate-selftest.yml"
   push:
     branches: [main]
     paths:
-      - ".gitea/workflows/_reusable-minimal-validate.yml"
+      - "scripts/minimal_validate.py"
+      - "scripts/test_minimal_validate.py"
       - ".gitea/workflows/minimal-validate-selftest.yml"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
-  statuses: write
+  contents: read
 
 jobs:
-  selftest:
-    uses: ./.gitea/workflows/_reusable-minimal-validate.yml
-    permissions:
-      contents: write
-      statuses: write
+  minimal-validate:
+    name: minimal-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - run: pip install --break-system-packages pyyaml -q
+      - name: Execute canonical validator
+        run: |
+          set -o pipefail
+          python3 scripts/minimal_validate.py "$GITHUB_WORKSPACE" \
+            | tee /tmp/minimal-validate.log
+      - name: Assert execution sentinel
+        run: grep -qxF 'minimal-validate:sentinel:executed' /tmp/minimal-validate.log

@@ -9,10 +9,10 @@
 #
 # WHY INLINE-CLONE (not `uses: molecule-ai/molecule-ci/.gitea/actions/...@v1`):
 # Cross-repo local-action resolution is not a validated capability of the
-# current Gitea CI contract. We therefore anon-clone the PUBLIC molecule-ci
-# SSOT at CI time and reference the composite action by LOCAL path. Same
-# single-source-of-truth (the action lives in molecule-ci, fetched fresh every
-# run), with no dependency on unverified remote `uses:` behavior.
+# current Gitea CI contract. We therefore anonymously fetch the PUBLIC molecule-ci
+# SSOT at an immutable reviewed commit and reference the composite action by
+# LOCAL path. Same single-source-of-truth (the action lives in molecule-ci),
+# with no mutable dependency or unverified remote `uses:` behavior.
 # When the Gitea deployment supports cross-repo local actions, this
 # inline-clone step can be dropped in favour of a direct
 # `uses: molecule-ai/molecule-ci/.gitea/actions/conformance-gate@v1` WITHOUT
@@ -54,13 +54,21 @@ jobs:
     name: conformance
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    env:
+      MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
 
       # Keep the gate independent of unverified cross-repo local-action
       # resolution: clone the SSOT, then reference it by LOCAL path.
-      - name: Fetch molecule-ci SSOT
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci
+      - name: Fetch immutable molecule-ci SSOT
+        run: |
+          git init -q .molecule-ci
+          git -C .molecule-ci remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          git -C .molecule-ci fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          git -C .molecule-ci checkout -q --detach FETCH_HEAD
+          test "$(git -C .molecule-ci rev-parse HEAD)" = "$MOLECULE_CI_REF"
 
       # ── EXAMPLE A: package-introspection (consumer side — e.g. molecule-core)
       # Asserts the PUBLISHED build's management manifest ⊇ the contract verbs.
