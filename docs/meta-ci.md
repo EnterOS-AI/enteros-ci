@@ -102,11 +102,22 @@ download/install and directly execute the helper. The runner tokenizes the relev
 commands and their immediate control edges, then checks that data flow. An unrelated
 compatibility command elsewhere in the same `RUN` may use `|| true`, but the recognized
 acquisition/delegation itself must remain fail-closed: pipelines, background/conditional
-execution, and `|| true` masks do not count. A direct `|| { ...; exit <nonzero>; }`
-failure branch does count. `bash -n`, `bash --noexec`, `sh -n`, comments, and `echo`
-markers are not helper execution. The packaged helper must likewise make real assignments
-from the constants and leave both exact/range offline self-checks unmasked; its explicit
-non-zero failure branches are accepted.
+execution, and `|| true` masks do not count. Evidence must be a top-level command, not a
+token inside an `if`, `case`, loop, command group, or never-called function. Prepared
+requirements remain valid only while their reaching assignment, `RUNTIME_VERSION`, and
+runtime-project identity remain unshadowed and not unset. A direct
+`|| { ...; exit <status>; }` branch counts only when the shell-normalized status is
+nonzero. `bash`/`sh` invocations accept only path-executing `-e`/`-u`/`-x` options;
+stdin, help/version, no-exec, command-string, comments, and `echo` forms are not helper
+execution. The packaged helper must likewise make real top-level assignments from the
+constants and leave both exact/range offline self-checks top-level and unmasked; its
+explicit non-zero failure branches are accepted.
+
+Each required Python MCP constant must have exactly one top-level literal string binding
+in the published runtime module. Duplicate, dynamic, augmented, nested, annotated,
+named-expression, deleted, import, definition/argument, exception-target, wildcard-import,
+or pattern-capture bindings fail closed rather than preserving a stale earlier literal
+that differs from the module's executable value.
 
 The same-repository self-test also reads the four official immutable consumer refs from
 `scripts/fixtures/meta-ci/official-consumers.json`, fetches each anonymously, exports a

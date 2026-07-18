@@ -345,20 +345,22 @@ def _runtime_wheel(
     pinned="1.8.3",
     compatible="^1.8.0",
     helper=None,
+    source_extra=None,
 ):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as wheel:
+        source_lines = [
+            'MANAGEMENT_MCP_NPM_PACKAGE = "@molecule-ai/mcp-server"',
+            f'MANAGEMENT_MCP_PINNED_VERSION = "{pinned}"',
+            f'MANAGEMENT_MCP_COMPATIBLE_RANGE = "{compatible}"',
+            'MANAGEMENT_MCP_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"',
+            'MANAGEMENT_MCP_REGISTRY_SCOPE = "@molecule-ai"',
+        ]
+        if source_extra:
+            source_lines.append(source_extra)
         wheel.writestr(
             "molecule_runtime/platform_agent_identity.py",
-            "\n".join(
-                [
-                    'MANAGEMENT_MCP_NPM_PACKAGE = "@molecule-ai/mcp-server"',
-                    f'MANAGEMENT_MCP_PINNED_VERSION = "{pinned}"',
-                    f'MANAGEMENT_MCP_COMPATIBLE_RANGE = "{compatible}"',
-                    'MANAGEMENT_MCP_REGISTRY = "https://git.moleculesai.app/api/packages/molecule-ai/npm/"',
-                    'MANAGEMENT_MCP_REGISTRY_SCOPE = "@molecule-ai"',
-                ]
-            ),
+            "\n".join(source_lines),
         )
         wheel.writestr(
             "molecule_runtime/scripts/prebake-mgmt-mcp.sh",
@@ -909,6 +911,29 @@ def test_runtime_acquisition_accepts_explicit_fail_closed_fallback():
     assert meta._run_acquires_pinned_runtime(run)
 
 
+@pytest.mark.parametrize("status", [256, 512])
+@pytest.mark.parametrize("braced", [False, True])
+def test_runtime_acquisition_rejects_fallback_exit_status_that_normalizes_to_zero(
+    status, braced
+):
+    fallback = f"{{ exit {status}; }}" if braced else f"exit {status}"
+    run = (
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}" '
+        f"|| {fallback}"
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_accepts_fallback_with_effective_nonzero_exit():
+    run = (
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}" '
+        "|| { exit 257; }"
+    )
+
+    assert meta._run_acquires_pinned_runtime(run)
+
+
 @pytest.mark.parametrize(
     "invocation",
     [
@@ -921,6 +946,25 @@ def test_prebake_delegation_rejects_shell_noexec_modes(invocation):
     assert not meta._run_directly_executes_prebake(invocation)
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "bash -s /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+        "sh -s /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+        "bash --help /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+        "bash --version /opt/molecule/scripts/prebake-mgmt-mcp.sh",
+    ],
+)
+def test_prebake_delegation_rejects_nonexecuting_shell_modes(invocation):
+    assert not meta._run_directly_executes_prebake(invocation)
+
+
+def test_prebake_delegation_accepts_execution_shell_options():
+    run = "bash -eux /opt/molecule/scripts/prebake-mgmt-mcp.sh"
+
+    assert meta._run_directly_executes_prebake(run)
+
+
 def test_prebake_delegation_ignores_unrelated_optional_command():
     run = "compatibility_probe || true; bash /opt/molecule/scripts/prebake-mgmt-mcp.sh"
 
@@ -930,6 +974,33 @@ def test_prebake_delegation_ignores_unrelated_optional_command():
 @pytest.mark.parametrize("mask", [" || true", " | true"])
 def test_prebake_delegation_rejects_masked_execution(mask):
     run = f"bash /opt/molecule/scripts/prebake-mgmt-mcp.sh{mask}"
+
+    assert not meta._run_directly_executes_prebake(run)
+
+
+def test_runtime_acquisition_rejects_command_inside_dead_if_branch():
+    run = (
+        "set -e; if false; then :; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"; fi'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_rejects_command_inside_never_called_function():
+    run = (
+        "set -e; acquire_runtime() { :; "
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"; }; true'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_prebake_delegation_rejects_command_inside_never_called_function():
+    run = (
+        "set -e; bake_runtime() { :; "
+        "bash /opt/molecule/scripts/prebake-mgmt-mcp.sh; }; true"
+    )
 
     assert not meta._run_directly_executes_prebake(run)
 
@@ -969,6 +1040,115 @@ def test_runtime_helper_accepts_fail_closed_self_check_fallbacks():
     assert meta._helper_consumes_mcp_contract(helper)
 
 
+def test_runtime_helper_rejects_self_checks_inside_never_called_function():
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            'SPEC="${PKG}@${VER}"',
+            "verify_only() {",
+            '  _prebake_self_check "${SPEC}"',
+            '  _prebake_self_check "${PKG}@${RANGE}"',
+            "}",
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+@pytest.mark.parametrize("mutation", ["overwrite", "unset"])
+def test_runtime_acquisition_rejects_invalidated_prepared_requirement(mutation):
+    change = (
+        'runtime_requirement="requests==2.32.0";'
+        if mutation == "overwrite"
+        else "unset runtime_requirement;"
+    )
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        f"{change} "
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize("builtin", ["export", "readonly", "declare", "typeset"])
+def test_runtime_acquisition_rejects_assignment_builtin_overwrite(builtin):
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        f'{builtin} runtime_requirement="requests==2.32.0"; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        'set -e; RUNTIME_VERSION="9.9.9"; '
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"',
+        'RUNTIME_VERSION="9.9.9" '
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"',
+        'export RUNTIME_VERSION="9.9.9"; '
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"',
+    ],
+)
+def test_runtime_acquisition_rejects_shadowed_runtime_version(run):
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_rejects_overwritten_runtime_project_identity():
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'runtime_project="requests"; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_rejects_shadowed_runtime_project_despite_decoy_identity():
+    run = (
+        'set -e; decoy="molecules-workspace-runtime"; '
+        'runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'runtime_project="requests"; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "transient_assignment",
+    [
+        'runtime_project="molecules-workspace-runtime" true; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")";',
+        'runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")" true;',
+    ],
+)
+def test_runtime_acquisition_rejects_nonreaching_environment_assignment(
+    transient_assignment,
+):
+    run = f'set -e; {transient_assignment} pip download "$runtime_requirement"'
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
 def test_runtime_wheel_rejects_helper_markers_in_comments_and_echoes():
     helper = "\n".join(
         [
@@ -981,6 +1161,35 @@ def test_runtime_wheel_rejects_helper_markers_in_comments_and_echoes():
 
     with pytest.raises(meta.MCPPinLockstepError, match="does not consume"):
         meta._runtime_contract(_runtime_wheel(helper=helper), "0.4.25")
+
+
+@pytest.mark.parametrize(
+    "source_extra",
+    [
+        'MANAGEMENT_MCP_PINNED_VERSION = "".join(["9", ".9.9"])',
+        'MANAGEMENT_MCP_PINNED_VERSION = "1.8.3"',
+        'MANAGEMENT_MCP_PINNED_VERSION += ".0"',
+        'if True:\n    MANAGEMENT_MCP_PINNED_VERSION = "9.9.9"',
+        "del MANAGEMENT_MCP_PINNED_VERSION",
+        'MANAGEMENT_MCP_PINNED_VERSION: str = "9.9.9"',
+        '(MANAGEMENT_MCP_PINNED_VERSION := "9.9.9")',
+        "import json as MANAGEMENT_MCP_PINNED_VERSION",
+        "def MANAGEMENT_MCP_PINNED_VERSION():\n    return '9.9.9'",
+        "class MANAGEMENT_MCP_PINNED_VERSION:\n    pass",
+        "async def MANAGEMENT_MCP_PINNED_VERSION():\n    pass",
+        "def shadow(MANAGEMENT_MCP_PINNED_VERSION):\n    pass",
+        "lambda MANAGEMENT_MCP_PINNED_VERSION: None",
+        "from json import loads as MANAGEMENT_MCP_PINNED_VERSION",
+        "from json import *",
+        "try:\n    raise RuntimeError\nexcept RuntimeError as MANAGEMENT_MCP_PINNED_VERSION:\n    pass",
+        "match '9.9.9':\n    case MANAGEMENT_MCP_PINNED_VERSION:\n        pass",
+        "match []:\n    case [*MANAGEMENT_MCP_PINNED_VERSION]:\n        pass",
+        "match {}:\n    case {**MANAGEMENT_MCP_PINNED_VERSION}:\n        pass",
+    ],
+)
+def test_runtime_wheel_rejects_any_additional_write_to_contract_constant(source_extra):
+    with pytest.raises(meta.MCPPinLockstepError, match="literal assignment"):
+        meta._runtime_contract(_runtime_wheel(source_extra=source_extra), "0.4.25")
 
 
 def test_mcp_pin_lockstep_fails_closed_when_pin_is_outside_compatible_range(tmp_path):

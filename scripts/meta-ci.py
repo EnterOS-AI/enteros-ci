@@ -640,6 +640,64 @@ def _command_words(segment: list[str]) -> list[str]:
     return segment[index:]
 
 
+def _assignment_updates(segment: list[str]) -> list[tuple[str, str, bool]]:
+    """Return assignments and whether they persist beyond this shell command."""
+    leading: list[tuple[str, str]] = []
+    index = 0
+    while index < len(segment):
+        assignment = _assignment(segment[index])
+        if assignment is None:
+            break
+        leading.append(assignment)
+        index += 1
+    words = segment[index:]
+    updates = [(name, value, not words) for name, value in leading]
+    if words and words[0] in {"declare", "export", "readonly", "typeset"}:
+        updates.extend(
+            (*assignment, True)
+            for word in words[1:]
+            if (assignment := _assignment(word)) is not None
+        )
+    return updates
+
+
+def _opens_function_scope(words: list[str]) -> bool:
+    return bool(
+        "{" in words
+        and (
+            (words and words[0] == "function")
+            or (words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)", words[0]))
+        )
+    )
+
+
+def _top_level_shell_commands(
+    commands: list[tuple[list[str], str | None]],
+) -> list[bool]:
+    """Mark commands outside branches, loops, functions, and command groups.
+
+    Only the constructs present in the official Dockerfiles/helper are modeled. An
+    unbalanced construct makes every command unproven and therefore unusable as gate
+    evidence.
+    """
+    depth = 0
+    top_level: list[bool] = []
+    for segment, _ in commands:
+        words = _command_words(segment)
+        first = words[0] if words else ""
+        if first in {"fi", "esac", "done", "}", ")"}:
+            depth -= 1
+            if depth < 0:
+                return [False] * len(commands)
+        top_level.append(depth == 0)
+        if (
+            first in {"if", "case", "for", "while", "until", "select", "{", "("}
+            or _opens_function_scope(words)
+        ):
+            depth += 1
+    return top_level if depth == 0 else [False] * len(commands)
+
+
 def _runtime_prepare_assignment(value: str) -> bool:
     if not value.startswith("$(") or not value.endswith(")"):
         return False
@@ -699,7 +757,10 @@ def _errexit_enabled_before(
     commands: list[tuple[list[str], str | None]], stop: int
 ) -> bool:
     enabled = False
+    top_level = _top_level_shell_commands(commands)
     for index, (words, operator) in enumerate(commands[:stop]):
+        if not top_level[index]:
+            continue
         previous = commands[index - 1][1] if index else None
         if previous not in {None, ";"} or operator in {"|", "|&", "&"}:
             continue
@@ -713,7 +774,7 @@ def _nonzero_exit(words: list[str]) -> bool:
         len(words) == 2
         and words[0] == "exit"
         and re.fullmatch(r"[0-9]+", words[1])
-        and int(words[1]) != 0
+        and int(words[1]) % 256 != 0
     )
 
 
@@ -772,23 +833,47 @@ def _command_failure_is_unmasked(
 
 def _run_acquires_pinned_runtime(run: str) -> bool:
     commands = _shell_commands(run)
+    top_level = _top_level_shell_commands(commands)
+    if any(_opens_function_scope(_command_words(segment)) for segment, _ in commands):
+        return False
     prepared: dict[str, int] = {}
-    has_runtime_identity = False
+    runtime_project_is_runtime = False
+    runtime_version_pristine = True
     for index, (segment, _) in enumerate(commands):
-        if len(segment) == 1:
-            assignment = _assignment(segment[0])
-            if assignment:
-                name, value = assignment
-                has_runtime_identity = has_runtime_identity or (
-                    value.replace("_", "-") == "molecules-workspace-runtime"
+        for name, value, persists in _assignment_updates(segment):
+            if name == "RUNTIME_VERSION":
+                runtime_version_pristine = False
+            prepared.pop(name, None)
+            if name == "runtime_project":
+                runtime_project_is_runtime = bool(
+                    persists
+                    and top_level[index]
+                    and value.replace("_", "-") == "molecules-workspace-runtime"
                 )
-                if _runtime_prepare_assignment(value):
-                    prepared[name] = index
+            if (
+                persists
+                and top_level[index]
+                and runtime_version_pristine
+                and _runtime_prepare_assignment(value)
+            ):
+                prepared[name] = index
 
-        arguments = _pip_acquisition_arguments(_command_words(segment))
+        words = _command_words(segment)
+        if words and words[0] == "unset":
+            for name in (word for word in words[1:] if not word.startswith("-")):
+                if name == "RUNTIME_VERSION":
+                    runtime_version_pristine = False
+                prepared.pop(name, None)
+                if name == "runtime_project":
+                    runtime_project_is_runtime = False
+
+        if not top_level[index]:
+            continue
+
+        arguments = _pip_acquisition_arguments(words)
         if arguments is None or not _command_failure_is_unmasked(commands, index):
             continue
-        if any(
+        if runtime_version_pristine and any(
             re.fullmatch(
                 r"molecules[-_]workspace[-_]runtime==\$\{?RUNTIME_VERSION\}?", argument
             )
@@ -799,14 +884,15 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
             if assignment_index < index and any(
                 argument in {f"${name}", f"${{{name}}}"} for argument in arguments
             ):
-                return has_runtime_identity
+                return runtime_version_pristine and runtime_project_is_runtime
     return False
 
 
 def _run_directly_executes_prebake(run: str) -> bool:
     commands = _shell_commands(run)
+    top_level = _top_level_shell_commands(commands)
     for index, (segment, _) in enumerate(commands):
-        if not _command_failure_is_unmasked(commands, index):
+        if not top_level[index] or not _command_failure_is_unmasked(commands, index):
             continue
         words = _command_words(segment)
         if not words:
@@ -824,9 +910,7 @@ def _run_directly_executes_prebake(run: str) -> bool:
                 break
             if not option.startswith("-") or option == "-":
                 break
-            if option == "--noexec" or (
-                not option.startswith("--") and set(option[1:]) & {"c", "n"}
-            ):
+            if not re.fullmatch(r"-[eux]+", option):
                 script_index = len(words)
                 break
             script_index += 1
@@ -841,8 +925,9 @@ def _run_directly_executes_prebake(run: str) -> bool:
 def _helper_consumes_mcp_contract(helper: str) -> bool:
     assignments: dict[str, str] = {}
     commands = _shell_commands(" ; ".join(_continued_lines(helper)))
-    for segment, _ in commands:
-        if len(segment) == 1:
+    top_level = _top_level_shell_commands(commands)
+    for index, (segment, _) in enumerate(commands):
+        if top_level[index] and len(segment) == 1:
             assignment = _assignment(segment[0])
             if assignment:
                 assignments[assignment[0]] = assignment[1]
@@ -859,6 +944,7 @@ def _helper_consumes_mcp_contract(helper: str) -> bool:
         words[1]
         for index, (segment, _) in enumerate(commands)
         if len(words := _command_words(segment)) >= 2
+        and top_level[index]
         and words[0] == "_prebake_self_check"
         and _command_failure_is_unmasked(commands, index)
     }
@@ -1001,6 +1087,45 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
         module = ast.parse(source)
     except SyntaxError as exc:
         raise MCPPinLockstepError("runtime platform_agent_identity.py is invalid Python") from exc
+    writes: dict[str, list[ast.AST]] = {name: [] for name in required}
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Name)
+            and node.id in required
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        ):
+            writes[node.id].append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in required:
+                writes[node.name].append(node)
+        elif isinstance(node, ast.arg):
+            if node.arg in required:
+                writes[node.arg].append(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    for name in required:
+                        writes[name].append(node)
+                    continue
+                bound = alias.asname
+                if bound is None:
+                    bound = (
+                        alias.name.partition(".")[0]
+                        if isinstance(node, ast.Import)
+                        else alias.name
+                    )
+                if bound in required:
+                    writes[bound].append(node)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name in required:
+                writes[node.name].append(node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name in required:
+                writes[node.name].append(node)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest in required:
+                writes[node.rest].append(node)
+    literal_targets: dict[str, ast.Name] = {}
     for node in module.body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
             continue
@@ -1012,10 +1137,18 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
             and isinstance(node.value.value, str)
         ):
             values[target.id] = node.value.value
-    missing = sorted(required - values.keys())
-    if missing:
+            literal_targets[target.id] = target
+    invalid = sorted(
+        name
+        for name in required
+        if len(writes[name]) != 1
+        or literal_targets.get(name) is not writes[name][0]
+    )
+    if invalid:
         raise MCPPinLockstepError(
-            "runtime wheel lacks literal MCP contract constants: " + ", ".join(missing)
+            "runtime wheel requires exactly one top-level literal assignment for MCP "
+            "contract constants: "
+            + ", ".join(invalid)
         )
     try:
         helper_consumes_contract = _helper_consumes_mcp_contract(helper)
