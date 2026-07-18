@@ -57,7 +57,7 @@ def _tree_paths(repo: Path, target: str) -> list[str]:
     return [part.decode("utf-8", errors="surrogateescape") for part in result.stdout.split(b"\0") if part]
 
 
-def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str], tuple[str, str] | None, str]:
+def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str], str]:
     head_ok = _ensure_commit(repo, head)
     target = head if head_ok else "HEAD"
     if not head_ok and _git(repo, "cat-file", "-e", "HEAD^{commit}", check=False).returncode != 0:
@@ -81,39 +81,24 @@ def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str], tuple[s
                 for part in diff.stdout.split(b"\0")
                 if part
             ]
-            return paths, (base, head), target
+            return paths, target
         print("::warning::git diff failed; scanning the entire target tree")
 
-    return _tree_paths(repo, target), None, target
+    return _tree_paths(repo, target), target
 
 
-def _content(repo: Path, path: str, diff_range: tuple[str, str] | None, target: str) -> str:
-    if diff_range is None:
-        result = _git(repo, "show", f"{target}:{path}", check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"cannot read {path!r} from target tree")
-        return result.stdout.decode("utf-8", errors="replace")
-
-    base, head = diff_range
-    result = _git(
-        repo,
-        "diff",
-        "--no-color",
-        "--unified=0",
-        base,
-        head,
-        "--",
-        path,
-        check=False,
-    )
+def _content(repo: Path, path: str, target: str) -> str:
+    # Read the complete resulting blob instead of parsing a textual patch. Git
+    # suppresses patch bodies for binary/NUL-containing files, which would let
+    # an added credential evade an added-line-only scan.
+    result = _git(repo, "show", f"{target}:{path}", check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"cannot compute added lines for {path!r}")
-    lines = result.stdout.decode("utf-8", errors="replace").splitlines()
-    return "\n".join(line[1:] for line in lines if line.startswith("+") and not line.startswith("+++"))
+        raise RuntimeError(f"cannot read {path!r} from target tree")
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def scan(repo: Path, *, base: str, head: str) -> list[tuple[str, str]]:
-    paths, diff_range, target = _changed_paths(repo, base, head)
+    paths, target = _changed_paths(repo, base, head)
     findings: list[tuple[str, str]] = []
     total_bytes = 0
     for path in paths:
@@ -129,7 +114,7 @@ def scan(repo: Path, *, base: str, head: str) -> list[tuple[str, str]]:
             raise RuntimeError(
                 f"scan budget exceeded at {path!r} (file={size}, total={total_bytes})"
             )
-        content = _content(repo, path, diff_range, target)
+        content = _content(repo, path, target)
         for label, pattern in PATTERNS:
             if pattern.search(content):
                 findings.append((path, label))

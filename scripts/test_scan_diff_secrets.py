@@ -110,3 +110,16 @@ def test_secret_added_while_renaming_file_is_scanned(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "renamed.txt (GitHub classic PAT)" in result.stdout
     assert secret not in result.stdout
+
+
+def test_secret_in_nul_containing_changed_blob_is_scanned(tmp_path: Path) -> None:
+    repo, base = _repo(tmp_path)
+    secret = "ghs_" + "E" * 40
+    (repo / "opaque.bin").write_bytes(b"prefix\0TOKEN=" + secret.encode() + b"\n")
+    _git(repo, "add", "opaque.bin")
+    _git(repo, "commit", "-qm", "add opaque blob")
+
+    result = _scan(repo, base, _git(repo, "rev-parse", "HEAD"))
+    assert result.returncode == 1
+    assert "opaque.bin (GitHub App token)" in result.stdout
+    assert secret not in result.stdout
