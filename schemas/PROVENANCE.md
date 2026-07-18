@@ -41,10 +41,11 @@ are therefore vendored here rather than pulled at validate time.
 These copies are the **SSOT mirror, not a fork**. They MUST stay byte-identical
 to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
 
-1. `scripts/check-schemas-in-sync.sh` re-fetches each schema from
-   `molecule-ai-sdk (contracts/)` **main** and `diff`s it against the vendored copy,
-   failing if they have drifted. It runs in CI via
-   `.gitea/workflows/schema-sync.yml`.
+1. `scripts/check-schemas-in-sync.sh` clones `molecule-ai-sdk` **main** once,
+   resolves that checkout to an exact commit, and `diff`s every schema against
+   that coherent snapshot. It prints the resolved source commit and fails
+   closed if the source cannot be checked or any copy has drifted. It runs in
+   CI via `.gitea/workflows/schema-sync.yml`.
 2. Each `$id` points to its canonical path in `molecule-ai-sdk`. The value is
    copied byte-for-byte with the rest of the schema; a one-sided `$id` edit
    therefore reds the drift gate like any other contract change.
