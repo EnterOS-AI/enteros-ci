@@ -406,7 +406,7 @@ def _mcp_lockstep_fixture(tmp_path, *, runtime_version="0.4.25", pinned="1.8.3")
     (tmp_path / "Dockerfile").write_text(
         "FROM python:3.11-slim\n"
         "ARG RUNTIME_VERSION=\n"
-        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "RUN set -e; runtime_project=\"molecules-workspace-runtime\"; \\\n"
         "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
         "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
         "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
@@ -483,7 +483,7 @@ def test_mcp_pin_lockstep_verifies_exact_immutable_runtime_and_mcp_artifacts(tmp
             "Dockerfile",
             "FROM scratch\n"
             "ARG RUNTIME_VERSION=\n"
-            "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+            "RUN set -e; runtime_project=\"molecules-workspace-runtime\"; \\\n"
             "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
             "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
             "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n",
@@ -745,7 +745,7 @@ def test_dockerfile_rejects_echo_only_prebake_marker(tmp_path):
     (tmp_path / "Dockerfile").write_text(
         "FROM scratch\n"
         "ARG RUNTIME_VERSION=\n"
-        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "RUN set -e; runtime_project=\"molecules-workspace-runtime\"; \\\n"
         "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
         "--runtime-version \"${RUNTIME_VERSION}\")\"; \\\n"
         "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
@@ -761,7 +761,7 @@ def test_dockerfile_accepts_positional_runtime_prepare_contract(tmp_path):
     (tmp_path / "Dockerfile").write_text(
         "FROM scratch\n"
         "ARG RUNTIME_VERSION=\n"
-        "RUN runtime_project=\"molecules-workspace-runtime\"; \\\n"
+        "RUN set -e; runtime_project=\"molecules-workspace-runtime\"; \\\n"
         "    runtime_requirement=\"$(python3 /tmp/prepare-runtime-requirements.py "
         "requirements.txt /tmp/public.txt \"${RUNTIME_VERSION}\")\"; \\\n"
         "    pip download --dest /tmp/molecule-runtime \"${runtime_requirement}\"\n"
@@ -1059,6 +1059,56 @@ def test_runtime_helper_rejects_self_checks_inside_never_called_function():
     assert not meta._helper_consumes_mcp_contract(helper)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'export VER="9.9.9"',
+        'readonly VER="9.9.9"',
+        'local VER="9.9.9"',
+        'declare -x VER="9.9.9"',
+        'typeset -x VER="9.9.9"',
+        "unset VER",
+        "VER+=.0",
+        'VER="9.9.9" true',
+    ],
+)
+def test_runtime_helper_rejects_rebound_exact_version_before_spec(mutation):
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            mutation,
+            'SPEC="${PKG}@${VER}"',
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert not meta._helper_consumes_mcp_contract(helper)
+
+
+def test_runtime_helper_accepts_exporting_existing_canonical_bindings():
+    helper = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -eu",
+            'PKG="$(_read MANAGEMENT_MCP_NPM_PACKAGE)"',
+            'VER="$(_read MANAGEMENT_MCP_PINNED_VERSION)"',
+            'RANGE="$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)"',
+            "export PKG VER RANGE",
+            'SPEC="${PKG}@${VER}"',
+            "export SPEC",
+            '_prebake_self_check "${SPEC}"',
+            '_prebake_self_check "${PKG}@${RANGE}"',
+        ]
+    )
+
+    assert meta._helper_consumes_mcp_contract(helper)
+
+
 @pytest.mark.parametrize("mutation", ["overwrite", "unset"])
 def test_runtime_acquisition_rejects_invalidated_prepared_requirement(mutation):
     change = (
@@ -1088,6 +1138,45 @@ def test_runtime_acquisition_rejects_assignment_builtin_overwrite(builtin):
     )
 
     assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize("builtin", ["export", "readonly", "declare", "typeset", "local"])
+@pytest.mark.parametrize("binding", ["runtime_project", "runtime_requirement"])
+def test_runtime_acquisition_rejects_declaration_assignment_as_canonical_binding(
+    builtin, binding
+):
+    runtime_project = (
+        f'{builtin} runtime_project="molecules-workspace-runtime";'
+        if binding == "runtime_project"
+        else 'runtime_project="molecules-workspace-runtime";'
+    )
+    runtime_requirement = (
+        f'{builtin} runtime_requirement="$(python3 '
+        '/tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")";'
+        if binding == "runtime_requirement"
+        else 'runtime_requirement="$(python3 '
+        '/tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")";'
+    )
+    run = (
+        f"set -e; {runtime_project} {runtime_requirement} "
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_accepts_exporting_existing_canonical_bindings():
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'export runtime_project runtime_requirement; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert meta._run_acquires_pinned_runtime(run)
 
 
 @pytest.mark.parametrize(
@@ -1146,6 +1235,57 @@ def test_runtime_acquisition_rejects_nonreaching_environment_assignment(
 ):
     run = f'set -e; {transient_assignment} pip download "$runtime_requirement"'
 
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize("assignment_edge", ["| true", "& wait", "&& true"])
+def test_runtime_acquisition_rejects_masked_or_nonpersistent_prepare_assignment(
+    assignment_edge,
+):
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="requests==2.32.0"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")" '
+        f"{assignment_edge}; "
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+def test_runtime_acquisition_rejects_prepare_output_from_masked_failure():
+    # The prepare command can print a wrong project and then fail. The assignment keeps
+    # that output, while ``|| true`` masks its nonzero status before pip consumes it.
+    run = (
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="requests==2.32.0"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")" || true; '
+        'pip download "$runtime_requirement"'
+    )
+
+    assert not meta._run_acquires_pinned_runtime(run)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        'set -e; RUNTIME_VERSION+=0; '
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"',
+        'set -e; export RUNTIME_VERSION+=0; '
+        'pip download "molecules-workspace-runtime==${RUNTIME_VERSION}"',
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'runtime_project+="-shadow"; pip download "$runtime_requirement"',
+        'set -e; runtime_project="molecules-workspace-runtime"; '
+        'runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py '
+        '--runtime-version "${RUNTIME_VERSION}")"; '
+        'runtime_requirement+="-shadow"; pip download "$runtime_requirement"',
+    ],
+)
+def test_runtime_acquisition_rejects_augmented_protected_assignment(run):
     assert not meta._run_acquires_pinned_runtime(run)
 
 

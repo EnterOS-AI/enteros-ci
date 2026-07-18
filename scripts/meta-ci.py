@@ -628,35 +628,59 @@ def _shell_commands(command: str) -> list[tuple[list[str], str | None]]:
     return commands
 
 
+def _assignment_write(word: str) -> tuple[str, str, bool] | None:
+    """Return a shell assignment write and whether it is a direct scalar ``=``."""
+    match = re.fullmatch(
+        r"([A-Za-z_][A-Za-z0-9_]*)(\[[^]]+\])?(\+?=)(.*)", word, re.S
+    )
+    if match is None:
+        return None
+    return (
+        match.group(1),
+        match.group(4),
+        match.group(2) is None and match.group(3) == "=",
+    )
+
+
 def _assignment(word: str) -> tuple[str, str] | None:
-    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", word, re.S)
-    return (match.group(1), match.group(2)) if match else None
+    write = _assignment_write(word)
+    return (write[0], write[1]) if write is not None and write[2] else None
 
 
 def _command_words(segment: list[str]) -> list[str]:
     index = 0
-    while index < len(segment) and _assignment(segment[index]) is not None:
+    while index < len(segment) and _assignment_write(segment[index]) is not None:
         index += 1
     return segment[index:]
 
 
-def _assignment_updates(segment: list[str]) -> list[tuple[str, str, bool]]:
-    """Return assignments and whether they persist beyond this shell command."""
-    leading: list[tuple[str, str]] = []
+def _assignment_updates(
+    segment: list[str],
+) -> list[tuple[str, str, bool, bool, bool]]:
+    """Return writes as ``(name, value, persists, is_direct, establishes)``.
+
+    Declaration builtins are writes, but never proof sources: Bash can report a
+    successful ``export``/``local``/``readonly`` even when its substitution failed.
+    """
+    leading: list[tuple[str, str, bool]] = []
     index = 0
     while index < len(segment):
-        assignment = _assignment(segment[index])
-        if assignment is None:
+        write = _assignment_write(segment[index])
+        if write is None:
             break
-        leading.append(assignment)
+        leading.append(write)
         index += 1
     words = segment[index:]
-    updates = [(name, value, not words) for name, value in leading]
-    if words and words[0] in {"declare", "export", "readonly", "typeset"}:
+    updates = [
+        (name, value, not words, is_direct, True)
+        for name, value, is_direct in leading
+    ]
+    if words and words[0] in {"declare", "export", "local", "readonly", "typeset"}:
         updates.extend(
-            (*assignment, True)
+            (name, value, True, is_direct, False)
             for word in words[1:]
-            if (assignment := _assignment(word)) is not None
+            if (write := _assignment_write(word)) is not None
+            for name, value, is_direct in [write]
         )
     return updates
 
@@ -840,18 +864,29 @@ def _run_acquires_pinned_runtime(run: str) -> bool:
     runtime_project_is_runtime = False
     runtime_version_pristine = True
     for index, (segment, _) in enumerate(commands):
-        for name, value, persists in _assignment_updates(segment):
+        assignment_is_unmasked = bool(
+            top_level[index] and _command_failure_is_unmasked(commands, index)
+        )
+        for name, value, persists, is_direct, establishes in _assignment_updates(
+            segment
+        ):
             if name == "RUNTIME_VERSION":
                 runtime_version_pristine = False
             prepared.pop(name, None)
             if name == "runtime_project":
                 runtime_project_is_runtime = bool(
                     persists
+                    and is_direct
+                    and establishes
+                    and assignment_is_unmasked
                     and top_level[index]
                     and value.replace("_", "-") == "molecules-workspace-runtime"
                 )
             if (
                 persists
+                and is_direct
+                and establishes
+                and assignment_is_unmasked
                 and top_level[index]
                 and runtime_version_pristine
                 and _runtime_prepare_assignment(value)
@@ -923,32 +958,66 @@ def _run_directly_executes_prebake(run: str) -> bool:
 
 
 def _helper_consumes_mcp_contract(helper: str) -> bool:
-    assignments: dict[str, str] = {}
+    expected = {
+        "PKG": "$(_read MANAGEMENT_MCP_NPM_PACKAGE)",
+        "VER": "$(_read MANAGEMENT_MCP_PINNED_VERSION)",
+        "RANGE": "$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)",
+    }
+    protected = {*expected, "SPEC"}
+    bindings: dict[str, str] = {}
+    exact_checked = False
+    range_checked = False
     commands = _shell_commands(" ; ".join(_continued_lines(helper)))
     top_level = _top_level_shell_commands(commands)
     for index, (segment, _) in enumerate(commands):
-        if top_level[index] and len(segment) == 1:
-            assignment = _assignment(segment[0])
-            if assignment:
-                assignments[assignment[0]] = assignment[1]
+        assignment_is_unmasked = bool(
+            top_level[index] and _command_failure_is_unmasked(commands, index)
+        )
+        for name, value, persists, is_direct, establishes in _assignment_updates(
+            segment
+        ):
+            if name not in protected:
+                continue
+            bindings.pop(name, None)
+            if not (
+                persists and is_direct and establishes and assignment_is_unmasked
+            ):
+                continue
+            if name == "SPEC":
+                if (
+                    value in {"${PKG}@${VER}", "$PKG@$VER"}
+                    and bindings.get("PKG") == expected["PKG"]
+                    and bindings.get("VER") == expected["VER"]
+                ):
+                    bindings[name] = "canonical-exact-spec"
+            else:
+                bindings[name] = value
 
-    if assignments.get("PKG") != "$(_read MANAGEMENT_MCP_NPM_PACKAGE)":
-        return False
-    if assignments.get("VER") != "$(_read MANAGEMENT_MCP_PINNED_VERSION)":
-        return False
-    if assignments.get("RANGE") != "$(_read MANAGEMENT_MCP_COMPATIBLE_RANGE)":
-        return False
-    if assignments.get("SPEC") not in {"${PKG}@${VER}", "$PKG@$VER"}:
-        return False
-    invocations = {
-        words[1]
-        for index, (segment, _) in enumerate(commands)
-        if len(words := _command_words(segment)) >= 2
-        and top_level[index]
-        and words[0] == "_prebake_self_check"
-        and _command_failure_is_unmasked(commands, index)
-    }
-    return "${SPEC}" in invocations and "${PKG}@${RANGE}" in invocations
+        words = _command_words(segment)
+        if words and words[0] == "unset":
+            for name in (word for word in words[1:] if not word.startswith("-")):
+                if name in protected:
+                    bindings.pop(name, None)
+
+        if (
+            not top_level[index]
+            or len(words) < 2
+            or words[0] != "_prebake_self_check"
+            or not _command_failure_is_unmasked(commands, index)
+        ):
+            continue
+        if words[1] == "${SPEC}":
+            if bindings.get("SPEC") != "canonical-exact-spec":
+                return False
+            exact_checked = True
+        elif words[1] == "${PKG}@${RANGE}":
+            if (
+                bindings.get("PKG") != expected["PKG"]
+                or bindings.get("RANGE") != expected["RANGE"]
+            ):
+                return False
+            range_checked = True
+    return exact_checked and range_checked
 
 
 def _template_runtime_pin(repo_root: Path) -> str:

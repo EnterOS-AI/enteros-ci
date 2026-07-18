@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 ARG RUNTIME_VERSION=
-RUN runtime_project="molecules-workspace-runtime"; \
+RUN set -e; runtime_project="molecules-workspace-runtime"; \
     runtime_requirement="$(python3 /tmp/prepare-runtime-requirements.py --runtime-version "${RUNTIME_VERSION}")"; \
     pip download --dest /tmp/molecule-runtime "${runtime_requirement}"
 
