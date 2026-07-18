@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
 MINIMAL_TEMPLATE = REPO_ROOT / "templates" / "ci-minimal.yml"
 DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
+PINNED_MOLECULE_CI_REF = "ce4f84f1c9851c3ee6a49a8d9862934dd9965c44"
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SECRET_SCANNING_WORKFLOWS = (
     WORKSPACE_TEMPLATE,
@@ -78,6 +79,7 @@ def test_inline_ssot_templates_pin_and_verify_an_immutable_ref(path: Path) -> No
     ref = job["env"]["MOLECULE_CI_REF"]
     commands = "\n".join(_all_run_steps(path))
     assert re.fullmatch(r"[0-9a-f]{40}", ref)
+    assert ref == PINNED_MOLECULE_CI_REF
     assert "git clone" not in commands
     assert 'fetch -q --depth 1 origin "$MOLECULE_CI_REF"' in commands
     assert 'rev-parse HEAD)" = "$MOLECULE_CI_REF"' in commands

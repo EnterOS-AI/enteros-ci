@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MOLECULE_CI_REF: 1896b1cafc4fbf778f7baa9e627c975803fcd088
+      MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
     # ADVISORY: never block a merge while the router beds in. The router SCRIPT
     # exits nonzero on an invalid repo-meta / failed bundle; this flag only
     # governs whether THIS job's red blocks the PR (it does not).

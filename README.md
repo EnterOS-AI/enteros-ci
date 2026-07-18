@@ -121,7 +121,7 @@ version/dist-tag — evaluation is version-specific), `contract-path` *or*
 
 ```yaml
 env:
-  MOLECULE_CI_REF: 1896b1cafc4fbf778f7baa9e627c975803fcd088
+  MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
 steps:
   - run: |
       git init -q .molecule-ci
