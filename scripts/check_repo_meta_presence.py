@@ -91,35 +91,73 @@ def _env(key: str, default: str | None = None) -> str:
     return val
 
 
-def fetch_repo_meta(api: str, org: str, repo: str, token: str) -> tuple[str, str | None]:
-    """Return (status, raw_yaml). status ∈ {'ok','missing','error'}."""
-    url = f"{api}/repos/{org}/{repo}/contents/repo-meta.yaml"
-    # A non-default User-Agent: the Cloudflare edge fronting the forge answers a
-    # bot challenge (403) to the bare `Python-urllib/*` UA. A named UA passes.
+# CF-safe UA (matches the sibling drift gates): the Cloudflare edge fronting the
+# forge answers a bot challenge to a bare `Python-urllib/*` UA.
+_UA = "curl/8.4.0"
+
+
+def _get(url: str, token: str, timeout: int = 15):
+    """One authenticated GET, retried once. Returns (http_code|None, body|None, err|None).
+
+    http_code is the definite HTTP status when the server answered; it is None
+    (with `err` set) on a transport failure or a 200 whose body is not JSON (e.g.
+    a Cloudflare challenge page). A non-JSON 200 is NEVER treated as a real
+    result — the caller fails closed rather than mistaking it for 'missing'.
+    Retry-once so a single transient blip cannot red the gate (15s×2 keeps 15
+    repos well under the 5-minute job cap).
+    """
     req = urllib.request.Request(
         url,
-        headers={
-            "Authorization": f"token {token}",
-            "User-Agent": "molecule-ci-repo-meta-presence-gate",
-            "Accept": "application/json",
-        },
+        headers={"Authorization": f"token {token}", "User-Agent": _UA, "Accept": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.load(resp)
-        import base64
+    last_err = None
+    for _ in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            try:
+                return (200, json.loads(raw.decode("utf-8")), None)
+            except (ValueError, UnicodeDecodeError) as exc:
+                return (None, None, f"non-JSON 200 body ({exc})")
+        except urllib.error.HTTPError as exc:
+            return (exc.code, None, None)  # a definite HTTP status — do not retry
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_err = str(exc)
+            continue
+    return (None, None, last_err or "request failed")
 
-        content = base64.b64decode(body.get("content", "")).decode("utf-8")
+
+def fetch_repo_meta(api: str, org: str, repo: str, token: str) -> tuple[str, str | None]:
+    """Return (status, raw_yaml). status ∈ {'ok','missing','error'}.
+
+    A manifest 404 is 'missing' ONLY when the repo itself is reachable. A 404
+    caused by a renamed/archived repo or a token that cannot see the repo (Gitea
+    404s inaccessible repos to avoid leaking their existence) is 'error' — fail
+    closed, NOT a false 'add a manifest'. A non-JSON / undecodable body is also
+    'error', never a silent crash.
+    """
+    code, body, err = _get(f"{api}/repos/{org}/{repo}/contents/repo-meta.yaml", token)
+    if code == 200:
+        try:
+            import base64
+
+            content = base64.b64decode((body or {}).get("content", "")).decode("utf-8")
+        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+            sys.stderr.write(f"::error::{repo}: repo-meta.yaml body undecodable ({exc})\n")
+            return ("error", None)
         return ("ok", content)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+    if code == 404:
+        rcode, _, rerr = _get(f"{api}/repos/{org}/{repo}", token)
+        if rcode == 200:
             return ("missing", None)
-        # 401/403/5xx — cannot verify; fail closed.
-        sys.stderr.write(f"::error::{repo}: repo-meta.yaml GET HTTP {exc.code}\n")
+        sys.stderr.write(
+            f"::error::{repo}: manifest 404 but repo GET returned {rcode or rerr} — "
+            f"repo renamed/archived or token lacks access; cannot verify\n"
+        )
         return ("error", None)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        sys.stderr.write(f"::error::{repo}: repo-meta.yaml GET failed ({exc})\n")
-        return ("error", None)
+    # 401/403/5xx, transport failure, or non-JSON 200 — cannot verify; fail closed.
+    sys.stderr.write(f"::error::{repo}: repo-meta.yaml GET {code or err}\n")
+    return ("error", None)
 
 
 def validate_manifest(raw: str) -> str | None:
@@ -162,31 +200,34 @@ def run() -> int:
             else:
                 ok += 1
 
-    if errors:
-        # Could not verify some repos — fail closed rather than green a gate we
-        # could not evaluate.
+    # Print EVERY category first, so a transient/unverifiable repo can never HIDE
+    # a genuinely-missing or invalid manifest surfaced in the same run.
+    for r in missing:
         print(
-            f"::error::repo-meta presence gate could NOT verify "
-            f"{len(errors)} repo(s) (auth/API): {', '.join(errors)}. Failing "
-            f"closed."
+            f"::error::{r} is a known-layer repo but has NO repo-meta.yaml. "
+            f"Add one (schema_version: 1 + layer) so meta-CI can derive its "
+            f"bundle. See molecule-ci/schemas/repo-meta.schema.json."
         )
-        return 2
+    for r in invalid:
+        print(f"::error::invalid repo-meta.yaml — {r}")
+    if errors:
+        print(
+            f"::error::could NOT verify {len(errors)} repo(s) "
+            f"(auth/API/rename): {', '.join(errors)}. Failing closed."
+        )
 
+    # A definite missing/invalid is the most actionable outcome — surface it
+    # (exit 1) even alongside an unverifiable repo. Only an unverifiable-with-no-
+    # definite-finding run exits 2 ("could not verify"). Both are merge-blocking.
     if missing or invalid:
-        for r in missing:
-            print(
-                f"::error::{r} is a known-layer repo but has NO repo-meta.yaml. "
-                f"Add one (schema_version: 1 + layer) so meta-CI can derive its "
-                f"bundle. See molecule-ci/schemas/repo-meta.schema.json."
-            )
-        for r in invalid:
-            print(f"::error::invalid repo-meta.yaml — {r}")
         print(
             f"::error::repo-meta presence gate FAILED: {len(missing)} missing, "
-            f"{len(invalid)} invalid, {ok} ok, of {len(KNOWN_LAYER_REPOS)} "
-            f"known-layer repos."
+            f"{len(invalid)} invalid, {len(errors)} unverifiable, {ok} ok, of "
+            f"{len(KNOWN_LAYER_REPOS)} known-layer repos."
         )
         return 1
+    if errors:
+        return 2
 
     print(
         f"::notice::repo-meta presence gate OK — all "
