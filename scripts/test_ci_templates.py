@@ -9,6 +9,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
+MINIMAL_TEMPLATE = REPO_ROOT / "templates" / "ci-minimal.yml"
+DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SECRET_SCANNING_WORKFLOWS = (
     WORKSPACE_TEMPLATE,
@@ -60,6 +62,29 @@ def test_consumer_templates_only_invoke_scripts_present_in_cloned_ci_repo(
     for reference in references:
         source_path = REPO_ROOT / reference.removeprefix(".molecule-ci/")
         assert source_path.is_file(), f"{path.name} references missing {source_path}"
+
+
+@pytest.mark.parametrize("path", CONSUMER_TEMPLATES)
+def test_consumer_templates_never_use_remote_workflow_call(path: Path) -> None:
+    assert not re.search(
+        r"uses:\s+\S+/\.gitea/workflows/\S+@", path.read_text()
+    ), f"{path.name} uses unsupported cross-repository workflow_call"
+
+
+@pytest.mark.parametrize("path", (MINIMAL_TEMPLATE, DIFF_SECRET_TEMPLATE))
+def test_inline_ssot_templates_pin_and_verify_an_immutable_ref(path: Path) -> None:
+    workflow = yaml.safe_load(path.read_text())
+    job = next(iter(workflow["jobs"].values()))
+    ref = job["env"]["MOLECULE_CI_REF"]
+    commands = "\n".join(_all_run_steps(path))
+    assert re.fullmatch(r"[0-9a-f]{40}", ref)
+    assert 'fetch -q --depth 1 origin "$MOLECULE_CI_REF"' in commands
+    assert 'rev-parse HEAD)" = "$MOLECULE_CI_REF"' in commands
+
+
+def test_inline_ssot_templates_assert_execution_sentinels() -> None:
+    assert "minimal-validate:sentinel:executed" in MINIMAL_TEMPLATE.read_text()
+    assert "secret-scan:sentinel:executed" in DIFF_SECRET_TEMPLATE.read_text()
 
 
 @pytest.mark.parametrize(

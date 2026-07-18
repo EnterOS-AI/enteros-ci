@@ -14,6 +14,8 @@ consumer repository:
 | `molecule-ai-plugin-*` | [`templates/ci-plugin.yml`](templates/ci-plugin.yml) |
 | `molecule-ai-workspace-template-*` | [`templates/ci-workspace-template.yml`](templates/ci-workspace-template.yml) |
 | `molecule-ai-org-template-*` | [`templates/ci-org-template.yml`](templates/ci-org-template.yml) |
+| satellite/channel/misc repositories | [`templates/ci-minimal.yml`](templates/ci-minimal.yml) |
+| repositories needing the canonical diff secret gate | [`templates/ci-secret-scan.yml`](templates/ci-secret-scan.yml) |
 
 The inline templates clone `molecule-ci` from `git.moleculesai.app` and execute the canonical validators from `scripts/`, so validator logic remains centralized without a cross-repository action fetch.
 
@@ -29,6 +31,10 @@ Any future guard must be implemented as a repository-local, base-trusted Gitea
 workflow, use the `git.moleculesai.app` API with a least-privilege identity, and
 prove its emitted context before branch protection requires it. Until then,
 operators must treat every new PR head as a new review and CI boundary.
+
+The inline minimal and secret-scan templates pin an immutable molecule-ci
+commit, verify the fetched SHA, execute a canonical script, and assert that
+script's sentinel. Updating the pin is a reviewed dependency change.
 
 ## What each workflow validates
 
