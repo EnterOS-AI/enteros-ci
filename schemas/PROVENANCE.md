@@ -7,15 +7,15 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119 merge) |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `5588b7ce877c923d7249dc7d272244cfdcb3aca1` |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 `molecule-ai-sdk` main at re-vendor time:
-`bdf41eb0517087acc47c74233755a37425fcd1b7` (SDK PR #119). The source commits
+`a51a008fc27abf3da599b95b5e101d5db5a7012c`. The source commits
 above are the latest contract-changing commits for each path and are all
-contained by that main: plugin-manifest from PR #119, workspace-template from
+contained by that main: plugin-manifest from PR #121, workspace-template from
 PR #92, org-template from PR #98, and repo-meta from PR #116.
 
 > **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
@@ -41,10 +41,11 @@ are therefore vendored here rather than pulled at validate time.
 These copies are the **SSOT mirror, not a fork**. They MUST stay byte-identical
 to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
 
-1. `scripts/check-schemas-in-sync.sh` re-fetches each schema from
-   `molecule-ai-sdk (contracts/)` **main** and `diff`s it against the vendored copy,
-   failing if they have drifted. It runs in CI via
-   `.gitea/workflows/schema-sync.yml`.
+1. `scripts/check-schemas-in-sync.sh` clones `molecule-ai-sdk` **main** once,
+   resolves that checkout to an exact commit, and `diff`s every schema against
+   that coherent snapshot. It prints the resolved source commit and fails
+   closed if the source cannot be checked or any copy has drifted. It runs in
+   CI via `.gitea/workflows/schema-sync.yml`.
 2. Each `$id` points to its canonical path in `molecule-ai-sdk`. The value is
    copied byte-for-byte with the rest of the schema; a one-sided `$id` edit
    therefore reds the drift gate like any other contract change.
@@ -55,7 +56,7 @@ When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
 # Pin this to the exact molecule-ai-sdk main verified before the update.
-SDK_COMMIT=bdf41eb0517087acc47c74233755a37425fcd1b7
+SDK_COMMIT=a51a008fc27abf3da599b95b5e101d5db5a7012c
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 for s in plugin-manifest workspace-template org-template repo-meta; do

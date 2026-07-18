@@ -3,13 +3,11 @@
 #
 # The validate-plugin / validate-workspace-template / validate-org-template
 # scripts now validate real artifact manifests against schemas/*.schema.json
-# (vendored from molecule-ai-sdk contracts/). This gate re-fetches each schema from
-# molecule-ai-sdk (contracts/) main and diffs it against the vendored copy, failing the
-# build on drift. Mirrors molecule-ai-workspace-runtime#196's vendored-schema
-# drift gate. See schemas/PROVENANCE.md.
-#
-# Soft-skips (exit 2) on a fetch failure so a transient git.* TLS stall does
-# not paint PRs red; a real byte difference (exit 1) always fails.
+# (vendored from molecule-ai-sdk contracts/). This gate clones SDK main once,
+# resolves it to an exact commit, and diffs every vendored copy against that
+# coherent snapshot. Mirrors molecule-ai-workspace-runtime#196's vendored-schema
+# drift gate. It fails
+# closed when that source snapshot cannot be verified. See schemas/PROVENANCE.md.
 
 name: Schema Sync
 
@@ -32,17 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
-      - name: Check vendored schemas against molecule-ai-sdk (contracts/) main
-        run: |
-          set +e
-          bash scripts/check-schemas-in-sync.sh
-          rc=$?
-          set -e
-          # rc 2 = fetch could not complete (network/infra). Soft-skip so a
-          # transient git.* stall isn't a false red; rc 1 (real drift) fails.
-          if [ "$rc" -eq 2 ]; then
-            echo "::warning::schema-sync soft-skipped (could not fetch molecule-ai-sdk contracts main)."
-            exit 0
-          fi
-          exit "$rc"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Check vendored schemas against one molecule-ai-sdk main snapshot
+        run: bash scripts/check-schemas-in-sync.sh
