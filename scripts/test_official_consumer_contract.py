@@ -83,8 +83,9 @@ def _test_contract(consumer: str, *, verifier_ref: str = VERIFIER_REF) -> bytes:
         "mcp-built-image-e2e:sentinel:executed",
     )
     assert workflow_ref == MOLECULE_CI_REF
-    assert FORK_RUN
-    assert required_fragments
+    assert FORK_RUN in build
+    for fragment in required_fragments:
+        assert fragment in build
     assert "--volume" not in build
 """
     if consumer == "hermes":
@@ -199,6 +200,38 @@ def test_required_regression_test_must_assert_the_hardening_contract() -> None:
         contract.validate_contract("hermes", _workflow(), test_contract)
 
 
+def test_dead_fragment_tuple_and_truthiness_assertion_fail_closed() -> None:
+    test_contract = _test_contract("codex").replace(
+        b"    for fragment in required_fragments:\n"
+        b"        assert fragment in build\n",
+        b"    assert required_fragments\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="test contract is missing required final-image MCP assertions",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_fragment_assertions_must_target_parsed_workflow_data() -> None:
+    test_contract = _test_contract("codex").replace(
+        b"    for fragment in required_fragments:\n"
+        b"        assert fragment in build\n",
+        b'    decoy = " ".join(required_fragments)\n'
+        b"    for fragment in required_fragments:\n"
+        b"        assert fragment in decoy\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="test contract is missing required final-image MCP assertions",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
 @pytest.mark.parametrize(
     ("original", "replacement", "message"),
     (
@@ -211,6 +244,11 @@ def test_required_regression_test_must_assert_the_hardening_contract() -> None:
             b"assert workflow_ref == MOLECULE_CI_REF",
             b"assert MOLECULE_CI_REF",
             "does not compare the immutable verifier ref",
+        ),
+        (
+            b"assert FORK_RUN in build",
+            b"assert FORK_RUN",
+            "does not assert the non-fork guard",
         ),
         (
             b'assert "--volume" not in build',

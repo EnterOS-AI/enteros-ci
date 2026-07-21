@@ -149,6 +149,240 @@ def _test_ref(module: ast.Module) -> str | None:
     return _static_string(assignments[0])
 
 
+def _function_nodes(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    nodes: list[ast.AST] = []
+    stack = list(reversed(function.body))
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return nodes
+
+
+def _is_workflow_load(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "safe_load"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "yaml"
+        and any(
+            isinstance(child, ast.Name) and child.id == "CI_WORKFLOW"
+            for child in ast.walk(node)
+        )
+    )
+
+
+def _target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {
+            name
+            for element in target.elts
+            for name in _target_names(element)
+        }
+    return set()
+
+
+def _is_workflow_derived(
+    expression: ast.AST,
+    derived_names: set[str],
+    derived_functions: set[str],
+) -> bool:
+    for node in ast.walk(expression):
+        if _is_workflow_load(node):
+            return True
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in derived_names
+        ):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in derived_functions
+        ):
+            return True
+    return False
+
+
+def _workflow_derived_names(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    derived_functions: set[str],
+) -> set[str]:
+    assignments: list[tuple[list[ast.AST], ast.AST]] = []
+    for node in _function_nodes(function):
+        if isinstance(node, ast.Assign):
+            assignments.append((node.targets, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append(([node.target], node.value))
+
+    derived_names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in assignments:
+            if not _is_workflow_derived(value, derived_names, derived_functions):
+                continue
+            assigned = {
+                name for target in targets for name in _target_names(target)
+            }
+            if not assigned.issubset(derived_names):
+                derived_names.update(assigned)
+                changed = True
+    return derived_names
+
+
+def _workflow_returning_functions(
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    derived_functions: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, function in functions.items():
+            derived_names = _workflow_derived_names(function, derived_functions)
+            if any(
+                isinstance(node, ast.Return)
+                and node.value is not None
+                and _is_workflow_derived(
+                    node.value, derived_names, derived_functions
+                )
+                for node in _function_nodes(function)
+            ) and name not in derived_functions:
+                derived_functions.add(name)
+                changed = True
+    return derived_functions
+
+
+def _comparison_parts(
+    comparison: ast.Compare,
+) -> list[tuple[ast.AST, ast.cmpop, ast.AST]]:
+    operands = [comparison.left, *comparison.comparators]
+    return [
+        (operands[index], operator, operands[index + 1])
+        for index, operator in enumerate(comparison.ops)
+    ]
+
+
+def _contains_name(expression: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Name) and node.id == name
+        for node in ast.walk(expression)
+    )
+
+
+def _asserts_name_against_workflow(
+    assertion: ast.Assert,
+    name: str,
+    operator_types: tuple[type[ast.cmpop], ...],
+    derived_names: set[str],
+    derived_functions: set[str],
+) -> bool:
+    if not isinstance(assertion.test, ast.Compare):
+        return False
+    for left, operator, right in _comparison_parts(assertion.test):
+        if not isinstance(operator, operator_types):
+            continue
+        if _contains_name(left, name) and _is_workflow_derived(
+            right, derived_names, derived_functions
+        ):
+            return True
+        if _contains_name(right, name) and _is_workflow_derived(
+            left, derived_names, derived_functions
+        ):
+            return True
+    return False
+
+
+def _static_string_sequence(
+    expression: ast.AST, bindings: dict[str, tuple[str, ...]]
+) -> tuple[str, ...] | None:
+    if isinstance(expression, ast.Name):
+        return bindings.get(expression.id)
+    if not isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
+        return None
+    values = tuple(_static_string(element) for element in expression.elts)
+    if any(value is None for value in values):
+        return None
+    return tuple(value for value in values if value is not None)
+
+
+def _asserted_workflow_fragments(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    derived_functions: set[str],
+) -> str:
+    asserted: list[str] = []
+    for function in functions:
+        nodes = _function_nodes(function)
+        derived_names = _workflow_derived_names(function, derived_functions)
+        bindings: dict[str, tuple[str, ...]] = {}
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                if value is None:
+                    continue
+                sequence = _static_string_sequence(value, bindings)
+                if sequence is None:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for name in _target_names(target):
+                        if bindings.get(name) != sequence:
+                            bindings[name] = sequence
+                            changed = True
+
+        for node in nodes:
+            if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare):
+                for left, operator, right in _comparison_parts(node.test):
+                    value = _static_string(left)
+                    if (
+                        isinstance(operator, ast.In)
+                        and value is not None
+                        and _is_workflow_derived(
+                            right, derived_names, derived_functions
+                        )
+                    ):
+                        asserted.append(value)
+            if not isinstance(node, (ast.For, ast.AsyncFor)):
+                continue
+            target_names = _target_names(node.target)
+            if len(target_names) != 1:
+                continue
+            target_name = next(iter(target_names))
+            sequence = _static_string_sequence(node.iter, bindings)
+            if sequence is None:
+                continue
+            loop_assertions = [
+                child for child in ast.walk(node) if isinstance(child, ast.Assert)
+            ]
+            if any(
+                isinstance(assertion.test, ast.Compare)
+                and any(
+                    isinstance(operator, ast.In)
+                    and isinstance(left, ast.Name)
+                    and left.id == target_name
+                    and _is_workflow_derived(
+                        right, derived_names, derived_functions
+                    )
+                    for left, operator, right in _comparison_parts(assertion.test)
+                )
+                for assertion in loop_assertions
+            ):
+                asserted.extend(sequence)
+    return " ".join(asserted)
+
+
 def _validate_workflow(workflow: str) -> None:
     refs = _REF_ASSIGNMENT_RE.findall(workflow)
     if len(refs) != 1:
@@ -180,6 +414,7 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
         for node in module.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    derived_functions = _workflow_returning_functions(functions)
     required_names = _REQUIRED_TESTS[consumer]
     missing_names = [name for name in required_names if name not in functions]
     if missing_names:
@@ -197,65 +432,75 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
         )
 
     required_nodes = [
-        node for function in required_functions for node in ast.walk(function)
+        node for function in required_functions for node in _function_nodes(function)
     ]
     workflow_loads = [
         node
         for node in required_nodes
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "safe_load"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "yaml"
-        and any(
-            isinstance(child, ast.Name) and child.id == "CI_WORKFLOW"
-            for child in ast.walk(node)
-        )
+        if _is_workflow_load(node)
     ]
     if not workflow_loads:
         raise OfficialConsumerContractError(
             "required regression test does not statically read the CI workflow"
         )
 
-    assertions = [node for node in required_nodes if isinstance(node, ast.Assert)]
+    derived_names = {
+        function.name: _workflow_derived_names(function, derived_functions)
+        for function in required_functions
+    }
     if not any(
-        isinstance(assertion.test, ast.Compare)
-        and any(isinstance(operator, ast.Eq) for operator in assertion.test.ops)
-        and any(
-            isinstance(node, ast.Name) and node.id == "MOLECULE_CI_REF"
-            for node in ast.walk(assertion.test)
+        _asserts_name_against_workflow(
+            assertion,
+            "MOLECULE_CI_REF",
+            (ast.Eq,),
+            derived_names[function.name],
+            derived_functions,
         )
-        for assertion in assertions
+        for function in required_functions
+        for assertion in _function_nodes(function)
+        if isinstance(assertion, ast.Assert)
     ):
         raise OfficialConsumerContractError(
             "required regression test does not compare the immutable verifier ref"
         )
     if not any(
-        isinstance(node, ast.Name) and node.id == "FORK_RUN"
+        _asserts_name_against_workflow(
+            assertion,
+            "FORK_RUN",
+            (ast.Eq, ast.In),
+            derived_names[function.name],
+            derived_functions,
+        )
         for function in required_functions
-        for node in ast.walk(function)
+        for assertion in _function_nodes(function)
+        if isinstance(assertion, ast.Assert)
     ):
         raise OfficialConsumerContractError(
             "required regression test does not assert the non-fork guard"
         )
     if not any(
         isinstance(assertion.test, ast.Compare)
-        and isinstance(assertion.test.left, ast.Constant)
-        and assertion.test.left.value == "--volume"
-        and any(isinstance(operator, ast.NotIn) for operator in assertion.test.ops)
-        for assertion in assertions
+        and any(
+            isinstance(operator, ast.NotIn)
+            and _static_string(left) == "--volume"
+            and _is_workflow_derived(
+                right, derived_names[function.name], derived_functions
+            )
+            for left, operator, right in _comparison_parts(assertion.test)
+        )
+        for function in required_functions
+        for assertion in _function_nodes(function)
+        if isinstance(assertion, ast.Assert)
     ):
         raise OfficialConsumerContractError(
             "required regression test does not reject verifier bind mounts"
         )
 
-    literals = " ".join(
-        node.value
-        for function in required_functions
-        for node in ast.walk(function)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    _require_fragments(
+        _asserted_workflow_fragments(required_functions, derived_functions),
+        _TEST_FRAGMENTS,
+        "test",
     )
-    _require_fragments(literals, _TEST_FRAGMENTS, "test")
 
 
 def validate_contract(
