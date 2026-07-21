@@ -16,7 +16,12 @@ def test_schema_sync_workflow_never_waives_source_unavailability() -> None:
     assert "soft-skip" not in script.lower()
     assert "soft-skip" not in workflow.lower()
     assert "raw/branch/main" not in script
-    assert script.count('git -c http.userAgent="$UA" clone') == 1
+    assert "safe_git()" in script
+    assert script.count("-c http.userAgent=curl/8.4.0") == 2
+    assert 'fetch --depth=1 origin "$SDK_COMMIT"' in script
+    assert "fetch --depth=1 origin main" in script
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in script
+    assert "GIT_ASKPASS=/bin/false" in script
     assert "run: bash scripts/check-schemas-in-sync.sh" in workflow
     assert "set +e" not in workflow
     assert (

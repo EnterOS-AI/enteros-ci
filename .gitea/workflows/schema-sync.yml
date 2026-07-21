@@ -3,20 +3,17 @@
 #
 # The validate-plugin / validate-workspace-template / validate-org-template
 # scripts now validate real artifact manifests against schemas/*.schema.json
-# (vendored from molecule-ai-sdk contracts/). This gate clones SDK main once,
-# resolves it to an exact commit, and diffs every vendored copy against that
-# coherent snapshot. Mirrors molecule-ai-workspace-runtime#196's vendored-schema
-# drift gate. It fails
-# closed when that source snapshot cannot be verified. See schemas/PROVENANCE.md.
+# (vendored from molecule-ai-sdk contracts/). This gate re-fetches each schema
+# from the immutable commit in schemas/SDK_SOURCE_COMMIT, requires that source
+# snapshot to match current SDK main, and diffs it against the vendored copy.
+# Drift, source bytes not yet on main, invalid pins, and incomplete fetches all
+# fail closed.
+# See schemas/PROVENANCE.md.
 
 name: Schema Sync
 
 on:
   pull_request:
-    paths:
-      - "schemas/**"
-      - "scripts/check-schemas-in-sync.sh"
-      - ".gitea/workflows/schema-sync.yml"
   push:
     branches: [main]
   workflow_dispatch: {}
@@ -31,5 +28,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      - name: Check vendored schemas against one molecule-ai-sdk main snapshot
+        with:
+          persist-credentials: false
+      - name: Check vendored schemas against immutable SDK contracts
         run: bash scripts/check-schemas-in-sync.sh
