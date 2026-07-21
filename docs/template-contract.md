@@ -104,6 +104,60 @@ if [ "$t4" != "success" ]; then
 fi
 ```
 
+### T4 final-image management-MCP proof
+
+A template declaring `mcp-server-bake` must run the central molecule-ci
+`scripts/mcp_built_image_e2e.py` against the **same final image tag** its existing
+`t4-conformance` job built. Rebuilding a verifier-only image is not equivalent: a later
+Docker layer can replace the installed runtime, helper, constants, npm cache, or npmrc.
+
+The workflow contract is:
+
+1. Generate the credential-free static JSON attestation with the immutable molecule-ci
+   `mcp_pin_lockstep.py --json` and extract its already-validated runtime semver.
+2. Pass that exact version to the one final-image build as
+   `--build-arg RUNTIME_VERSION=<validated-version>`; a checked-in pin that never reaches
+   the Docker build argument does not prove the image used the attested wheel.
+3. Mount the verifier read-only and pipe the attestation on stdin to the final image.
+   Run as uid/gid 1000 from an empty `/tmp`, with networking disabled, all capabilities
+   dropped, `no-new-privileges`, bounded PIDs/memory/CPU, and a bounded `/tmp` tmpfs.
+4. Require both a zero exit and the exact
+   `mcp-built-image-e2e:sentinel:executed` line before the job proceeds to its existing
+   privileged host-root/token-ownership probes. Always remove the per-run image tag,
+   including when the verifier fails early.
+
+The container shape is intentionally ordinary `docker run`, not a shell inside the
+image. With `VERIFIER`, `ATTESTATION`, and `T4_TAG` set to job-local paths/values:
+
+```bash
+docker run --rm -i --network none \
+  --user 1000:1000 --workdir /tmp \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --pids-limit 128 --memory 768m --cpus 1 \
+  --tmpfs /tmp:size=64m \
+  --volume "${VERIFIER}:/opt/molecule-ci/mcp_built_image_e2e.py:ro" \
+  --entrypoint python3 "${T4_TAG}" \
+  /opt/molecule-ci/mcp_built_image_e2e.py < "${ATTESTATION}"
+```
+
+Hermes passes one additional fixed environment value,
+`MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin`, matching the base-runtime
+helper's sanctioned off-PATH Node override. All templates use the baked
+`/home/agent/.npm` cache and `/home/agent/.npmrc` under both the agent home and a foreign
+home; no registry credential is needed because resolution is strictly offline.
+
+This proof is Cartesian, not sampled: exact pin and compatible range under both the agent
+home and a foreign home (four JSON-RPC launches). Every launch must complete
+`initialize`, acknowledge initialization, answer `tools/list`, and expose the attested
+required tool. If `serverInfo.version` is emitted it must be bounded and identical across
+the four launches, but it is not the npm artifact version and must not be compared to the
+npm pin.
+
+Because existing Tier-4 probes use privileged host mounts, fork PRs must be skipped by an
+explicit fork guard before any privileged step, while internal PRs and `main` pushes must
+hard-require Tier-4 success through the aggregate rule above. Checkout credentials must
+not persist into any job that executes repository- or image-controlled code.
+
 ## Adding a runtime adapter
 
 1. Choose a RuntimeId that satisfies the open SDK contract. Do not add it to an allowlist.
