@@ -668,6 +668,33 @@ def _closes_control(unit: str) -> bool:
     return unit in {"fi", "done", "esac", "}", ")"}
 
 
+_SHELL_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_SHELL_REDIRECTION_RE = re.compile(
+    r"^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?"
+    r"(?P<operator>&>>|&>|<<<|<<-|<<|<>|>>|>&|<&|>\||>|<)"
+    r"(?P<target>.*)$"
+)
+
+
+def _skip_shell_assignments_and_redirections(
+    tokens: list[str], position: int
+) -> int:
+    """Skip simple-command prefixes while retaining the executable position."""
+
+    while position < len(tokens):
+        token = tokens[position]
+        if _SHELL_ASSIGNMENT_RE.fullmatch(token):
+            position += 1
+            continue
+        redirection = _SHELL_REDIRECTION_RE.fullmatch(token)
+        if redirection is None:
+            break
+        position += 1
+        if not redirection.group("target") and position < len(tokens):
+            position += 1
+    return position
+
+
 def _shell_command(unit: str) -> tuple[list[str], int] | None:
     try:
         tokens = shlex.split(unit, posix=True)
@@ -695,12 +722,57 @@ def _shell_command(unit: str) -> tuple[list[str], int] | None:
             position += 1
     if position < len(tokens) and tokens[position] == "!":
         position += 1
-    while position < len(tokens) and re.fullmatch(
-        r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
-    ):
-        position += 1
-    while position < len(tokens) and tokens[position] in {"builtin", "command"}:
-        position += 1
+    position = _skip_shell_assignments_and_redirections(tokens, position)
+    while position < len(tokens):
+        wrapper = tokens[position]
+        if wrapper == "builtin":
+            position += 1
+            if position < len(tokens) and tokens[position] == "--":
+                position += 1
+        elif wrapper == "command":
+            # `command -v/-V` queries a name rather than executing it. `-p` and
+            # `--` still wrap an executable command.
+            if position + 1 < len(tokens) and tokens[position + 1] in {"-v", "-V"}:
+                break
+            position += 1
+            while position < len(tokens) and tokens[position] in {"-p", "--"}:
+                position += 1
+        elif wrapper == "exec":
+            position += 1
+            while position < len(tokens):
+                option = tokens[position]
+                if option == "--":
+                    position += 1
+                    break
+                if option in {"-c", "-l"}:
+                    position += 1
+                    continue
+                if option == "-a" and position + 1 < len(tokens):
+                    position += 2
+                    continue
+                break
+        elif wrapper == "env":
+            position += 1
+            while position < len(tokens):
+                option = tokens[position]
+                if option == "--":
+                    position += 1
+                    break
+                if option in {"-i", "--ignore-environment", "-0", "--null"}:
+                    position += 1
+                    continue
+                if option in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
+                    if position + 1 >= len(tokens):
+                        return None
+                    position += 2
+                    continue
+                if re.match(r"^--(?:unset|chdir|argv0)=", option):
+                    position += 1
+                    continue
+                break
+        else:
+            break
+        position = _skip_shell_assignments_and_redirections(tokens, position)
     return (tokens, position) if position < len(tokens) else None
 
 
@@ -740,7 +812,8 @@ def _shell_command_segments(unit: str) -> list[str]:
             index += 1
             continue
         previous = unit[index - 1] if index else ""
-        if character == "&" and previous in {">", "<"}:
+        following = unit[index + 1] if index + 1 < len(unit) else ""
+        if character == "&" and (previous in {">", "<"} or following == ">"):
             index += 1
             continue
         segment = unit[start:index].strip()
@@ -858,7 +931,11 @@ def _script_units(script: str) -> list[_ShellUnit]:
         if not unit:
             continue
 
-        if re.match(r"^case(?:\s|$)", unit):
+        if any(
+            command is not None and command[0][command[1]] == "case"
+            for segment in _shell_command_segments(unit)
+            if (command := _shell_command(segment)) is not None
+        ):
             raise OfficialConsumerContractError(
                 "workflow script contains unsupported case control"
             )
@@ -1297,43 +1374,10 @@ def _contains_background_operator(unit: str) -> bool:
 
 def _uses_dynamic_command_dispatch(unit: str) -> bool:
     for segment in _shell_command_segments(unit):
-        try:
-            tokens = shlex.split(segment, posix=True)
-        except ValueError:
+        command = _shell_command(segment)
+        if command is None:
             continue
-        position = 0
-        while position < len(tokens) and tokens[position] in {
-            "(",
-            "{",
-            "do",
-            "else",
-            "then",
-        }:
-            position += 1
-        if position < len(tokens) and tokens[position] in {
-            "elif",
-            "if",
-            "until",
-            "while",
-        }:
-            position += 1
-        if position < len(tokens) and tokens[position] == "!":
-            position += 1
-        while position < len(tokens) and re.fullmatch(
-            r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
-        ):
-            position += 1
-        while position < len(tokens) and tokens[position] in {
-            "builtin",
-            "command",
-            "env",
-            "exec",
-        }:
-            position += 1
-            while position < len(tokens) and re.fullmatch(
-                r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
-            ):
-                position += 1
+        tokens, position = command
         if position < len(tokens) and any(
             marker in tokens[position] for marker in ("$", "`")
         ):

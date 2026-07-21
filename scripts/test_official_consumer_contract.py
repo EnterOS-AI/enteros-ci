@@ -1205,6 +1205,22 @@ def test_dynamic_dispatch_cannot_hide_after_a_command_separator() -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_shell_prefixes_cannot_hide_dynamic_command_dispatch() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b'          CMD="docker"\n'
+        b'          mark=1 2>/dev/null env FLAG=1 "$CMD" tag forged:image "$T4_TAG"\n'
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dynamic command dispatch",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_cleanup_function_cannot_hide_pre_sentinel_privilege() -> None:
     workflow = _workflow().replace(
         b"          set -euo pipefail\n",
@@ -1455,6 +1471,36 @@ def test_shell_word_concatenation_cannot_hide_final_image_replacement() -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        b'env MARK=1 docker tag forged:image "$T4_TAG"',
+        b'env -i MARK=1 docker tag forged:image "$T4_TAG"',
+        b'env --unset MARK docker tag forged:image "$T4_TAG"',
+        b'exec docker tag forged:image "$T4_TAG"',
+        b'exec -a docker docker tag forged:image "$T4_TAG"',
+        b'command -p docker tag forged:image "$T4_TAG"',
+        b'2>/dev/null docker tag forged:image "$T4_TAG"',
+        b'1> /dev/null docker tag forged:image "$T4_TAG"',
+        b'mark=1 docker tag forged:image "$T4_TAG"',
+        b'mark=1 2>/dev/null command docker tag forged:image "$T4_TAG"',
+    ),
+)
+def test_shell_prefixes_cannot_hide_final_image_replacement(
+    replacement: bytes,
+) -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          " + replacement + b"\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="same final image"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_verifier_copy_cannot_chain_an_unreviewed_overwrite() -> None:
     workflow = _workflow().replace(
         b'            "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"\n',
@@ -1566,6 +1612,22 @@ def test_case_arm_cannot_hide_required_command_functions() -> None:
         b"          case 1 in\n"
         b"            1) function docker { command true; }; "
         b"function grep { command true; } ;;\n"
+        b"          esac\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="unsupported case control"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_separator_prefix_cannot_hide_unsupported_case_control() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          :; case 1 in\n"
+        b"            1) : ;;\n"
         b"          esac\n",
         1,
     )
