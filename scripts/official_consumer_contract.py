@@ -458,17 +458,7 @@ def _validate_always_aggregate(job: dict[str, Any], name: str) -> None:
         if (
             variable_assignments != [assignment.group(0)]
             or re.search(rf"\$\{{{re.escape(variable)}(?::?[=+])", script)
-            or re.search(
-                r"(?m)^\s*(?:(?:builtin|command)\s+)?(?:eval|source|unset|read|"
-                r"readarray|mapfile|declare|typeset|local|readonly|export)\b",
-                script,
-            )
-            or re.search(r"(?m)^\s*\.\s+", script)
-            or re.search(r"(?m)^\s*printf\b[^\n]*\s-v(?:\s|$)", script)
-            or re.search(
-                r"(?m)^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{",
-                script,
-            )
+            or _contains_state_mutating_shell_command(units)
         ):
             saw_non_failing_assertion = True
             continue
@@ -599,6 +589,11 @@ _HEREDOC_RE = re.compile(
 _FUNCTION_HEADER_RE = re.compile(
     r"^(?:function\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{$"
 )
+_FUNCTION_DECLARATION_RE = re.compile(
+    r"^(?:function\s+(?P<function_name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*\(\s*\))?|(?P<paren_name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))"
+    r"(?=\s|\{|$)"
+)
 _REQUIRED_EXECUTABLES = frozenset(
     {"docker", "git", "grep", "mv", "python3", "sha256sum", "tee", "test"}
 )
@@ -679,7 +674,20 @@ def _shell_command(unit: str) -> tuple[list[str], int] | None:
     except ValueError:
         return None
     position = 0
-    if tokens[:1] == ["if"]:
+    while position < len(tokens) and tokens[position] in {
+        "(",
+        "{",
+        "do",
+        "else",
+        "then",
+    }:
+        position += 1
+    if position < len(tokens) and tokens[position] in {
+        "elif",
+        "if",
+        "until",
+        "while",
+    }:
         position += 1
     if position < len(tokens) and tokens[position] == "!":
         position += 1
@@ -690,6 +698,72 @@ def _shell_command(unit: str) -> tuple[list[str], int] | None:
     while position < len(tokens) and tokens[position] in {"builtin", "command"}:
         position += 1
     return (tokens, position) if position < len(tokens) else None
+
+
+def _shell_command_segments(unit: str) -> list[str]:
+    """Split a shell unit at unquoted command-list operators.
+
+    The contract does not execute a general shell parser.  This narrow scan is
+    only used to make security-sensitive declarations and builtins visible
+    even when an earlier no-op precedes them on the same physical line.
+    """
+
+    segments: list[str] = []
+    start = 0
+    single = False
+    double = False
+    escaped = False
+    index = 0
+    while index < len(unit):
+        character = unit[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and not single:
+            escaped = True
+            index += 1
+            continue
+        if character == "'" and not double:
+            single = not single
+            index += 1
+            continue
+        if character == '"' and not single:
+            double = not double
+            index += 1
+            continue
+        if single or double or character not in ";|&":
+            index += 1
+            continue
+        previous = unit[index - 1] if index else ""
+        if character == "&" and previous in {">", "<"}:
+            index += 1
+            continue
+        segment = unit[start:index].strip()
+        if segment:
+            segments.append(segment)
+        operator = character
+        index += 1
+        if index < len(unit) and unit[index] == operator:
+            index += 1
+        start = index
+    tail = unit[start:].strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _function_declaration_name(segment: str) -> str | None:
+    candidate = re.sub(
+        r"^(?:(?:\{|\(|!|then|do|else|if|elif|until|while)\s+|"
+        r"time(?:\s+-p)?\s+)+",
+        "",
+        segment.lstrip(),
+    )
+    match = _FUNCTION_DECLARATION_RE.match(candidate)
+    if match is None:
+        return None
+    return match.group("function_name") or match.group("paren_name")
 
 
 def _script_units(script: str) -> list[_ShellUnit]:
@@ -738,6 +812,20 @@ def _script_units(script: str) -> list[_ShellUnit]:
             in_function = True
             function_units = []
             continue
+        if not in_function:
+            declared_functions = [
+                name
+                for segment in _shell_command_segments(unit)
+                if (name := _function_declaration_name(segment)) is not None
+            ]
+            if declared_functions:
+                if any(name in _REQUIRED_EXECUTABLES for name in declared_functions):
+                    raise OfficialConsumerContractError(
+                        "workflow proof shadows a required executable"
+                    )
+                raise OfficialConsumerContractError(
+                    "workflow script contains an unsupported shell function"
+                )
         if in_function:
             if unit == "}":
                 _validate_cleanup_function(function_name, function_units)
@@ -749,14 +837,19 @@ def _script_units(script: str) -> list[_ShellUnit]:
                 function_units.append(unit)
             continue
 
-        command = _shell_command(unit)
-        if command is not None and command[0][command[1]] == "trap":
+        trap_segments = []
+        for segment in _shell_command_segments(unit):
+            command = _shell_command(segment)
+            if command is not None and command[0][command[1]] == "trap":
+                trap_segments.append(segment)
+        if trap_segments:
             trap = re.fullmatch(
                 r"trap (?P<function>cleanup_(?:mcp_e2e|mcp_proof_fetch|t4_build)) EXIT",
                 unit,
             )
-            if unit not in _SAFE_PROBE_TRAPS and (
-                trap is None or trap.group("function") not in safe_functions
+            if len(trap_segments) != 1 or (
+                unit not in _SAFE_PROBE_TRAPS
+                and (trap is None or trap.group("function") not in safe_functions)
             ):
                 raise OfficialConsumerContractError(
                     "workflow proof contains an unsupported exit trap"
@@ -798,6 +891,35 @@ def _script_units(script: str) -> list[_ShellUnit]:
 
 def _logical_units(script: str) -> list[str]:
     return [unit.text for unit in _script_units(script)]
+
+
+def _contains_state_mutating_shell_command(units: list[_ShellUnit]) -> bool:
+    mutating_commands = {
+        ".",
+        "declare",
+        "eval",
+        "export",
+        "local",
+        "mapfile",
+        "read",
+        "readarray",
+        "readonly",
+        "source",
+        "typeset",
+        "unset",
+    }
+    for unit in units:
+        for segment in _shell_command_segments(unit.text):
+            command = _shell_command(segment)
+            if command is None:
+                continue
+            tokens, command_index = command
+            name = tokens[command_index]
+            if name in mutating_commands or (
+                name == "printf" and "-v" in tokens[command_index + 1 :]
+            ):
+                return True
+    return False
 
 
 _MUTATING_COMMAND_RE = re.compile(
@@ -1056,34 +1178,36 @@ def _tokens(unit: str, label: str) -> list[str]:
 
 
 def _relaxes_fail_closed_shell_mode(unit: str) -> bool:
-    command = _shell_command(unit)
-    if command is None:
-        return False
-    tokens, command_index = command
-    if tokens[command_index] != "set":
-        return False
-    options = tokens[command_index + 1 :]
-    for index, token in enumerate(options):
-        if re.fullmatch(r"\+[A-Za-z]*[eu][A-Za-z]*", token):
-            return True
-        if token == "+o" and index + 1 < len(options):
-            if options[index + 1] in {"errexit", "nounset", "pipefail"}:
+    for segment in _shell_command_segments(unit):
+        command = _shell_command(segment)
+        if command is None:
+            continue
+        tokens, command_index = command
+        if tokens[command_index] != "set":
+            continue
+        options = tokens[command_index + 1 :]
+        for index, token in enumerate(options):
+            if re.fullmatch(r"\+[A-Za-z]*[eu][A-Za-z]*", token):
                 return True
+            if token == "+o" and index + 1 < len(options):
+                if options[index + 1] in {"errexit", "nounset", "pipefail"}:
+                    return True
     return False
 
 
 def _dangerous_shell_environment_override(unit: str) -> bool:
     if any(marker in unit for marker in ("$GITHUB_PATH", "${GITHUB_PATH}")):
         return True
-    command = _shell_command(unit)
-    if command is not None and command[0][command[1]] in {
-        "alias",
-        "enable",
-        "hash",
-        "shopt",
-        "unalias",
-    }:
-        return True
+    for segment in _shell_command_segments(unit):
+        command = _shell_command(segment)
+        if command is not None and command[0][command[1]] in {
+            "alias",
+            "enable",
+            "hash",
+            "shopt",
+            "unalias",
+        }:
+            return True
     if _EXACT_FETCH_RE.fullmatch(unit) is not None:
         return False
     assignments = re.finditer(r"(?<![A-Za-z0-9_])(?P<name>[A-Z_][A-Z0-9_]*)=", unit)
@@ -1107,33 +1231,49 @@ def _contains_background_operator(unit: str) -> bool:
 
 
 def _uses_dynamic_command_dispatch(unit: str) -> bool:
-    try:
-        tokens = shlex.split(unit, posix=True)
-    except ValueError:
-        return False
-    position = 0
-    if tokens[:1] == ["if"]:
-        position += 1
-    if position < len(tokens) and tokens[position] == "!":
-        position += 1
-    while position < len(tokens) and re.fullmatch(
-        r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
-    ):
-        position += 1
-    while position < len(tokens) and tokens[position] in {
-        "builtin",
-        "command",
-        "env",
-        "exec",
-    }:
-        position += 1
+    for segment in _shell_command_segments(unit):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        position = 0
+        while position < len(tokens) and tokens[position] in {
+            "(",
+            "{",
+            "do",
+            "else",
+            "then",
+        }:
+            position += 1
+        if position < len(tokens) and tokens[position] in {
+            "elif",
+            "if",
+            "until",
+            "while",
+        }:
+            position += 1
+        if position < len(tokens) and tokens[position] == "!":
+            position += 1
         while position < len(tokens) and re.fullmatch(
             r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
         ):
             position += 1
-    return position < len(tokens) and any(
-        marker in tokens[position] for marker in ("$", "`")
-    )
+        while position < len(tokens) and tokens[position] in {
+            "builtin",
+            "command",
+            "env",
+            "exec",
+        }:
+            position += 1
+            while position < len(tokens) and re.fullmatch(
+                r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
+            ):
+                position += 1
+        if position < len(tokens) and any(
+            marker in tokens[position] for marker in ("$", "`")
+        ):
+            return True
+    return False
 
 
 def _validate_pre_sentinel_shell(

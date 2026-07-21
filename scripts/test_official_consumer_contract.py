@@ -11,8 +11,8 @@ import pytest
 
 
 SCRIPT = Path(__file__).with_name("official_consumer_contract.py")
-VERIFIER_REF = "".join(("11b8598e5c0b3f0b1031733a8d5f6bc", "238f146a4"))
-CHECKOUT_REF = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+VERIFIER_REF = "".join(("11b8598e5c0b3f0b1031", "733a8d5f6bc238f146a4"))
+CHECKOUT_REF = "".join(("de0fac2e4500dabe0009", "e67214ff5f5447ce83dd"))
 
 
 def _load_module():
@@ -377,6 +377,36 @@ def test_always_aggregate_result_binding_cannot_be_rewritten(mutation: bytes) ->
     workflow = _workflow().replace(
         b'          t4="${{ needs.t4-conformance.result }}"\n',
         b'          t4="${{ needs.t4-conformance.result }}"\n' + mutation,
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="aggregate.*fail closed"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_always_aggregate_cannot_shadow_exit_with_alternate_function_syntax() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        b"          set -euo pipefail\n"
+        b"          function exit { command true; }\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="unsupported shell function"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_always_aggregate_cannot_hide_state_mutation_after_a_command_separator() -> None:
+    workflow = _workflow().replace(
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        b'          t4="${{ needs.t4-conformance.result }}"\n'
+        b"          :; eval 't4=success'\n",
         1,
     )
 
@@ -836,6 +866,19 @@ def test_proof_cannot_relax_fail_closed_shell_mode(relaxation: bytes) -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_proof_cannot_relax_fail_closed_mode_after_a_command_separator() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          :; set +e\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="relaxes fail-closed shell mode"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_post_sentinel_probe_can_manage_its_own_expected_failure() -> None:
     workflow = _workflow().replace(
         b"          KEEP_T4_IMAGE=1\n",
@@ -866,6 +909,21 @@ def test_proof_cannot_shadow_required_commands_with_builtin_hash() -> None:
     workflow = _workflow().replace(
         b'          git init "$CI_ROOT"\n',
         b"          builtin hash -p /tmp/attacker/git git\n"
+        b'          git init "$CI_ROOT"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dangerous environment override",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_proof_cannot_hide_builtin_hash_after_a_command_separator() -> None:
+    workflow = _workflow().replace(
+        b'          git init "$CI_ROOT"\n',
+        b"          :; builtin hash -p /tmp/attacker/git git\n"
         b'          git init "$CI_ROOT"\n',
         1,
     )
@@ -1082,6 +1140,22 @@ def test_dynamic_command_dispatch_cannot_hide_pre_sentinel_privilege() -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_dynamic_dispatch_cannot_hide_after_a_command_separator() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b'          CMD="docker"\n'
+        b"          :; \"$CMD\" run --privileged attacker/image:latest\n"
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dynamic command dispatch",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_cleanup_function_cannot_hide_pre_sentinel_privilege() -> None:
     workflow = _workflow().replace(
         b"          set -euo pipefail\n",
@@ -1111,6 +1185,29 @@ def test_exit_trap_cannot_mask_pre_sentinel_failures(trap: bytes) -> None:
     workflow = _workflow().replace(
         b"          docker create --interactive",
         b"          " + trap + b"\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="unsupported exit trap",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    "trap",
+    (
+        b":; trap 'exit 0' EXIT",
+        b":; { trap 'exit 0' EXIT; }",
+    ),
+)
+def test_inline_exit_trap_cannot_mask_a_pre_sentinel_failure(trap: bytes) -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          " + trap + b"\n"
+        b"          false\n"
+        b"          docker create --interactive",
         1,
     )
 
@@ -1298,6 +1395,80 @@ def test_proof_cannot_shadow_required_executables_with_shell_functions() -> None
         b"          docker() {\n"
         b"            command true\n"
         b"          }\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="shadows a required executable"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize("executable", (b"docker", b"grep"))
+def test_proof_cannot_shadow_required_executables_with_alternate_function_syntax(
+    executable: bytes,
+) -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          function " + executable + b" { command true; }\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="shadows a required executable"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_command_group_cannot_hide_an_inline_function_declaration() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          :; { function docker { command true; }; }\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="shadows a required executable"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize("control", (b"if", b"while"))
+def test_shell_control_cannot_hide_an_inline_function_declaration(
+    control: bytes,
+) -> None:
+    closing = b"then\n            :\n          fi" if control == b"if" else (
+        b"do\n            break\n          done"
+    )
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          "
+        + control
+        + b" function docker { command true; }\n          "
+        + closing
+        + b"\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="shadows a required executable"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize("prefix", (b"!", b"time", b"time -p"))
+def test_shell_reserved_prefix_cannot_hide_an_inline_function_declaration(
+    prefix: bytes,
+) -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          "
+        + prefix
+        + b" function docker { command true; }\n",
         1,
     )
 
