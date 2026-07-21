@@ -465,7 +465,7 @@ def test_run_bounded_uses_argv_without_shell_interpretation(tmp_path) -> None:
     result = built_image.run_bounded_process(
         [sys.executable, "-c", code, literal],
         input_bytes=b"",
-        env={"PATH": os.environ.get("PATH", "")},
+        env=os.environ.copy(),
         timeout_seconds=2,
         max_output_bytes=4096,
     )
@@ -482,7 +482,7 @@ def test_run_bounded_kills_a_timed_out_process_group() -> None:
         built_image.run_bounded_process(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             input_bytes=b"",
-            env={"PATH": os.environ.get("PATH", "")},
+            env=os.environ.copy(),
             timeout_seconds=0.1,
             max_output_bytes=4096,
         )
@@ -523,7 +523,7 @@ def test_run_bounded_cleans_the_process_group_after_success(monkeypatch) -> None
     result = built_image.run_bounded_process(
         [sys.executable, "-c", "print('done')"],
         input_bytes=b"",
-        env={"PATH": os.environ.get("PATH", "")},
+        env=os.environ.copy(),
         timeout_seconds=2,
         max_output_bytes=4096,
     )
@@ -537,7 +537,7 @@ def test_run_bounded_kills_a_process_that_exceeds_output_limit() -> None:
         built_image.run_bounded_process(
             [sys.executable, "-c", "print('x' * 10000)"],
             input_bytes=b"",
-            env={"PATH": os.environ.get("PATH", "")},
+            env=os.environ.copy(),
             timeout_seconds=2,
             max_output_bytes=1024,
         )
