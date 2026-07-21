@@ -74,8 +74,40 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
         step["run"] for step in archive["steps"] if "run" in step
     )
     assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
-    assert "git -C \"$fetch_dir\" archive \"$actual\"" in archive_runs
-    assert 'python3 scripts/meta-ci.py --repo-root "$archive_dir"' in archive_runs
+    assert "strict_json_loads" in archive_runs
+    assert 'git -C "$fetch_dir" show "$actual:.runtime-version"' in archive_runs
+    assert 'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
+    assert "mcp-pin-lockstep:sentinel:executed" in archive_runs
+    assert 'runtime_version="$(tr -d' in archive_runs
+    assert 'runtime_version" != "$fleet_version' in archive_runs
+    assert "official fleet runtime lockstep" in archive_runs
+    assert "git -C \"$fetch_dir\" archive" not in archive_runs
+    assert 'python3 scripts/meta-ci.py --repo-root "$proof_dir"' not in archive_runs
+    archive_gate = next(
+        step
+        for step in archive["steps"]
+        if step.get("name") == "Validate immutable consumer artifact pins"
+    )
+    assert archive_gate["env"] == {
+        "GIT_ASKPASS": "/bin/false",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    for job in (selftest, archive):
+        checkout = next(step for step in job["steps"] if "uses" in step)
+        assert checkout["with"]["persist-credentials"] is False
+
+
+def test_meta_ci_consumer_template_does_not_persist_checkout_credentials() -> None:
+    workflow = yaml.safe_load((ROOT / "templates" / "ci-meta.yml").read_text())
+    checkout = next(
+        step
+        for step in workflow["jobs"]["meta"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+
+    assert checkout["with"]["persist-credentials"] is False
 
 
 def test_readme_does_not_claim_the_retired_guard_is_active() -> None:

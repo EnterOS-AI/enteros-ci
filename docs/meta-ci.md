@@ -87,79 +87,59 @@ declared, but **fails closed** — it does not green-skip — when a repo that d
 lint/typecheck/build must never count as a passing leg; every step is also bounded by a
 `timeout`, so a hanging build fails rather than wedging the job).
 
-The MCP lockstep runner follows the artifact chain the image really consumes:
-the template's exact `.runtime-version` selects one runtime wheel and its published
-SHA-256; that wheel must contain the packaged executable platform constants and prebake
-helper, with an exact MCP pin that satisfies its compatible launch range; and the exact
-MCP npm tarball must exist with matching SHA-512/SHA-1 integrity and package identity.
-The source repo's top-level `contracts/mcp-plugin-delivery.contract.json` is not packaged
-in the wheel, so this runner does not claim to inspect it; SDK/runtime contract byte-sync
-remains its own gate. This runner checks the executable constants and helper the image
-actually consumes.
+The MCP artifact-lockstep runner is a credential-free, data-only pre-pull check.
+It follows the immutable metadata chain declared by the template pin:
 
-The template Dockerfile's **final delivered stage** must declare exactly one
-`ARG RUNTIME_VERSION` before the effective runtime-wheel download/install and directly
-execute the helper. A final-stage `ENV RUNTIME_VERSION` override or later ARG
-redefinition is rejected because it breaks the checked `.runtime-version` data flow.
-Proof found only in an earlier stage is rejected. The final stage must use Docker's
-default shell-form `RUN` executor; a custom `SHELL` is rejected because arbitrary shell
-executors cannot be proven from the command text alone. Docker heredoc instructions and
-non-default `# escape=` directives are likewise rejected so their bodies/continuations
-cannot masquerade as final-stage Docker instructions. The runner tokenizes the relevant
-shell commands and their immediate control edges, then checks that data flow. An unrelated
-compatibility command elsewhere in the same `RUN` may use `|| true`, but the recognized
-acquisition/delegation itself must remain fail-closed: pipelines, background/conditional
-execution, and `|| true` masks do not count. Evidence must be a top-level command, not a
-token inside an `if`, `case`, loop, command group, or never-called function. Prepared
-requirements and the runtime-project identity must come from top-level, persistent,
-failure-unmasked plain assignments. Pipeline/background/conditional assignment edges and
-declaration assignments (`export`/`readonly`/`local`/`declare`/`typeset`) invalidate proof;
-the latter can mask a failed command substitution. Reaching state remains valid only
-while the prepared requirement, `RUNTIME_VERSION`, and runtime-project identity are not
-unset, overwritten, augmented, or otherwise rebound. The shared reaching-state check
-also follows parent-shell writes from `printf -v`, `read`/`mapfile`/`readarray`,
-`wait -p`, `getopts`, `for`/`select` binders, and writes through
-`declare`/`local`/`typeset -n` namerefs. Dynamic write targets, unresolved namerefs,
-arithmetic mutation, traps, and `eval`/`source` forms invalidate proof instead of being
-guessed. Stateful builtins retain the same treatment when prefixed by the shell's
-`time` keyword; timing a mutation cannot hide it from the reaching-state gate. Errexit
-proof follows `set` option parsing only until `--` or the first positional argument, so
-a positional `-e` cannot masquerade as an enabled fail-closed shell. Only known Bash
-short/long `set` flags establish state; invalid flags and unsupported `-O` shopt forms
-cannot manufacture errexit evidence. A `set` command that enables no-exec mode rejects
-the whole shell proof because subsequent acquisition/delegation/check commands would be
-parsed but never run. Unconditional top-level green `exit`/`exec` controls and dynamic
-`eval`/`source` control before evidence are rejected for the same reason. A direct
-`|| { ...; exit <status>; }` branch counts only when the shell-normalized status is
-nonzero. `bash`/`sh` invocations accept only path-executing `-e`/`-u`/`-x` options;
-stdin, help/version, no-exec, command-string, comments, and `echo` forms are not helper
-execution. The packaged helper must likewise preserve effective reaching bindings from
-plain top-level, persistent, unmasked reads through `SPEC` and both top-level unmasked
-exact/range self-checks. Declaration, unset, augmented, nested, masked, or non-persistent
-helper writes invalidate that proof; exporting an already-proven binding without assigning
-a new value is allowed. The same implicit-write and nameref invalidation rules apply to
-helper bindings before `SPEC`. Explicit non-zero failure branches remain accepted.
+```text
+.runtime-version
+  -> trusted runtime-wheel URL + SHA-256 + wheel METADATA
+  -> declared MCP package/pin/range/registry/tool + packaged-helper SHA-256
+  -> exact trusted npm tarball + SHA-512/SHA-1 + package identity
+```
 
-Each required Python MCP constant must have exactly one top-level literal string binding
-in the published runtime module. Duplicate, dynamic, augmented, nested, annotated,
-named-expression, deleted, import, definition/argument, exception-target, wildcard-import,
-or pattern-capture bindings fail closed rather than preserving a stale earlier literal
-that differs from the module's executable value.
+The checker emits the full machine-readable attestation with
+`python3 scripts/mcp_pin_lockstep.py --repo-root <template> --json`. It accepts only
+an exact stable runtime version from a tiny non-symlink regular file, canonical
+same-origin public Gitea package URLs with no query material, bounded archives, one
+matching runtime wheel, unambiguous wheel identity headers, one literal declaration for
+each required metadata field, a non-empty packaged prebake helper, a compatible exact MCP
+pin, and an npm tarball whose integrity and package identity match the exact registry
+entry. Duplicate JSON keys, duplicate archive names, missing, malformed, oversized,
+unavailable, off-origin, or inconsistent data fail closed without echoing untrusted pin
+contents. The JSON records the exact wheel URL/SHA-256/helper digest and the verified npm
+packument URL, tarball URL, SHA-512 integrity, and legacy SHA-1 shasum.
 
-The same-repository self-test also reads the four official immutable consumer refs from
-`scripts/fixtures/meta-ci/official-consumers.json`, fetches each anonymously, exports a
-clean tree with `git archive`, and runs the checkout's canonical router against all four.
-This archive regression is an implementation gate for changes to the router; it does not
-promote the consumer advisory context or replace any template's live Tier-4 Docker gate.
+This static check intentionally does **not** read or interpret the Dockerfile, import the
+runtime module, execute the helper, run package-manager lifecycle scripts, or claim that
+the final image installed the attested wheel. Those are separate proof layers:
 
-All reads are anonymous, size/decompression bounded, and restricted to the exact public
-Molecule Gitea package origin (default/443 only, no userinfo). Every redirect is checked
-before it is followed. Transient transport failures, including truncated HTTP bodies,
-HTTP 429, and HTTP 5xx receive at most three 10-second attempts; authentication and other
-4xx responses fail immediately. Missing metadata, unavailable or malformed responses,
-compressed-archive expansion beyond the per-member/total caps, hash mismatch, pin/range
-skew, and a missing exact package all fail closed. This does not replace or relax the
-runtime-template's existing live Tier-4 Docker conformance gate.
+| Static artifact proof (this runner) | Required built-image Tier-4/E2E proof |
+|---|---|
+| `.runtime-version` is exact | Installed runtime distribution equals that version |
+| Wheel URL, SHA-256, and METADATA agree | Installed helper bytes equal the attested digest |
+| Wheel declares package, pin, range, registry, scope, and required tool | Imported executable values equal those declarations |
+| The helper member exists and has a digest | Exact and compatible-range launches resolve offline |
+| npm tarball integrity and identity agree | Agent and foreign-HOME launches expose the required tool with network disabled |
+
+Runtime release CI is the SSOT for helper implementation semantics. Template Tier-4 is
+the authority for final-image installation, later replacement/reinstall, cache ownership,
+and offline behavior. Keeping these boundaries explicit prevents a shell-text parser from
+being mistaken for executable image proof.
+
+The same-repository self-test reads the four official immutable consumer refs from
+`scripts/fixtures/meta-ci/official-consumers.json`. The artifact-pin job (whose legacy
+workflow key remains `official-consumer-archives`) rejects duplicate JSON fields, disables
+persisted checkout credentials, fetches each exact commit anonymously, reads only
+`.runtime-version` with `git show`, and invokes the standalone artifact checker against
+a one-file proof directory. The job also requires all four extracted runtime pins to be
+identical, so four individually valid templates cannot hide fleet drift. It never extracts
+or executes consumer repository code. A dedicated sentinel proves the checker actually
+ran.
+
+All registry reads are anonymous, size/decompression bounded, restricted to the exact
+public Molecule Gitea package origin (default/443 only, no userinfo), and redirect-checked.
+Transient transport failures, HTTP 429, and HTTP 5xx receive at most three bounded
+attempts; authentication and other 4xx responses fail immediately.
 
 The heavier language bundles
 (`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
@@ -173,7 +153,8 @@ commit a `repo-meta.yaml`. It anonymously fetches an immutable, verified commit
 of this SSOT and runs the canonical router with `continue-on-error: true` and
 **no explicit commit-status POST**, so it can never block a merge (its real
 router result lives in the job log while the advisory job exits green). Do
-**not** add it to branch-protection required contexts.
+**not** add it to branch-protection required contexts. The template also disables
+persisted checkout credentials before any repo-controlled runner executes.
 
 ### Why inline, not cross-repo `uses:`
 
