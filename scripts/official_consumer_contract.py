@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import stat
@@ -164,16 +165,25 @@ def _function_nodes(
 
 
 def _is_workflow_load(node: ast.AST) -> bool:
-    return (
+    if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "safe_load"
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "yaml"
-        and any(
-            isinstance(child, ast.Name) and child.id == "CI_WORKFLOW"
-            for child in ast.walk(node)
-        )
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        return False
+    source = node.args[0]
+    return (
+        isinstance(source, ast.Call)
+        and isinstance(source.func, ast.Attribute)
+        and source.func.attr == "read_text"
+        and isinstance(source.func.value, ast.Name)
+        and source.func.value.id == "CI_WORKFLOW"
+        and not source.args
+        and not source.keywords
     )
 
 
@@ -181,11 +191,7 @@ def _target_names(target: ast.AST) -> set[str]:
     if isinstance(target, ast.Name):
         return {target.id}
     if isinstance(target, (ast.List, ast.Tuple)):
-        return {
-            name
-            for element in target.elts
-            for name in _target_names(element)
-        }
+        return {name for element in target.elts for name in _target_names(element)}
     return set()
 
 
@@ -193,71 +199,206 @@ def _is_workflow_derived(
     expression: ast.AST,
     derived_names: set[str],
     derived_functions: set[str],
+    local_derived: frozenset[str] = frozenset(),
 ) -> bool:
-    for node in ast.walk(expression):
-        if _is_workflow_load(node):
-            return True
+    """Prove that an expression preserves parsed workflow data.
+
+    This intentionally supports only the selection and collection shapes used
+    by the official tests. Unknown transformations fail closed rather than
+    letting a literal decoy inherit provenance from an unrelated child node.
+    """
+
+    if _is_workflow_load(expression):
+        return True
+    if isinstance(expression, ast.Name):
+        return expression.id in derived_names or expression.id in local_derived
+    if isinstance(expression, ast.Subscript):
         if (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and node.id in derived_names
+            isinstance(expression.value, (ast.List, ast.Tuple))
+            and isinstance(expression.slice, ast.Constant)
+            and isinstance(expression.slice.value, int)
         ):
-            return True
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in derived_functions
-        ):
-            return True
+            elements = expression.value.elts
+            index = expression.slice.value
+            if -len(elements) <= index < len(elements):
+                return _is_workflow_derived(
+                    elements[index], derived_names, derived_functions, local_derived
+                )
+            return False
+        return _is_workflow_derived(
+            expression.value, derived_names, derived_functions, local_derived
+        )
+    if isinstance(expression, ast.Attribute):
+        return _is_workflow_derived(
+            expression.value, derived_names, derived_functions, local_derived
+        )
+    if isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
+        return bool(expression.elts) and all(
+            _is_workflow_derived(
+                element, derived_names, derived_functions, local_derived
+            )
+            for element in expression.elts
+        )
+    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        scope = set(local_derived)
+        has_derived_source = False
+        for generator in expression.generators:
+            if _is_workflow_derived(
+                generator.iter, derived_names, derived_functions, frozenset(scope)
+            ):
+                scope.update(_target_names(generator.target))
+                has_derived_source = True
+        return has_derived_source and _is_workflow_derived(
+            expression.elt, derived_names, derived_functions, frozenset(scope)
+        )
+    if isinstance(expression, ast.Call):
+        if isinstance(expression.func, ast.Name):
+            if expression.func.id in derived_functions:
+                return True
+            if expression.func.id in {
+                "enumerate",
+                "list",
+                "next",
+                "set",
+                "sorted",
+                "str",
+                "tuple",
+            }:
+                if (
+                    not expression.args
+                    or expression.keywords
+                    or (expression.func.id != "enumerate" and len(expression.args) != 1)
+                    or len(expression.args) > 2
+                ):
+                    return False
+                return _is_workflow_derived(
+                    expression.args[0],
+                    derived_names,
+                    derived_functions,
+                    local_derived,
+                )
+            return False
+        if isinstance(expression.func, ast.Attribute):
+            receiver_is_derived = _is_workflow_derived(
+                expression.func.value,
+                derived_names,
+                derived_functions,
+                local_derived,
+            )
+            if expression.func.attr == "get":
+                if (
+                    not receiver_is_derived
+                    or expression.keywords
+                    or len(expression.args) not in (1, 2)
+                ):
+                    return False
+                if len(expression.args) == 2:
+                    default = expression.args[1]
+                    if not (
+                        isinstance(default, ast.Constant)
+                        and default.value in (None, "")
+                    ):
+                        return False
+                return True
+            if expression.func.attr in {"copy", "items", "keys", "values"}:
+                return (
+                    receiver_is_derived
+                    and not expression.args
+                    and not expression.keywords
+                )
+        return False
+    if isinstance(expression, ast.UnaryOp):
+        return _is_workflow_derived(
+            expression.operand, derived_names, derived_functions, local_derived
+        )
+    if isinstance(expression, ast.BoolOp):
+        return bool(expression.values) and all(
+            _is_workflow_derived(value, derived_names, derived_functions, local_derived)
+            for value in expression.values
+        )
+    if isinstance(expression, ast.IfExp):
+        return all(
+            _is_workflow_derived(part, derived_names, derived_functions, local_derived)
+            for part in (expression.body, expression.orelse)
+        )
     return False
 
 
-def _workflow_derived_names(
+def _update_assignment_state(
+    targets: list[ast.AST],
+    value: ast.AST,
+    derived_names: set[str],
+    string_bindings: dict[str, tuple[str, ...]],
+    derived_functions: set[str],
+) -> None:
+    assigned = {name for target in targets for name in _target_names(target)}
+    value_is_derived = _is_workflow_derived(value, derived_names, derived_functions)
+    sequence = _static_string_sequence(value, string_bindings)
+    for name in assigned:
+        if value_is_derived:
+            derived_names.add(name)
+        else:
+            derived_names.discard(name)
+        if sequence is None:
+            string_bindings.pop(name, None)
+        else:
+            string_bindings[name] = sequence
+
+
+def _function_returns_workflow(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     derived_functions: set[str],
-) -> set[str]:
-    assignments: list[tuple[list[ast.AST], ast.AST]] = []
-    for node in _function_nodes(function):
-        if isinstance(node, ast.Assign):
-            assignments.append((node.targets, node.value))
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            assignments.append(([node.target], node.value))
+) -> bool:
+    returns = [
+        node for node in _function_nodes(function) if isinstance(node, ast.Return)
+    ]
+    if (
+        len(returns) != 1
+        or not function.body
+        or returns[0] is not function.body[-1]
+        or returns[0].value is None
+    ):
+        return False
 
     derived_names: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for targets, value in assignments:
-            if not _is_workflow_derived(value, derived_names, derived_functions):
-                continue
-            assigned = {
-                name for target in targets for name in _target_names(target)
-            }
-            if not assigned.issubset(derived_names):
-                derived_names.update(assigned)
-                changed = True
-    return derived_names
+    string_bindings: dict[str, tuple[str, ...]] = {}
+    for statement in function.body[:-1]:
+        if isinstance(statement, ast.Assign):
+            _update_assignment_state(
+                statement.targets,
+                statement.value,
+                derived_names,
+                string_bindings,
+                derived_functions,
+            )
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            _update_assignment_state(
+                [statement.target],
+                statement.value,
+                derived_names,
+                string_bindings,
+                derived_functions,
+            )
+        elif not isinstance(statement, (ast.Assert, ast.Expr, ast.Pass)):
+            for name in _stored_names(statement):
+                derived_names.discard(name)
+                string_bindings.pop(name, None)
+
+    return _is_workflow_derived(returns[0].value, derived_names, derived_functions)
 
 
 def _workflow_returning_functions(
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> set[str]:
     derived_functions: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
+    # Function provenance is monotonic and can grow at most once per function.
+    for _ in range(len(functions) + 1):
+        previous = set(derived_functions)
         for name, function in functions.items():
-            derived_names = _workflow_derived_names(function, derived_functions)
-            if any(
-                isinstance(node, ast.Return)
-                and node.value is not None
-                and _is_workflow_derived(
-                    node.value, derived_names, derived_functions
-                )
-                for node in _function_nodes(function)
-            ) and name not in derived_functions:
+            if _function_returns_workflow(function, derived_functions):
                 derived_functions.add(name)
-                changed = True
+        if derived_functions == previous:
+            break
     return derived_functions
 
 
@@ -271,11 +412,8 @@ def _comparison_parts(
     ]
 
 
-def _contains_name(expression: ast.AST, name: str) -> bool:
-    return any(
-        isinstance(node, ast.Name) and node.id == name
-        for node in ast.walk(expression)
-    )
+def _is_name(expression: ast.AST, name: str) -> bool:
+    return isinstance(expression, ast.Name) and expression.id == name
 
 
 def _asserts_name_against_workflow(
@@ -290,11 +428,11 @@ def _asserts_name_against_workflow(
     for left, operator, right in _comparison_parts(assertion.test):
         if not isinstance(operator, operator_types):
             continue
-        if _contains_name(left, name) and _is_workflow_derived(
+        if _is_name(left, name) and _is_workflow_derived(
             right, derived_names, derived_functions
         ):
             return True
-        if _contains_name(right, name) and _is_workflow_derived(
+        if _is_name(right, name) and _is_workflow_derived(
             left, derived_names, derived_functions
         ):
             return True
@@ -314,73 +452,164 @@ def _static_string_sequence(
     return tuple(value for value in values if value is not None)
 
 
-def _asserted_workflow_fragments(
-    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
-    derived_functions: set[str],
-) -> str:
-    asserted: list[str] = []
-    for function in functions:
-        nodes = _function_nodes(function)
-        derived_names = _workflow_derived_names(function, derived_functions)
-        bindings: dict[str, tuple[str, ...]] = {}
-        changed = True
-        while changed:
-            changed = False
-            for node in nodes:
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    continue
-                value = node.value
-                if value is None:
-                    continue
-                sequence = _static_string_sequence(value, bindings)
-                if sequence is None:
-                    continue
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    for name in _target_names(target):
-                        if bindings.get(name) != sequence:
-                            bindings[name] = sequence
-                            changed = True
+def _stored_names(node: ast.AST) -> set[str]:
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    }
 
-        for node in nodes:
-            if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare):
-                for left, operator, right in _comparison_parts(node.test):
-                    value = _static_string(left)
-                    if (
-                        isinstance(operator, ast.In)
-                        and value is not None
-                        and _is_workflow_derived(
-                            right, derived_names, derived_functions
-                        )
-                    ):
-                        asserted.append(value)
-            if not isinstance(node, (ast.For, ast.AsyncFor)):
-                continue
-            target_names = _target_names(node.target)
-            if len(target_names) != 1:
-                continue
-            target_name = next(iter(target_names))
-            sequence = _static_string_sequence(node.iter, bindings)
-            if sequence is None:
-                continue
-            loop_assertions = [
-                child for child in ast.walk(node) if isinstance(child, ast.Assert)
-            ]
-            if any(
-                isinstance(assertion.test, ast.Compare)
-                and any(
-                    isinstance(operator, ast.In)
-                    and isinstance(left, ast.Name)
-                    and left.id == target_name
-                    and _is_workflow_derived(
-                        right, derived_names, derived_functions
-                    )
-                    for left, operator, right in _comparison_parts(assertion.test)
-                )
-                for assertion in loop_assertions
-            ):
-                asserted.extend(sequence)
-    return " ".join(asserted)
+
+def _has_workflow_source(expression: ast.AST, derived_functions: set[str]) -> bool:
+    return any(
+        _is_workflow_load(node)
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in derived_functions
+        )
+        for node in ast.walk(expression)
+    )
+
+
+@dataclass
+class _FunctionEvidence:
+    saw_workflow_load: bool = False
+    asserted_ref: bool = False
+    asserted_fork: bool = False
+    asserted_no_volume: bool = False
+    asserted_fragments: list[str] = field(default_factory=list)
+
+
+def _record_assertion(
+    evidence: _FunctionEvidence,
+    assertion: ast.Assert,
+    derived_names: set[str],
+    derived_functions: set[str],
+) -> None:
+    if not isinstance(assertion.test, ast.Compare):
+        return
+    if _asserts_name_against_workflow(
+        assertion,
+        "MOLECULE_CI_REF",
+        (ast.Eq,),
+        derived_names,
+        derived_functions,
+    ):
+        evidence.asserted_ref = True
+    if _asserts_name_against_workflow(
+        assertion,
+        "FORK_RUN",
+        (ast.Eq, ast.In),
+        derived_names,
+        derived_functions,
+    ):
+        evidence.asserted_fork = True
+    for left, operator, right in _comparison_parts(assertion.test):
+        if (
+            isinstance(operator, ast.NotIn)
+            and _static_string(left) == "--volume"
+            and _is_workflow_derived(right, derived_names, derived_functions)
+        ):
+            evidence.asserted_no_volume = True
+        value = _static_string(left)
+        if (
+            isinstance(operator, ast.In)
+            and value is not None
+            and _is_workflow_derived(right, derived_names, derived_functions)
+        ):
+            evidence.asserted_fragments.append(value)
+
+
+def _record_static_loop_assertions(
+    evidence: _FunctionEvidence,
+    loop: ast.For | ast.AsyncFor,
+    string_bindings: dict[str, tuple[str, ...]],
+    derived_names: set[str],
+    derived_functions: set[str],
+) -> None:
+    target_names = _target_names(loop.target)
+    sequence = _static_string_sequence(loop.iter, string_bindings)
+    if (
+        len(target_names) != 1
+        or not sequence
+        or loop.orelse
+        or not loop.body
+        or not all(isinstance(statement, ast.Assert) for statement in loop.body)
+    ):
+        return
+    target_name = next(iter(target_names))
+    for assertion in loop.body:
+        _record_assertion(evidence, assertion, derived_names, derived_functions)
+        if not isinstance(assertion.test, ast.Compare):
+            continue
+        if any(
+            isinstance(operator, ast.In)
+            and _is_name(left, target_name)
+            and _is_workflow_derived(right, derived_names, derived_functions)
+            for left, operator, right in _comparison_parts(assertion.test)
+        ):
+            evidence.asserted_fragments.extend(sequence)
+
+
+def _function_evidence(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    derived_functions: set[str],
+) -> _FunctionEvidence:
+    """Collect guaranteed evidence in source order from one regression test.
+
+    Only direct top-level assertions and non-empty static loops whose bodies
+    contain assertions exclusively are guaranteed. Conditional/nested evidence
+    is ignored, and any assignment replaces the prior provenance for its name.
+    """
+
+    evidence = _FunctionEvidence()
+    derived_names: set[str] = set()
+    string_bindings: dict[str, tuple[str, ...]] = {}
+
+    for statement in function.body:
+        if isinstance(statement, ast.Assign):
+            evidence.saw_workflow_load |= _has_workflow_source(
+                statement.value, derived_functions
+            )
+            _update_assignment_state(
+                statement.targets,
+                statement.value,
+                derived_names,
+                string_bindings,
+                derived_functions,
+            )
+            continue
+        if isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            evidence.saw_workflow_load |= _has_workflow_source(
+                statement.value, derived_functions
+            )
+            _update_assignment_state(
+                [statement.target],
+                statement.value,
+                derived_names,
+                string_bindings,
+                derived_functions,
+            )
+            continue
+        if isinstance(statement, ast.Assert):
+            _record_assertion(evidence, statement, derived_names, derived_functions)
+            continue
+        if isinstance(statement, (ast.For, ast.AsyncFor)):
+            _record_static_loop_assertions(
+                evidence,
+                statement,
+                string_bindings,
+                derived_names,
+                derived_functions,
+            )
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            break
+        for name in _stored_names(statement):
+            derived_names.discard(name)
+            string_bindings.pop(name, None)
+
+    return evidence
 
 
 def _validate_workflow(workflow: str) -> None:
@@ -423,6 +652,10 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
         )
 
     required_functions = [functions[name] for name in required_names]
+    if any(function.decorator_list for function in required_functions):
+        raise OfficialConsumerContractError(
+            "required regression test is not guaranteed to execute"
+        )
     if any(
         not any(isinstance(node, ast.Assert) for node in ast.walk(function))
         for function in required_functions
@@ -431,73 +664,30 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
             "required regression test contains no assertions"
         )
 
-    required_nodes = [
-        node for function in required_functions for node in _function_nodes(function)
+    evidence = [
+        _function_evidence(function, derived_functions)
+        for function in required_functions
     ]
-    workflow_loads = [
-        node
-        for node in required_nodes
-        if _is_workflow_load(node)
-    ]
-    if not workflow_loads:
+    if not any(item.saw_workflow_load for item in evidence):
         raise OfficialConsumerContractError(
             "required regression test does not statically read the CI workflow"
         )
 
-    derived_names = {
-        function.name: _workflow_derived_names(function, derived_functions)
-        for function in required_functions
-    }
-    if not any(
-        _asserts_name_against_workflow(
-            assertion,
-            "MOLECULE_CI_REF",
-            (ast.Eq,),
-            derived_names[function.name],
-            derived_functions,
-        )
-        for function in required_functions
-        for assertion in _function_nodes(function)
-        if isinstance(assertion, ast.Assert)
-    ):
+    if not any(item.asserted_ref for item in evidence):
         raise OfficialConsumerContractError(
             "required regression test does not compare the immutable verifier ref"
         )
-    if not any(
-        _asserts_name_against_workflow(
-            assertion,
-            "FORK_RUN",
-            (ast.Eq, ast.In),
-            derived_names[function.name],
-            derived_functions,
-        )
-        for function in required_functions
-        for assertion in _function_nodes(function)
-        if isinstance(assertion, ast.Assert)
-    ):
+    if not any(item.asserted_fork for item in evidence):
         raise OfficialConsumerContractError(
             "required regression test does not assert the non-fork guard"
         )
-    if not any(
-        isinstance(assertion.test, ast.Compare)
-        and any(
-            isinstance(operator, ast.NotIn)
-            and _static_string(left) == "--volume"
-            and _is_workflow_derived(
-                right, derived_names[function.name], derived_functions
-            )
-            for left, operator, right in _comparison_parts(assertion.test)
-        )
-        for function in required_functions
-        for assertion in _function_nodes(function)
-        if isinstance(assertion, ast.Assert)
-    ):
+    if not any(item.asserted_no_volume for item in evidence):
         raise OfficialConsumerContractError(
             "required regression test does not reject verifier bind mounts"
         )
 
     _require_fragments(
-        _asserted_workflow_fragments(required_functions, derived_functions),
+        " ".join(fragment for item in evidence for fragment in item.asserted_fragments),
         _TEST_FRAGMENTS,
         "test",
     )

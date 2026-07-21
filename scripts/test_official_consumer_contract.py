@@ -202,8 +202,7 @@ def test_required_regression_test_must_assert_the_hardening_contract() -> None:
 
 def test_dead_fragment_tuple_and_truthiness_assertion_fail_closed() -> None:
     test_contract = _test_contract("codex").replace(
-        b"    for fragment in required_fragments:\n"
-        b"        assert fragment in build\n",
+        b"    for fragment in required_fragments:\n        assert fragment in build\n",
         b"    assert required_fragments\n",
         1,
     )
@@ -217,8 +216,7 @@ def test_dead_fragment_tuple_and_truthiness_assertion_fail_closed() -> None:
 
 def test_fragment_assertions_must_target_parsed_workflow_data() -> None:
     test_contract = _test_contract("codex").replace(
-        b"    for fragment in required_fragments:\n"
-        b"        assert fragment in build\n",
+        b"    for fragment in required_fragments:\n        assert fragment in build\n",
         b'    decoy = " ".join(required_fragments)\n'
         b"    for fragment in required_fragments:\n"
         b"        assert fragment in decoy\n",
@@ -230,6 +228,79 @@ def test_fragment_assertions_must_target_parsed_workflow_data() -> None:
         match="test contract is missing required final-image MCP assertions",
     ):
         contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_post_derivation_overwrite_with_decoy_fails_closed() -> None:
+    test_contract = _test_contract("codex").replace(
+        b"    assert workflow_ref == MOLECULE_CI_REF\n",
+        b'    build = " ".join(required_fragments) + " " + FORK_RUN\n'
+        b"    assert workflow_ref == MOLECULE_CI_REF\n",
+        1,
+    )
+
+    with pytest.raises(contract.OfficialConsumerContractError):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_assertions_under_if_false_fail_closed() -> None:
+    enforced = (
+        b"    assert workflow_ref == MOLECULE_CI_REF\n"
+        b"    assert FORK_RUN in build\n"
+        b"    for fragment in required_fragments:\n"
+        b"        assert fragment in build\n"
+        b'    assert "--volume" not in build\n'
+    )
+    unreachable = (
+        b"    if False:\n"
+        b"        assert workflow_ref == MOLECULE_CI_REF\n"
+        b"        assert FORK_RUN in build\n"
+        b"        for fragment in required_fragments:\n"
+        b"            assert fragment in build\n"
+        b'        assert "--volume" not in build\n'
+    )
+    test_contract = _test_contract("codex").replace(enforced, unreachable, 1)
+
+    with pytest.raises(contract.OfficialConsumerContractError):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_reassigned_fragment_sequence_terminates_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    test_contract = _test_contract("codex").replace(
+        b"    assert workflow_ref == MOLECULE_CI_REF\n",
+        b'    required_fragments = ("replacement",)\n'
+        b"    assert workflow_ref == MOLECULE_CI_REF\n",
+        1,
+    )
+    repo = tmp_path / "consumer"
+    workflow = repo / ".gitea" / "workflows" / "ci.yml"
+    tests = repo / "tests"
+    workflow.parent.mkdir(parents=True)
+    tests.mkdir()
+    workflow.write_bytes(_workflow())
+    tests.joinpath("test_ci_runtime_image_pin.py").write_bytes(test_contract)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--consumer",
+            "codex",
+            "--repo-root",
+            str(repo),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "test contract is missing required final-image MCP assertions" in result.stderr
+    )
+    assert result.stdout == ""
 
 
 @pytest.mark.parametrize(
