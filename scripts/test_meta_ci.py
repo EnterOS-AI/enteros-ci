@@ -311,6 +311,50 @@ def test_node_step_timeout_fails_not_hangs(tmp_path, monkeypatch):
     assert "timed out" in detail.lower()
 
 
+
+# --- mcp artifact lockstep runner ------------------------------------------
+def test_mcp_server_bake_selects_executable_artifact_lockstep_bundle():
+    manifest = {
+        "schema_version": 1,
+        "layer": "runtime-template",
+        "capabilities": ["mcp-server-bake"],
+    }
+
+    plan = meta.derive_bundles(manifest)
+
+    assert "mcp-pin-lockstep" in plan["bundles_effective"]
+    assert meta.EXECUTABLE_RUNNERS["mcp-pin-lockstep"] is meta._run_mcp_pin_lockstep
+
+
+def test_mcp_runner_delegates_only_to_static_artifact_checker(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(repo_root):
+        calls.append(repo_root)
+        return True, "static artifact attestation"
+
+    monkeypatch.setattr(meta.mcp_pin_lockstep, "run", fake_run)
+
+    assert meta._run_mcp_pin_lockstep(tmp_path) == (
+        True,
+        "static artifact attestation",
+    )
+    assert calls == [tmp_path]
+
+
+def test_cli_mcp_bundle_fails_closed_before_network_without_runtime_pin(tmp_path):
+    (tmp_path / "repo-meta.yaml").write_text(
+        "schema_version: 1\n"
+        "layer: runtime-template\n"
+        "capabilities: [mcp-server-bake]\n"
+    )
+
+    proc = _run_cli(tmp_path)
+
+    assert proc.returncode == 1
+    assert "FAIL    mcp-pin-lockstep" in proc.stdout
+    assert ".runtime-version" in proc.stdout
+
 # --- CLI end-to-end (the exact entrypoint CI runs) -------------------------
 def _run_cli(repo_root: Path, *extra):
     return subprocess.run(

@@ -79,12 +79,70 @@ as a `frontend` capability then.
 
 The "matrix" runs **in-process** inside `meta-ci.py` (a loop), so exactly **one**
 aggregate context is produced — not one-per-leg. Phase 1 executes the bundle runners that
-are safe to run in-repo: `secret-scan` and the `node-install-lint-typecheck-build` bundle
-(the latter no-ops to a clean pass when there is no `package.json` or a script is not
+are safe to run in-repo: `secret-scan`, `node-install-lint-typecheck-build`, and
+`mcp-pin-lockstep`. The Node bundle
+(which no-ops to a clean pass when there is no `package.json` or a script is not
 declared, but **fails closed** — it does not green-skip — when a repo that declares
 `node-package` runs on a runner missing the package manager, because an unrun
 lint/typecheck/build must never count as a passing leg; every step is also bounded by a
-`timeout`, so a hanging build fails rather than wedging the job). The heavier language bundles
+`timeout`, so a hanging build fails rather than wedging the job).
+
+The MCP artifact-lockstep runner is a credential-free, data-only pre-pull check.
+It follows the immutable metadata chain declared by the template pin:
+
+```text
+.runtime-version
+  -> trusted runtime-wheel URL + SHA-256 + wheel METADATA
+  -> declared MCP package/pin/range/registry/tool + packaged-helper SHA-256
+  -> exact trusted npm tarball + SHA-512/SHA-1 + package identity
+```
+
+The checker emits the full machine-readable attestation with
+`python3 scripts/mcp_pin_lockstep.py --repo-root <template> --json`. It accepts only
+an exact stable runtime version from a tiny non-symlink regular file, canonical
+same-origin public Gitea package URLs with no query material, complete HTTP 200
+responses with bounded framing, bounded archives, one
+matching runtime wheel, unambiguous wheel identity headers, one literal declaration for
+each required metadata field, a non-empty packaged prebake helper, a compatible exact MCP
+pin, and an npm tarball whose integrity and package identity match the exact registry
+entry. Duplicate JSON keys, duplicate archive names, missing, malformed, oversized,
+unavailable, off-origin, or inconsistent data fail closed without echoing untrusted pin
+contents. The JSON records the exact wheel URL/SHA-256/helper digest and the verified npm
+packument URL, tarball URL, SHA-512 integrity, and legacy SHA-1 shasum.
+
+This static check intentionally does **not** read or interpret the Dockerfile, import the
+runtime module, execute the helper, run package-manager lifecycle scripts, or claim that
+the final image installed the attested wheel. Those are separate proof layers:
+
+| Static artifact proof (this runner) | Required built-image Tier-4/E2E proof |
+|---|---|
+| `.runtime-version` is exact | Installed runtime distribution equals that version |
+| Wheel URL, SHA-256, and METADATA agree | Installed helper bytes equal the attested digest |
+| Wheel declares package, pin, range, registry, scope, and required tool | Imported executable values equal those declarations |
+| The helper member exists and has a digest | Exact and compatible-range launches resolve offline |
+| npm tarball integrity and identity agree | Agent and foreign-HOME launches expose the required tool with network disabled |
+
+Runtime release CI is the SSOT for helper implementation semantics. Template Tier-4 is
+the authority for final-image installation, later replacement/reinstall, cache ownership,
+and offline behavior. Keeping these boundaries explicit prevents a shell-text parser from
+being mistaken for executable image proof.
+
+The same-repository self-test reads the four official immutable consumer refs from
+`scripts/fixtures/meta-ci/official-consumers.json`. The artifact-pin job (whose legacy
+workflow key remains `official-consumer-archives`) rejects duplicate JSON fields, disables
+persisted checkout credentials, fetches each exact commit anonymously, reads only
+`.runtime-version` with `git show`, and invokes the standalone artifact checker against
+a one-file proof directory. The job also requires all four extracted runtime pins to be
+identical, so four individually valid templates cannot hide fleet drift. It never extracts
+or executes consumer repository code. A dedicated sentinel proves the checker actually
+ran.
+
+All registry reads are anonymous, size/decompression bounded, restricted to the exact
+public Molecule Gitea package origin (default/443 only, no userinfo), and redirect-checked.
+Transient transport failures, HTTP 429, and HTTP 5xx receive at most three bounded
+attempts; authentication and other 4xx responses fail immediately.
+
+The heavier language bundles
 (`go-build-vet-lint-test`, `py-ruff-pytest-build`, `docker-build-smoke`, `t4-assert`, …)
 stay reported as `planned (execution wired in Phase 2)`. The aggregate is: manifest-valid
 AND every executed runner green. This is deliberately capture-first / enforce-later.
@@ -96,7 +154,8 @@ commit a `repo-meta.yaml`. It anonymously fetches an immutable, verified commit
 of this SSOT and runs the canonical router with `continue-on-error: true` and
 **no explicit commit-status POST**, so it can never block a merge (its real
 router result lives in the job log while the advisory job exits green). Do
-**not** add it to branch-protection required contexts.
+**not** add it to branch-protection required contexts. The template also disables
+persisted checkout credentials before any repo-controlled runner executes.
 
 ### Why inline, not cross-repo `uses:`
 

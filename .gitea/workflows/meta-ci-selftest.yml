@@ -3,12 +3,16 @@ name: meta-ci-selftest
 # Direct, read-only proof of the canonical router and its execution sentinel.
 # Consumers use the inline templates/ci-meta.yml shape; no workflow_call is
 # exposed or relied upon.
+# The artifact job separately fetches the four official consumers at immutable
+# commits, reads only .runtime-version, and runs this checkout's data-only checker.
 
 on:
   pull_request:
     paths:
       - "scripts/meta-ci.py"
       - "scripts/test_meta_ci.py"
+      - "scripts/mcp_pin_lockstep.py"
+      - "scripts/test_mcp_pin_lockstep.py"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -17,6 +21,8 @@ on:
     paths:
       - "scripts/meta-ci.py"
       - "scripts/test_meta_ci.py"
+      - "scripts/mcp_pin_lockstep.py"
+      - "scripts/test_mcp_pin_lockstep.py"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -32,6 +38,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.11"
@@ -43,5 +51,123 @@ jobs:
             | tee /tmp/meta-ci.log
       - name: Assert execution sentinel
         run: grep -qxF 'meta-ci:sentinel:executed' /tmp/meta-ci.log
+
+  official-consumer-archives:
+    name: official consumer archives
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.11"
+      - name: Validate immutable consumer artifact pins
+        env:
+          GIT_ASKPASS: /bin/false
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d)
+          trap 'rm -rf "$root"' EXIT
+          fleet_version=""
+
+          python3 - <<'PY' > "$root/consumers.tsv"
+          import re
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          from mcp_pin_lockstep import strict_json_loads
+
+          records = strict_json_loads(
+              Path("scripts/fixtures/meta-ci/official-consumers.json").read_bytes(),
+              "official consumer manifest",
+          )
+          expected = {"claude-code", "codex", "openclaw", "hermes"}
+          if (
+              not isinstance(records, list)
+              or len(records) != 4
+              or any(not isinstance(record, dict) for record in records)
+              or {record.get("name") for record in records} != expected
+          ):
+              raise SystemExit("official consumer manifest must name exactly four consumers")
+          for record in records:
+              if set(record) != {"name", "repository", "commit"}:
+                  raise SystemExit(f"unexpected consumer fields: {sorted(record)}")
+              expected_repository = f"molecule-ai-workspace-template-{record['name']}"
+              if record["repository"] != expected_repository:
+                  raise SystemExit(f"invalid consumer repository: {record['repository']}")
+              if not re.fullmatch(r"[0-9a-f]{40}", record["commit"]):
+                  raise SystemExit(f"consumer ref is not an immutable commit: {record['name']}")
+              print(record["name"], record["repository"], record["commit"], sep="\t")
+          PY
+
+          while IFS=$'\t' read -r name repository commit; do
+            printf 'validating %s at %s\n' "$name" "$commit"
+            fetch_dir="$root/$name.fetch"
+            proof_dir="$root/$name.proof"
+            git init -q "$fetch_dir"
+            git -C "$fetch_dir" remote add origin \
+              "https://git.moleculesai.app/molecule-ai/${repository}.git"
+
+            fetched=false
+            for attempt in 1 2 3; do
+              if git -c http.userAgent=curl/8.4.0 -C "$fetch_dir" fetch \
+                --no-tags --depth 1 origin "$commit"; then
+                fetched=true
+                break
+              fi
+              sleep "$attempt"
+            done
+            if [ "$fetched" != true ]; then
+              echo "failed to fetch immutable consumer $name@$commit" >&2
+              exit 1
+            fi
+
+            actual=$(git -C "$fetch_dir" rev-parse FETCH_HEAD)
+            if [ "$actual" != "$commit" ]; then
+              echo "consumer ref mismatch: expected $commit, fetched $actual" >&2
+              exit 1
+            fi
+            mkdir "$proof_dir"
+            git -C "$fetch_dir" show "$actual:.runtime-version" \
+              > "$proof_dir/.runtime-version"
+            test "$(find "$proof_dir" -type f | wc -l | tr -d ' ')" = 1
+            attestation="$root/$name.lockstep.json"
+            python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" --json \
+              > "$attestation"
+            runtime_version="$(python3 - "$attestation" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          if payload.get("checker_sentinel") != "mcp-pin-lockstep:sentinel:executed":
+              raise SystemExit("MCP lockstep checker sentinel missing")
+          runtime = payload.get("runtime")
+          version = runtime.get("version") if isinstance(runtime, dict) else None
+          if not isinstance(version, str) or not re.fullmatch(
+              r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version
+          ):
+              raise SystemExit("MCP lockstep attestation runtime is invalid")
+          sys.stdout.write(version)
+          PY
+            )"
+            if [ -z "$fleet_version" ]; then
+              fleet_version="$runtime_version"
+            elif [ "$runtime_version" != "$fleet_version" ]; then
+              echo "official consumer runtime drift: $name differs from fleet" >&2
+              exit 1
+            fi
+          done < "$root/consumers.tsv"
+          test -n "$fleet_version"
+          printf 'official fleet runtime lockstep: %s\n' "$fleet_version"
 
 # reschedule: prior run stuck on the docker-less deploy runner (internal#1058)

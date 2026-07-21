@@ -1,0 +1,22 @@
+[
+  {
+    "name": "claude-code",
+    "repository": "molecule-ai-workspace-template-claude-code",
+    "commit": "b9a730f0d5263c77a7bb2f6f4165e4960560dd3b"
+  },
+  {
+    "name": "codex",
+    "repository": "molecule-ai-workspace-template-codex",
+    "commit": "df8cedabd258256eddb731e1bcc86ee11cdf4130"
+  },
+  {
+    "name": "openclaw",
+    "repository": "molecule-ai-workspace-template-openclaw",
+    "commit": "4c9656f19fbde1d9276253c99d437cba75d24ae6"
+  },
+  {
+    "name": "hermes",
+    "repository": "molecule-ai-workspace-template-hermes",
+    "commit": "973d39e744e1f9451a995cc4605928f7ae373b07"
+  }
+]

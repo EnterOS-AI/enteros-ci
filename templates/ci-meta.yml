@@ -50,7 +50,11 @@ jobs:
     # governs whether THIS job's red blocks the PR (it does not).
     continue-on-error: true
     steps:
+      # Repo-controlled runners execute below, so never leave checkout auth in
+      # .git/config where a crafted repository file could read and print it.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+        with:
+          persist-credentials: false
       # Fetch the molecule-ci SSOT by immutable SHA; run the CANONICAL scripts/meta-ci.py
       # (schemas/ is its sibling there, so schema validation is intact). Direct
       # immutable SHA fetch avoids unsupported cross-repository workflow/action resolution

@@ -20,10 +20,10 @@ runners. It:
   * schema-validates ``repo-meta.yaml`` (a malformed manifest is a HARD error), then
   * derives + prints the bundle PLAN (which bundles attach, and why), then
   * EXECUTES the bundle runners that are already canonical + safe to run in-repo
-    (today: ``secret-scan`` and the self-guarding ``node-install-lint-typecheck-build``
-    node bundle), and REPORTS the rest as ``planned`` (execution wired in Phase 2 —
-    this file deliberately does not fork heavy go / docker-build / t4 / codegen
-    bundles yet).
+    (today: ``secret-scan``, the self-guarding ``node-install-lint-typecheck-build``
+    node bundle, and credential-free immutable-artifact ``mcp-pin-lockstep``), and
+    REPORTS the rest as ``planned`` (execution wired in Phase 2 — this file
+    deliberately does not fork heavy go / docker-build / t4 / codegen bundles yet).
 
 The aggregate result is: manifest-valid AND every EXECUTED runner passed. ``planned``
 bundles are surfaced but neutral. This keeps the advisory spine honest — it reds a
@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import importlib.util
 import json
 import re
 import shutil
@@ -65,6 +66,21 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_mcp_pin_lockstep():
+    path = _SCRIPT_DIR / "mcp_pin_lockstep.py"
+    spec = importlib.util.spec_from_file_location("mcp_pin_lockstep", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load static MCP artifact checker: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+mcp_pin_lockstep = _load_mcp_pin_lockstep()
 
 SENTINEL = "meta-ci:sentinel:executed"  # printed once; proves this script actually ran.
 
@@ -108,7 +124,6 @@ LAYERS = frozenset(LAYER_BUNDLES)
 CAPABILITY_RE = re.compile(r"^(x-)?[a-z0-9]+(-[a-z0-9]+)*$")
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "repo-meta.schema.json"
-
 
 class MetaCIError(Exception):
     """Fatal, well-formed error (usage / environment). Maps to exit 2."""
@@ -401,14 +416,26 @@ def _run_node_package(repo_root: Path) -> tuple[bool, str]:
     return True, f"{manager}: installed; no lint/typecheck/build scripts declared"
 
 
+# ---------------------------------------------------------------------------
+# mcp-server-bake artifact runner.
+#
+# The standalone checker is deliberately data-only: it reads .runtime-version,
+# trusted registry metadata, and bounded archive members. It never executes the
+# consumer checkout, Dockerfile, wheel module, or packaged helper. Runtime release
+# tests own helper semantics and template Tier-4 owns the final built image.
+# ---------------------------------------------------------------------------
+def _run_mcp_pin_lockstep(repo_root: Path) -> tuple[bool, str]:
+    return mcp_pin_lockstep.run(repo_root)
+
+
 # Runner table: bundle -> callable(repo_root)->(ok, detail). Bundles absent here are
 # 'planned' — reported but not executed in Phase 1 (execution wired in Phase 2). The
-# node bundle is executed now (not planned) because it no-ops safely where there is
-# no package.json / no declared script, fails closed on a missing manager, and bounds
-# every step with a timeout — see its definition above.
+# node and MCP artifact bundles are executed now because they are bounded and
+# fail closed. The MCP checker is isolated in scripts/mcp_pin_lockstep.py.
 EXECUTABLE_RUNNERS = {
     "secret-scan": _run_secret_scan,
     "node-install-lint-typecheck-build": _run_node_package,
+    "mcp-pin-lockstep": _run_mcp_pin_lockstep,
 }
 
 
