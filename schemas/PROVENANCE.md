@@ -14,7 +14,7 @@ repository (the marketplace-catalog contract family, RFC
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
 currently SDK PR #120 head
-`cf89e25144478ec131264b32fff31c8cbed520f3`; every row is fetched from that
+`65d50bce414e963e168bc27f439e2463d397f62a`; every row is fetched from that
 same immutable commit even when the table records an older, last
 contract-changing commit for the individual file. This molecule-ci change must
 remain unmerged until that rebased SDK head is merged. Until then the required
@@ -67,7 +67,7 @@ When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
 # Pin this to the exact molecule-ai-sdk commit verified before the update.
-SDK_COMMIT=cf89e25144478ec131264b32fff31c8cbed520f3
+SDK_COMMIT=65d50bce414e963e168bc27f439e2463d397f62a
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 git -C "$tmp" init -q molecule-ai-sdk
