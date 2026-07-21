@@ -689,6 +689,10 @@ def _shell_command(unit: str) -> tuple[list[str], int] | None:
         "while",
     }:
         position += 1
+    if position < len(tokens) and tokens[position] == "time":
+        position += 1
+        if position < len(tokens) and tokens[position] == "-p":
+            position += 1
     if position < len(tokens) and tokens[position] == "!":
         position += 1
     while position < len(tokens) and re.fullmatch(
@@ -753,6 +757,51 @@ def _shell_command_segments(unit: str) -> list[str]:
     return segments
 
 
+def _raw_shell_words(segment: str) -> list[str] | None:
+    words: list[str] = []
+    start: int | None = None
+    single = False
+    double = False
+    escaped = False
+    for index, character in enumerate(segment):
+        if start is None and not character.isspace():
+            start = index
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and not single:
+            escaped = True
+            continue
+        if character == "'" and not double:
+            single = not single
+            continue
+        if character == '"' and not single:
+            double = not double
+            continue
+        if character.isspace() and not single and not double and start is not None:
+            words.append(segment[start:index])
+            start = None
+    if single or double or escaped:
+        return None
+    if start is not None:
+        words.append(segment[start:])
+    return words
+
+
+def _uses_nonliteral_command_word(unit: str) -> bool:
+    for segment in _shell_command_segments(unit):
+        command = _shell_command(segment)
+        raw_words = _raw_shell_words(segment)
+        if command is None or raw_words is None:
+            continue
+        tokens, command_index = command
+        if command_index >= len(raw_words):
+            return True
+        if raw_words[command_index] != tokens[command_index]:
+            return True
+    return False
+
+
 def _function_declaration_name(segment: str) -> str | None:
     candidate = re.sub(
         r"^(?:(?:\{|\(|!|then|do|else|if|elif|until|while)\s+|"
@@ -761,9 +810,20 @@ def _function_declaration_name(segment: str) -> str | None:
         segment.lstrip(),
     )
     match = _FUNCTION_DECLARATION_RE.match(candidate)
-    if match is None:
+    if match is not None:
+        return match.group("function_name") or match.group("paren_name")
+    command = _shell_command(candidate)
+    if command is None:
         return None
-    return match.group("function_name") or match.group("paren_name")
+    tokens, position = command
+    if tokens[position] == "function" and position + 1 < len(tokens):
+        name = re.sub(r"\(\)$", "", tokens[position + 1])
+    else:
+        candidate_name = tokens[position]
+        if not candidate_name.endswith("()"):
+            return None
+        name = candidate_name[:-2]
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else None
 
 
 def _script_units(script: str) -> list[_ShellUnit]:
@@ -797,6 +857,11 @@ def _script_units(script: str) -> list[_ShellUnit]:
             break
         if not unit:
             continue
+
+        if re.match(r"^case(?:\s|$)", unit):
+            raise OfficialConsumerContractError(
+                "workflow script contains unsupported case control"
+            )
 
         function_header = _FUNCTION_HEADER_RE.fullmatch(unit)
         if not in_function and function_header:
@@ -1297,6 +1362,11 @@ def _validate_pre_sentinel_shell(
             raise OfficialConsumerContractError(
                 "workflow proof uses dynamic command dispatch before the verifier sentinel"
             )
+        if _uses_nonliteral_command_word(unit.text):
+            raise OfficialConsumerContractError(
+                "workflow proof uses a quoted or escaped command name before "
+                "the verifier sentinel"
+            )
         if _contains_background_operator(unit.text):
             raise OfficialConsumerContractError(
                 "workflow proof starts background work before the verifier sentinel"
@@ -1338,8 +1408,12 @@ def _validate_no_privileged_pre_sentinel(
             raise OfficialConsumerContractError(
                 "workflow privileged or host-bound operation precedes the verifier sentinel"
             )
-        docker_command = re.search(r"(?:^|[;&|]\s*|\$\(\s*|^if !\s+)docker\s+", text)
-        if docker_command is None or index in allowed_docker_indexes:
+        docker_commands = []
+        for segment in _shell_command_segments(text):
+            command = _shell_command(segment)
+            if command is not None and command[0][command[1]] == "docker":
+                docker_commands.append(segment)
+        if not docker_commands or index in allowed_docker_indexes:
             continue
         if text == "if ! docker info >/dev/null 2>&1; then" or text in safe_cleanup:
             continue
@@ -1351,6 +1425,28 @@ def _validate_no_privileged_pre_sentinel(
         raise OfficialConsumerContractError(
             "workflow privileged or host-bound operation precedes the verifier sentinel"
         )
+
+
+def _is_docker_image_mutation(unit: str) -> bool:
+    for segment in _shell_command_segments(unit):
+        command = _shell_command(segment)
+        if command is None:
+            continue
+        tokens, position = command
+        if tokens[position] != "docker" or position + 1 >= len(tokens):
+            continue
+        operation = tokens[position + 1 :]
+        if operation[0] in {"build", "commit", "import", "load", "tag"} or (
+            len(operation) >= 2
+            and operation[0] == "buildx"
+            and operation[1] == "build"
+        ) or (
+            len(operation) >= 2
+            and operation[0] == "image"
+            and operation[1] in {"build", "import", "load", "tag"}
+        ):
+            return True
+    return False
 
 
 def _option_values(tokens: list[str], option: str) -> list[str]:
@@ -2254,12 +2350,8 @@ def _validate_ordered_proof(
                 "ordered executable proof step does not enable fail-closed shell mode"
             )
 
-    image_mutation = re.compile(
-        r"^(?:command\s+)?docker\s+(?:build\b|buildx\s+build\b|tag\b|load\b|"
-        r"import\b|commit\b|image\s+(?:build|tag|load|import)\b)"
-    )
     if any(
-        image_mutation.match(unit.text)
+        _is_docker_image_mutation(unit.text)
         for unit in trace[build_index + 1 : create_index]
     ):
         raise OfficialConsumerContractError(

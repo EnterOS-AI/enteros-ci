@@ -402,6 +402,24 @@ def test_always_aggregate_cannot_shadow_exit_with_alternate_function_syntax() ->
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_always_aggregate_rejects_a_case_arm_exit_shadow() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        b"          set -euo pipefail\n"
+        b"          case 1 in\n"
+        b"            1) function exit { command true; } ;;\n"
+        b"          esac\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="unsupported case control"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_always_aggregate_cannot_hide_state_mutation_after_a_command_separator() -> None:
     workflow = _workflow().replace(
         b'          t4="${{ needs.t4-conformance.result }}"\n',
@@ -1218,6 +1236,23 @@ def test_inline_exit_trap_cannot_mask_a_pre_sentinel_failure(trap: bytes) -> Non
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_case_arm_cannot_hide_an_exit_trap() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          case 1 in\n"
+        b"            1) trap 'exit 0' EXIT ;;\n"
+        b"          esac\n"
+        b"          false\n"
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="unsupported case control"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_background_work_cannot_race_reviewed_content_seals() -> None:
     workflow = _workflow().replace(
         b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff',
@@ -1374,6 +1409,21 @@ def test_final_image_tag_cannot_be_replaced_after_the_reviewed_build(
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_shell_word_concatenation_cannot_hide_final_image_replacement() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          d''ocker tag forged:image \"$T4_TAG\"\n"
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="quoted or escaped command name|same final image",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_verifier_copy_cannot_chain_an_unreviewed_overwrite() -> None:
     workflow = _workflow().replace(
         b'            "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"\n',
@@ -1469,6 +1519,37 @@ def test_shell_reserved_prefix_cannot_hide_an_inline_function_declaration(
         b"          "
         + prefix
         + b" function docker { command true; }\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="shadows a required executable"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_case_arm_cannot_hide_required_command_functions() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          case 1 in\n"
+        b"            1) function docker { command true; }; "
+        b"function grep { command true; } ;;\n"
+        b"          esac\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="unsupported case control"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_quoted_function_name_cannot_hide_required_command_shadow() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          function d''ocker { command true; }\n",
         1,
     )
 
