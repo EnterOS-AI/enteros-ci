@@ -172,12 +172,16 @@ copy against its final image in its existing hard-gated `t4-conformance` job.
 The same-repository self-test reads the four official immutable consumer refs from
 `scripts/fixtures/meta-ci/official-consumers.json`. The artifact-pin job (whose legacy
 workflow key remains `official-consumer-archives`) rejects duplicate JSON fields, disables
-persisted checkout credentials, fetches each exact commit anonymously, reads only
-`.runtime-version` with `git show`, and invokes the standalone artifact checker against
-a one-file proof directory. The job also requires all four extracted runtime pins to be
-identical, so four individually valid templates cannot hide fleet drift. It never extracts
-or executes consumer repository code. A dedicated sentinel proves the checker actually
-ran.
+persisted checkout credentials, and fetches each exact commit anonymously. It extracts
+only three bounded regular-file blobs with `git show`: `.runtime-version`,
+`.gitea/workflows/ci.yml`, and `tests/test_ci_runtime_image_pin.py`. The standalone
+artifact checker verifies the runtime pin, while `official_consumer_contract.py` treats
+the workflow and test as inert UTF-8 data and fails closed unless both pin the reviewed
+immutable final-image verifier and retain the anonymous fetch, non-fork, same-image,
+offline, unprivileged, resource-bounded, no-bind-mount contract. It never imports or
+executes consumer repository code. The job also requires all four extracted runtime pins
+to be identical, so four individually valid templates cannot hide fleet drift. Dedicated
+sentinels prove both checkers actually ran.
 
 All registry reads are anonymous, size/decompression bounded, restricted to the exact
 public Molecule Gitea package origin (default/443 only, no userinfo), and redirect-checked.

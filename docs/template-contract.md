@@ -118,26 +118,39 @@ The workflow contract is:
 2. Pass that exact version to the one final-image build as
    `--build-arg RUNTIME_VERSION=<validated-version>`; a checked-in pin that never reaches
    the Docker build argument does not prove the image used the attested wheel.
-3. Mount the verifier read-only and pipe the attestation on stdin to the final image.
-   Run as uid/gid 1000 from an empty `/tmp`, with networking disabled, all capabilities
-   dropped, `no-new-privileges`, bounded PIDs/memory/CPU, and a bounded `/tmp` tmpfs.
+3. Create a stopped container from that final image, copy the verifier into the
+   container, and pipe the attestation on stdin when starting it. Do not bind-mount the
+   verifier or any host path. Run as uid/gid 1000 from an empty `/tmp`, with networking
+   disabled, all capabilities dropped, `no-new-privileges`, bounded PIDs/memory/CPU, and
+   a bounded `/tmp` tmpfs.
 4. Require both a zero exit and the exact
    `mcp-built-image-e2e:sentinel:executed` line before the job proceeds to its existing
-   privileged host-root/token-ownership probes. Always remove the per-run image tag,
-   including when the verifier fails early.
+   privileged host-root/token-ownership probes. Always remove the transient verifier
+   container and per-run image tag, including when the verifier fails early.
 
-The container shape is intentionally ordinary `docker run`, not a shell inside the
-image. With `VERIFIER`, `ATTESTATION`, and `T4_TAG` set to job-local paths/values:
+The container shape deliberately uses `docker create`, `docker cp`, then `docker start`
+instead of a bind mount or a shell inside the image. With `VERIFIER`, `ATTESTATION`,
+`T4_TAG`, and a unique `MCP_VERIFY_CONTAINER` set to job-local paths/values:
 
 ```bash
-docker run --rm -i --network none \
+cleanup_mcp_verify() {
+  docker rm -f "${MCP_VERIFY_CONTAINER}" >/dev/null 2>&1 || true
+}
+trap cleanup_mcp_verify EXIT
+docker create --interactive --name "${MCP_VERIFY_CONTAINER}" \
+  --network none \
   --user 1000:1000 --workdir /tmp \
   --cap-drop ALL --security-opt no-new-privileges \
   --pids-limit 128 --memory 768m --cpus 1 \
   --tmpfs /tmp:size=64m \
-  --volume "${VERIFIER}:/opt/molecule-ci/mcp_built_image_e2e.py:ro" \
   --entrypoint python3 "${T4_TAG}" \
-  /opt/molecule-ci/mcp_built_image_e2e.py < "${ATTESTATION}"
+  /mcp_built_image_e2e.py
+docker cp "${VERIFIER}" \
+  "${MCP_VERIFY_CONTAINER}:/mcp_built_image_e2e.py"
+docker start --attach --interactive "${MCP_VERIFY_CONTAINER}" \
+  < "${ATTESTATION}"
+docker rm "${MCP_VERIFY_CONTAINER}"
+trap - EXIT
 ```
 
 Hermes passes one additional fixed environment value,

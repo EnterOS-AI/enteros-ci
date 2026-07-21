@@ -78,7 +78,16 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     )
     assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
     assert "strict_json_loads" in archive_runs
-    assert 'git -C "$fetch_dir" show "$actual:.runtime-version"' in archive_runs
+    assert 'git -C "$fetch_dir" ls-tree "$actual" -- "$contract_path"' in archive_runs
+    assert 'git -C "$fetch_dir" cat-file -s "${actual}:$contract_path"' in archive_runs
+    assert 'git -C "$fetch_dir" show "${actual}:$contract_path"' in archive_runs
+    assert ".runtime-version" in archive_runs
+    assert "scripts/official_consumer_contract.py" in archive_runs
+    assert "official-consumer-contract:sentinel:executed" in archive_runs
+    assert ".gitea/workflows/ci.yml" in archive_runs
+    assert "tests/test_ci_runtime_image_pin.py" in archive_runs
+    assert "max_size=524288" in archive_runs
+    assert "max_size=32" in archive_runs
     assert 'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
     assert "mcp-pin-lockstep:sentinel:executed" in archive_runs
     assert "scripts/mcp_pin_lockstep.py --repo-root \"$proof_dir\" --json" in archive_runs
@@ -154,6 +163,19 @@ def test_meta_ci_archive_gate_never_logs_raw_invalid_consumer_pin(tmp_path) -> N
             """
         )
     )
+    scripts.joinpath("official_consumer_contract.py").write_text(
+        textwrap.dedent(
+            """\
+            import argparse
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--consumer", required=True)
+            parser.add_argument("--repo-root", required=True)
+            args = parser.parse_args()
+            print(f"official-consumer-contract:sentinel:executed {args.consumer}")
+            """
+        )
+    )
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -181,10 +203,17 @@ def test_meta_ci_archive_gate_never_logs_raw_invalid_consumer_pin(tmp_path) -> N
                 directory.joinpath("fetched").write_text(args[-1])
             elif command == "rev-parse":
                 print(directory.joinpath("fetched").read_text())
+            elif command == "ls-tree":
+                print(f"100644 blob {'0' * 40}\\t{args[-1]}")
+            elif command == "cat-file":
+                print("16")
             elif command == "show":
-                consumer = directory.name.removesuffix(".fetch")
-                pin = "0.4.35" if consumer == "claude-code" else "credential=must-not-log"
-                print(pin)
+                if args[-1].endswith(":.runtime-version"):
+                    consumer = directory.name.removesuffix(".fetch")
+                    pin = "0.4.35" if consumer == "claude-code" else "credential=must-not-log"
+                    print(pin)
+                else:
+                    print("static contract placeholder")
             else:
                 raise SystemExit(f"unexpected fake git command: {command}")
             """
