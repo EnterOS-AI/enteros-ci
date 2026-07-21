@@ -302,8 +302,7 @@ def _runtime_wheel_reference(index: bytes, runtime_version: str) -> tuple[str, s
         matches.append((clean, digest))
     if len(matches) != 1:
         raise MCPPinLockstepError(
-            f"expected exactly one immutable runtime wheel for {runtime_version}; "
-            f"found {len(matches)}"
+            f"expected exactly one immutable runtime wheel; found {len(matches)}"
         )
     return matches[0]
 
@@ -466,8 +465,7 @@ def _runtime_contract(wheel_bytes: bytes, runtime_version: str) -> dict[str, str
         values["MANAGEMENT_MCP_PINNED_VERSION"],
     ):
         raise MCPPinLockstepError(
-            f"runtime MCP pin {values['MANAGEMENT_MCP_PINNED_VERSION']} is outside "
-            f"compatible range {values['MANAGEMENT_MCP_COMPATIBLE_RANGE']}"
+            "runtime MCP pin is outside its declared compatible range"
         )
     package = values["MANAGEMENT_MCP_NPM_PACKAGE"]
     scope = values["MANAGEMENT_MCP_REGISTRY_SCOPE"]
@@ -616,7 +614,7 @@ def _verify_exact_mcp_artifact(values: dict[str, str], fetch_bytes) -> dict[str,
     exact = versions.get(version) if isinstance(versions, dict) else None
     if not isinstance(exact, dict):
         raise MCPPinLockstepError(
-            f"exact MCP package version {version} is missing from the registry"
+            "exact MCP package version is missing from the registry"
         )
     if exact.get("name") != package or exact.get("version") != version:
         raise MCPPinLockstepError("exact MCP registry metadata has a mismatched identity")

@@ -426,7 +426,9 @@ def test_pin_outside_declared_compatible_range_is_rejected(tmp_path):
     ok, detail = lockstep.run(tmp_path, fetch_bytes=fetch)
 
     assert not ok
-    assert "outside compatible range" in detail
+    assert "outside its declared compatible range" in detail
+    assert "2.0.0" not in detail
+    assert "^1.8.0" not in detail
 
 
 def test_untrusted_runtime_registry_does_not_echo_artifact_controlled_value():
@@ -465,7 +467,22 @@ def test_missing_exact_mcp_version_is_rejected(tmp_path):
     ok, detail = lockstep.run(tmp_path, fetch_bytes=fetch)
 
     assert not ok
-    assert "exact MCP package version 1.8.3 is missing" in detail
+    assert "exact MCP package version is missing" in detail
+    assert "1.8.3" not in detail
+
+
+def test_missing_runtime_wheel_error_does_not_echo_valid_pin(tmp_path):
+    pin = "9.8.7"
+    (tmp_path / ".runtime-version").write_text(pin)
+
+    ok, detail = lockstep.run(
+        tmp_path,
+        fetch_bytes=lambda _url: b"<html></html>",
+    )
+
+    assert not ok
+    assert "expected exactly one immutable runtime wheel" in detail
+    assert pin not in detail
 
 
 def test_mcp_tarball_integrity_mismatch_is_rejected(tmp_path):
