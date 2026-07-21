@@ -21,8 +21,38 @@ SENTINEL = "official-consumer-contract:sentinel:executed"
 _MAX_CONTRACT_BYTES = 512 * 1024
 _WORKFLOW_PATH = Path(".gitea/workflows/ci.yml")
 _TEST_PATH = Path("tests/test_ci_runtime_image_pin.py")
-_REF_ASSIGNMENT_RE = re.compile(
-    r"(?m)^\s*MOLECULE_CI_REF:\s*([0-9a-f]{40})\s*(?:#.*)?$"
+_REF_MAPPING_RE = re.compile(
+    r"^(?P<indent> *)(?:MOLECULE_CI_REF|['\"]MOLECULE_CI_REF['\"])[ \t]*:"
+    r"[ \t]*(?P<value>.*?)[ \t]*$"
+)
+_REF_MAPPING_TOKEN_RE = re.compile(
+    r"(?<![\w${.])(?:MOLECULE_CI_REF|['\"]MOLECULE_CI_REF['\"])[ \t]*:"
+)
+_STATIC_REF_VALUE_RE = re.compile(
+    r"^(?:([0-9a-f]{40})|'([0-9a-f]{40})'|\"([0-9a-f]{40})\")"
+    r"(?:[ \t]+#.*)?$"
+)
+_RUN_BLOCK_RE = re.compile(
+    r"^(?P<indent> *)(?:-[ \t]+)?run:[ \t]*[|>][+-]?(?:[ \t]+#.*)?$"
+)
+_MAPPING_HEADER_RE = re.compile(r"^[A-Za-z0-9_.-]+:[ \t]*(?:#.*)?$")
+_SHELL_REF_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w$])['\"]?MOLECULE_CI_REF['\"]?[ \t]*(?:\+?=|<<)"
+)
+_SHELL_REF_PARAMETER_ASSIGNMENT_RE = re.compile(r"\$\{MOLECULE_CI_REF(?::?=|\+=)")
+_SHELL_REF_MUTATING_COMMAND_RE = re.compile(
+    r"\b(?:unset|read|readonly|declare|typeset|local)\b[^\n#]*"
+    r"\bMOLECULE_CI_REF\b|\bprintf\b[^\n#]*\s-v\s+MOLECULE_CI_REF\b"
+)
+_FINAL_IMAGE_FETCH_FRAGMENTS = (
+    "https://git.moleculesai.app/molecule-ai/molecule-ci.git",
+    "fetch",
+    "--no-tags",
+    "--depth 1",
+    'origin "$MOLECULE_CI_REF"',
+    "checkout -q --detach FETCH_HEAD",
+    "rev-parse HEAD",
+    "mcp_pin_lockstep.py",
 )
 _REQUIRED_TESTS = {
     "claude-code": (
@@ -87,6 +117,14 @@ _TEST_FRAGMENTS = (
 
 class OfficialConsumerContractError(Exception):
     """A static official-consumer CI contract violation."""
+
+
+@dataclass(frozen=True)
+class _RunBlock:
+    header_index: int
+    body: str
+    job_index: int
+    step_index: int
 
 
 def _decode_contract(payload: bytes, label: str) -> str:
@@ -349,6 +387,8 @@ def _function_returns_workflow(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     derived_functions: set[str],
 ) -> bool:
+    if _contains_pytest_collection_control(function):
+        return False
     returns = [
         node for node in _function_nodes(function) if isinstance(node, ast.Return)
     ]
@@ -362,7 +402,7 @@ def _function_returns_workflow(
 
     derived_names: set[str] = set()
     string_bindings: dict[str, tuple[str, ...]] = {}
-    for statement in function.body[:-1]:
+    for index, statement in enumerate(function.body[:-1]):
         if isinstance(statement, ast.Assign):
             _update_assignment_state(
                 statement.targets,
@@ -379,10 +419,17 @@ def _function_returns_workflow(
                 string_bindings,
                 derived_functions,
             )
-        elif not isinstance(statement, (ast.Assert, ast.Expr, ast.Pass)):
-            for name in _stored_names(statement):
-                derived_names.discard(name)
-                string_bindings.pop(name, None)
+        elif isinstance(statement, (ast.Assert, ast.Pass)):
+            continue
+        elif (
+            index == 0
+            and isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        else:
+            return False
 
     return _is_workflow_derived(returns[0].value, derived_names, derived_functions)
 
@@ -474,6 +521,7 @@ def _has_workflow_source(expression: ast.AST, derived_functions: set[str]) -> bo
 
 @dataclass
 class _FunctionEvidence:
+    execution_guaranteed: bool = True
     saw_workflow_load: bool = False
     asserted_ref: bool = False
     asserted_fork: bool = False
@@ -527,7 +575,7 @@ def _record_static_loop_assertions(
     string_bindings: dict[str, tuple[str, ...]],
     derived_names: set[str],
     derived_functions: set[str],
-) -> None:
+) -> bool:
     target_names = _target_names(loop.target)
     sequence = _static_string_sequence(loop.iter, string_bindings)
     if (
@@ -537,7 +585,7 @@ def _record_static_loop_assertions(
         or not loop.body
         or not all(isinstance(statement, ast.Assert) for statement in loop.body)
     ):
-        return
+        return False
     target_name = next(iter(target_names))
     for assertion in loop.body:
         _record_assertion(evidence, assertion, derived_names, derived_functions)
@@ -550,10 +598,32 @@ def _record_static_loop_assertions(
             for left, operator, right in _comparison_parts(assertion.test)
         ):
             evidence.asserted_fragments.extend(sequence)
+    return True
+
+
+def _contains_pytest_collection_control(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    for node in _function_nodes(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "importorskip",
+            "skip",
+            "xfail",
+        }:
+            return True
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "importorskip",
+            "skip",
+            "xfail",
+        }:
+            return True
+    return False
 
 
 def _function_evidence(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    function: ast.FunctionDef,
     derived_functions: set[str],
 ) -> _FunctionEvidence:
     """Collect guaranteed evidence in source order from one regression test.
@@ -563,11 +633,13 @@ def _function_evidence(
     is ignored, and any assignment replaces the prior provenance for its name.
     """
 
-    evidence = _FunctionEvidence()
+    evidence = _FunctionEvidence(
+        execution_guaranteed=not _contains_pytest_collection_control(function)
+    )
     derived_names: set[str] = set()
     string_bindings: dict[str, tuple[str, ...]] = {}
 
-    for statement in function.body:
+    for index, statement in enumerate(function.body):
         if isinstance(statement, ast.Assign):
             evidence.saw_workflow_load |= _has_workflow_source(
                 statement.value, derived_functions
@@ -596,15 +668,25 @@ def _function_evidence(
             _record_assertion(evidence, statement, derived_names, derived_functions)
             continue
         if isinstance(statement, (ast.For, ast.AsyncFor)):
-            _record_static_loop_assertions(
+            if not _record_static_loop_assertions(
                 evidence,
                 statement,
                 string_bindings,
                 derived_names,
                 derived_functions,
-            )
-        if isinstance(statement, (ast.Return, ast.Raise)):
-            break
+            ):
+                evidence.execution_guaranteed = False
+            continue
+        if isinstance(statement, ast.Pass):
+            continue
+        if (
+            index == 0
+            and isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        evidence.execution_guaranteed = False
         for name in _stored_names(statement):
             derived_names.discard(name)
             string_bindings.pop(name, None)
@@ -612,17 +694,259 @@ def _function_evidence(
     return evidence
 
 
-def _validate_workflow(workflow: str) -> None:
-    refs = _REF_ASSIGNMENT_RE.findall(workflow)
-    if len(refs) != 1:
-        raise OfficialConsumerContractError(
-            "workflow must contain exactly one MOLECULE_CI_REF assignment"
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _parent_index(lines: list[str], index: int) -> int:
+    child_indent = _line_indent(lines[index])
+    for cursor in range(index - 1, -1, -1):
+        stripped = lines[cursor].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _line_indent(lines[cursor]) < child_indent:
+            return cursor
+    return -1
+
+
+def _job_index(lines: list[str], index: int) -> int:
+    candidate = -1
+    for cursor in range(index - 1, -1, -1):
+        stripped = lines[cursor].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = _line_indent(lines[cursor])
+        if indent == 2 and candidate == -1 and _MAPPING_HEADER_RE.fullmatch(stripped):
+            candidate = cursor
+            continue
+        if indent == 0:
+            if stripped == "jobs:" and candidate != -1:
+                return candidate
+            return -1
+    return -1
+
+
+def _step_index(lines: list[str], index: int, job_index: int) -> int:
+    candidate = -1
+    for cursor in range(index, job_index, -1):
+        stripped = lines[cursor].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = _line_indent(lines[cursor])
+        if indent == 6 and stripped.startswith("-") and candidate == -1:
+            candidate = cursor
+            continue
+        if indent == 4:
+            if stripped == "steps:" and candidate != -1:
+                return candidate
+            return -1
+    return -1
+
+
+def _ref_scope(lines: list[str], assignment_index: int) -> tuple[str, int] | None:
+    parent_index = _parent_index(lines, assignment_index)
+    if parent_index == -1 or lines[parent_index].strip() != "env:":
+        return None
+    env_indent = _line_indent(lines[parent_index])
+    if _line_indent(lines[assignment_index]) != env_indent + 2:
+        return None
+    if env_indent == 0:
+        return ("workflow", 0)
+    job_index = _job_index(lines, parent_index)
+    if job_index == -1:
+        return None
+    if env_indent == 4:
+        return ("job", job_index)
+    if env_indent == 8:
+        step_index = _step_index(lines, parent_index, job_index)
+        if step_index != -1:
+            return ("step", step_index)
+    return None
+
+
+def _run_blocks(lines: list[str]) -> list[_RunBlock]:
+    blocks: list[_RunBlock] = []
+    index = 0
+    while index < len(lines):
+        match = _RUN_BLOCK_RE.fullmatch(lines[index])
+        if match is None:
+            index += 1
+            continue
+        header_indent = len(match.group("indent"))
+        end = index + 1
+        while end < len(lines):
+            if lines[end].strip() and _line_indent(lines[end]) <= header_indent:
+                break
+            end += 1
+        job_index = _job_index(lines, index)
+        step_index = _step_index(lines, index, job_index) if job_index != -1 else -1
+        blocks.append(
+            _RunBlock(
+                header_index=index,
+                body="\n".join(lines[index + 1 : end]),
+                job_index=job_index,
+                step_index=step_index,
+            )
         )
-    if refs[0] != FINAL_IMAGE_VERIFIER_REF:
+        index = end
+    return blocks
+
+
+def _static_ref_value(value: str) -> str | None:
+    match = _STATIC_REF_VALUE_RE.fullmatch(value)
+    if match is None:
+        return None
+    return next(part for part in match.groups() if part is not None)
+
+
+def _run_block_reassigns_ref(block: _RunBlock) -> bool:
+    for line in block.body.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if (
+            _SHELL_REF_ASSIGNMENT_RE.search(line)
+            or _SHELL_REF_PARAMETER_ASSIGNMENT_RE.search(line)
+            or _SHELL_REF_MUTATING_COMMAND_RE.search(line)
+        ):
+            return True
+    return False
+
+
+def _validate_workflow_ref_wiring(workflow: str) -> None:
+    lines = workflow.splitlines()
+    assignments: list[tuple[int, re.Match[str]]] = []
+    for index, line in enumerate(lines):
+        match = _REF_MAPPING_RE.fullmatch(line)
+        if match is not None:
+            assignments.append((index, match))
+            continue
+        if not line.lstrip().startswith("#") and _REF_MAPPING_TOKEN_RE.search(line):
+            raise OfficialConsumerContractError(
+                "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
+            )
+
+    if not assignments:
         raise OfficialConsumerContractError(
             "workflow does not pin the reviewed molecule-ci verifier"
         )
+
+    values = [_static_ref_value(match.group("value")) for _, match in assignments]
+    if any(value is None for value in values):
+        raise OfficialConsumerContractError(
+            "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
+        )
+    if any(value != FINAL_IMAGE_VERIFIER_REF for value in values):
+        if len(values) == 1:
+            raise OfficialConsumerContractError(
+                "workflow does not pin the reviewed molecule-ci verifier"
+            )
+        raise OfficialConsumerContractError(
+            "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
+        )
+
+    scopes: set[tuple[str, int]] = set()
+    for (index, _), _value in zip(assignments, values, strict=True):
+        scope = _ref_scope(lines, index)
+        if scope is None:
+            raise OfficialConsumerContractError(
+                "workflow MOLECULE_CI_REF assignment is not in an effective env scope"
+            )
+        if scope in scopes:
+            raise OfficialConsumerContractError(
+                "workflow overwrites MOLECULE_CI_REF within one env scope"
+            )
+        scopes.add(scope)
+
+    blocks = _run_blocks(lines)
+    if any(_run_block_reassigns_ref(block) for block in blocks):
+        raise OfficialConsumerContractError(
+            "workflow reassigns MOLECULE_CI_REF inside a run script"
+        )
+
+    proof_blocks = [block for block in blocks if "mcp_pin_lockstep.py" in block.body]
+    if len(proof_blocks) != 1:
+        raise OfficialConsumerContractError(
+            "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
+        )
+    proof = proof_blocks[0]
+    normalized_proof = _normalized(proof.body)
+    applicable_scopes = {
+        ("workflow", 0),
+        ("job", proof.job_index),
+        ("step", proof.step_index),
+    }
+    if (
+        proof.job_index == -1
+        or proof.step_index == -1
+        or not scopes.intersection(applicable_scopes)
+        or any(
+            fragment not in normalized_proof
+            for fragment in _FINAL_IMAGE_FETCH_FRAGMENTS
+        )
+    ):
+        raise OfficialConsumerContractError(
+            "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
+        )
+
+
+def _validate_workflow(workflow: str) -> None:
+    _validate_workflow_ref_wiring(workflow)
     _require_fragments(workflow, _WORKFLOW_FRAGMENTS, "workflow")
+
+
+def _statement_bound_names(statement: ast.stmt) -> set[str]:
+    names: set[str] = set()
+    stack: list[ast.AST] = [statement]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name.split(".", 1)[0])
+            continue
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _statement_mutates_test_collection(
+    statement: ast.stmt, required_names: set[str]
+) -> bool:
+    stack: list[ast.AST] = [statement]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.attr in {"__test__", "pytestmark"}
+            and isinstance(node.value, ast.Name)
+            and node.value.id in required_names
+        ):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in required_names
+            and _static_string(node.args[1]) in {"__test__", "pytestmark"}
+        ):
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
 
 
 def _validate_test_contract(consumer: str, test_source: str) -> None:
@@ -638,24 +962,65 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
             "test contract does not pin the reviewed molecule-ci verifier"
         )
 
+    required_names = _REQUIRED_TESTS[consumer]
+    definitions = {
+        name: [
+            node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ]
+        for name in required_names
+    }
+    missing_names = [name for name, nodes in definitions.items() if not nodes]
+    if missing_names:
+        raise OfficialConsumerContractError(
+            "test contract is missing a required regression test"
+        )
+
+    if any(
+        len(definitions[name]) != 1
+        or not isinstance(definitions[name][0], ast.FunctionDef)
+        for name in required_names
+    ):
+        raise OfficialConsumerContractError(
+            "required regression test is not guaranteed to execute"
+        )
+    required_functions = [
+        definitions[name][0]
+        for name in required_names
+        if isinstance(definitions[name][0], ast.FunctionDef)
+    ]
+    required_name_set = set(required_names)
+    if any(
+        "pytestmark" in _statement_bound_names(statement)
+        or "__test__" in _statement_bound_names(statement)
+        for statement in module.body
+    ):
+        raise OfficialConsumerContractError(
+            "required regression test is not guaranteed to execute"
+        )
+    for function in required_functions:
+        definition_index = module.body.index(function)
+        if any(
+            function.name in _statement_bound_names(statement)
+            or _statement_mutates_test_collection(statement, required_name_set)
+            for statement in module.body[definition_index + 1 :]
+        ):
+            raise OfficialConsumerContractError(
+                "required regression test is not guaranteed to execute"
+            )
+    if any(function.decorator_list for function in required_functions):
+        raise OfficialConsumerContractError(
+            "required regression test is not guaranteed to execute"
+        )
+
     functions = {
         node.name: node
         for node in module.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     derived_functions = _workflow_returning_functions(functions)
-    required_names = _REQUIRED_TESTS[consumer]
-    missing_names = [name for name in required_names if name not in functions]
-    if missing_names:
-        raise OfficialConsumerContractError(
-            "test contract is missing a required regression test"
-        )
-
-    required_functions = [functions[name] for name in required_names]
-    if any(function.decorator_list for function in required_functions):
-        raise OfficialConsumerContractError(
-            "required regression test is not guaranteed to execute"
-        )
     if any(
         not any(isinstance(node, ast.Assert) for node in ast.walk(function))
         for function in required_functions
@@ -668,6 +1033,10 @@ def _validate_test_contract(consumer: str, test_source: str) -> None:
         _function_evidence(function, derived_functions)
         for function in required_functions
     ]
+    if any(not item.execution_guaranteed for item in evidence):
+        raise OfficialConsumerContractError(
+            "required regression test is not guaranteed to execute"
+        )
     if not any(item.saw_workflow_load for item in evidence):
         raise OfficialConsumerContractError(
             "required regression test does not statically read the CI workflow"

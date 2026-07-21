@@ -41,6 +41,7 @@ jobs:
             https://git.moleculesai.app/molecule-ai/molecule-ci.git
           git -c credential.helper= -c http.userAgent=curl/8.4.0 \\
             -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
           test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
           python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json
           from mcp_built_image_e2e import load_attestation
@@ -58,6 +59,10 @@ jobs:
           grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
           KEEP_T4_IMAGE=1
 """.encode()
+
+
+def _with_workflow_env(workflow: bytes, verifier_ref: str = VERIFIER_REF) -> bytes:
+    return f"env:\n  MOLECULE_CI_REF: {verifier_ref}\n".encode() + workflow
 
 
 def _test_contract(consumer: str, *, verifier_ref: str = VERIFIER_REF) -> bytes:
@@ -133,12 +138,71 @@ def test_workflow_must_pin_the_exact_immutable_verifier_ref() -> None:
         )
 
 
-def test_duplicate_workflow_ref_assignment_fails_closed() -> None:
-    workflow = _workflow() + f"  MOLECULE_CI_REF: {VERIFIER_REF}\n".encode()
+def test_matching_workflow_ref_assignments_across_scopes_are_accepted() -> None:
+    contract.validate_contract(
+        "codex",
+        _with_workflow_env(_workflow()),
+        _test_contract("codex"),
+    )
+
+
+@pytest.mark.parametrize("replacement", ("a" * 40, "${{ github.sha }}"))
+def test_divergent_or_dynamic_scoped_workflow_ref_fails_closed(
+    replacement: str,
+) -> None:
+    workflow = _with_workflow_env(
+        _workflow(verifier_ref=replacement),
+    )
 
     with pytest.raises(
         contract.OfficialConsumerContractError,
-        match="exactly one MOLECULE_CI_REF",
+        match="dynamic or divergent MOLECULE_CI_REF assignment",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_duplicate_workflow_ref_in_one_env_scope_fails_closed() -> None:
+    assignment = f"      MOLECULE_CI_REF: {VERIFIER_REF}\n".encode()
+    workflow = _workflow().replace(assignment, assignment * 2, 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="overwrites MOLECULE_CI_REF within one env scope",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_shell_reassignment_of_workflow_ref_fails_closed() -> None:
+    wrong_ref = "b" * 40
+    workflow = _workflow().replace(
+        b"          GIT_ASKPASS=/bin/false",
+        (
+            f"          MOLECULE_CI_REF={wrong_ref}\n          GIT_ASKPASS=/bin/false"
+        ).encode(),
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="reassigns MOLECULE_CI_REF inside a run script",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_final_image_fetch_and_attestation_must_share_one_pinned_run_block() -> None:
+    workflow = _workflow().replace(
+        b'          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" '
+        b"--repo-root . --json\n",
+        b"          echo verifier-separated\n"
+        b"      - run: |\n"
+        b'          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" '
+        b"--repo-root . --json\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="final-image fetch does not use the reviewed MOLECULE_CI_REF",
     ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
@@ -186,6 +250,92 @@ def test_required_regression_test_function_must_exist() -> None:
         match="required regression test",
     ):
         contract.validate_contract("claude-code", _workflow(), test_contract)
+
+
+def test_required_regression_test_must_be_synchronous() -> None:
+    test_contract = _test_contract("codex").replace(
+        b"def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image():",
+        b"async def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image():",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="required regression test is not guaranteed to execute",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_required_regression_test_cannot_be_rebound_after_definition() -> None:
+    test_name = "test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image"
+    test_contract = _test_contract("codex") + f"\n{test_name} = lambda: None\n".encode()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="required regression test is not guaranteed to execute",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        ".__test__ = False",
+        ".pytestmark = __import__('pytest').mark.skip",
+    ),
+)
+def test_required_regression_test_cannot_disable_pytest_collection(
+    mutation: str,
+) -> None:
+    test_name = "test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image"
+    test_contract = _test_contract("codex") + f"\n{test_name}{mutation}\n".encode()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="required regression test is not guaranteed to execute",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_required_regression_test_cannot_skip_before_assertions() -> None:
+    test_contract = _test_contract("codex").replace(
+        b"    workflow = yaml.safe_load(CI_WORKFLOW.read_text())\n",
+        b'    __import__("pytest").skip("disabled")\n'
+        b"    workflow = yaml.safe_load(CI_WORKFLOW.read_text())\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="required regression test is not guaranteed to execute",
+    ):
+        contract.validate_contract("codex", _workflow(), test_contract)
+
+
+def test_workflow_helper_cannot_skip_the_required_regression_test() -> None:
+    helper = b"""\
+def _load_workflow():
+    __import__("pytest").skip("disabled")
+    return yaml.safe_load(CI_WORKFLOW.read_text())
+
+"""
+    test_contract = (
+        _test_contract("codex")
+        .replace(
+            b"yaml.safe_load(CI_WORKFLOW.read_text())",
+            b"_load_workflow()",
+            1,
+        )
+        .replace(
+            b"def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image():",
+            helper
+            + b"def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image():",
+            1,
+        )
+    )
+
+    with pytest.raises(contract.OfficialConsumerContractError):
+        contract.validate_contract("codex", _workflow(), test_contract)
 
 
 def test_required_regression_test_must_assert_the_hardening_contract() -> None:
