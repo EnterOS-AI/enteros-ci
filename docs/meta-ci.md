@@ -136,7 +136,9 @@ template image*. It proves:
 
 - the installed `molecules-workspace-runtime` distribution version equals the
   attestation, and both imported runtime modules resolve to files recorded by that
-  distribution rather than a shadowing checkout;
+  distribution rather than a shadowing checkout; image-controlled imports execute in
+  a separate deadline/output-bounded process and only a strict proof object returns to
+  the verifier;
 - the installed `prebake-mgmt-mcp.sh` bytes match the attested wheel member digest and
   the imported `platform_agent_identity` package, pin, range, registry, scope, and tool
   constants match the attestation;
@@ -150,7 +152,8 @@ An emitted `initialize.result.serverInfo.version` is bounded and must agree acro
 four launches, but it is deliberately **not** compared with the npm package version.
 It is server protocol/implementation metadata (the current package reports `1.0.0`),
 whereas the exact npm artifact version is independently proven by the static attestation
-and exact offline resolution.
+and exact offline resolution. Its child-controlled literal value is never copied into CI
+logs; the PASS line reports only `emitted-consistent` or `not-emitted`.
 
 The verifier never invokes a shell. Every child is an argv-only process group with a
 hard deadline and combined-output cap; unexpected child output is not copied into error

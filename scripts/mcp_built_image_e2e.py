@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import importlib
 from importlib import metadata
 import json
 import os
@@ -50,6 +49,28 @@ _RUNTIME_FILES = {
     "identity": "molecule_runtime/platform_agent_identity.py",
     "helper": "molecule_runtime/scripts/prebake-mgmt-mcp.sh",
 }
+_IMPORT_PROBE_SOURCE = r"""
+import importlib
+import json
+import sys
+
+runtime = importlib.import_module("molecule_runtime")
+identity = importlib.import_module("molecule_runtime.platform_agent_identity")
+constant_names = (
+    "MANAGEMENT_MCP_NPM_PACKAGE",
+    "MANAGEMENT_MCP_PINNED_VERSION",
+    "MANAGEMENT_MCP_COMPATIBLE_RANGE",
+    "MANAGEMENT_MCP_REGISTRY",
+    "MANAGEMENT_MCP_REGISTRY_SCOPE",
+    "REQUIRED_TOOL",
+)
+proof = {
+    "runtime_origin": getattr(runtime, "__file__", None),
+    "identity_origin": getattr(identity, "__file__", None),
+    "constants": {name: getattr(identity, name, None) for name in constant_names},
+}
+sys.stdout.write(json.dumps(proof, separators=(",", ":"), sort_keys=True))
+"""
 
 
 class BuiltImageE2EError(Exception):
@@ -275,8 +296,7 @@ def _distribution_file(distribution, relative: str) -> Path:
         ) from exc
 
 
-def _module_origin(module, expected: Path) -> None:
-    origin = getattr(module, "__file__", None)
+def _module_origin(origin, expected: Path) -> None:
     if not isinstance(origin, str):
         raise BuiltImageE2EError("installed runtime import origin is missing")
     try:
@@ -287,6 +307,56 @@ def _module_origin(module, expected: Path) -> None:
         ) from exc
     if actual != expected:
         raise BuiltImageE2EError("installed runtime import origin is shadowed")
+
+
+def _installed_import_proof(
+    run_process: Callable[..., ProcessResult],
+) -> tuple[str, str, dict[str, str]]:
+    result = run_process(
+        [sys.executable, "-I", "-c", _IMPORT_PROBE_SOURCE],
+        input_bytes=b"",
+        env={
+            "HOME": AGENT_HOME,
+            "PATH": os.environ.get("PATH", ""),
+            "TMPDIR": "/tmp",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        },
+        timeout_seconds=PROCESS_TIMEOUT_SECONDS,
+        max_output_bytes=MAX_PROCESS_OUTPUT_BYTES,
+    )
+    if result.returncode != 0:
+        raise BuiltImageE2EError("installed runtime modules cannot be imported")
+    proof = _strict_json_loads(
+        result.stdout.encode("utf-8"),
+        "installed runtime import proof",
+    )
+    if not isinstance(proof, dict) or set(proof) != {
+        "runtime_origin",
+        "identity_origin",
+        "constants",
+    }:
+        raise BuiltImageE2EError("installed runtime import proof is invalid")
+    runtime_origin = proof["runtime_origin"]
+    identity_origin = proof["identity_origin"]
+    constants = proof["constants"]
+    if (
+        not isinstance(runtime_origin, str)
+        or not runtime_origin
+        or len(runtime_origin) > _MAX_FIELD_LENGTH
+        or not isinstance(identity_origin, str)
+        or not identity_origin
+        or len(identity_origin) > _MAX_FIELD_LENGTH
+        or not isinstance(constants, dict)
+        or any(
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or len(value) > _MAX_FIELD_LENGTH
+            for name, value in constants.items()
+        )
+    ):
+        raise BuiltImageE2EError("installed runtime import proof is invalid")
+    return runtime_origin, identity_origin, constants
 
 
 def _installed_helper_digest(path: Path) -> str:
@@ -306,7 +376,11 @@ def _installed_helper_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_installed_runtime(attestation: Attestation) -> None:
+def verify_installed_runtime(
+    attestation: Attestation,
+    *,
+    run_process: Callable[..., ProcessResult] | None = None,
+) -> None:
     """Prove the imported runtime is the attested installed distribution."""
 
     try:
@@ -323,17 +397,13 @@ def verify_installed_runtime(attestation: Attestation) -> None:
     package_path = _distribution_file(distribution, _RUNTIME_FILES["package"])
     identity_path = _distribution_file(distribution, _RUNTIME_FILES["identity"])
     helper_path = _distribution_file(distribution, _RUNTIME_FILES["helper"])
-    try:
-        runtime_module = importlib.import_module("molecule_runtime")
-        identity_module = importlib.import_module(
-            "molecule_runtime.platform_agent_identity"
-        )
-    except Exception as exc:
-        raise BuiltImageE2EError(
-            "installed runtime modules cannot be imported"
-        ) from exc
-    _module_origin(runtime_module, package_path)
-    _module_origin(identity_module, identity_path)
+    if run_process is None:
+        run_process = run_bounded_process
+    runtime_origin, identity_origin, installed_constants = _installed_import_proof(
+        run_process
+    )
+    _module_origin(runtime_origin, package_path)
+    _module_origin(identity_origin, identity_path)
 
     helper_digest = _installed_helper_digest(helper_path)
     if helper_digest != attestation.helper_sha256:
@@ -348,9 +418,9 @@ def verify_installed_runtime(attestation: Attestation) -> None:
         "REQUIRED_TOOL": attestation.required_tool,
     }
     if any(
-        getattr(identity_module, name, None) != expected
+        installed_constants.get(name) != expected
         for name, expected in expected_constants.items()
-    ):
+    ) or set(installed_constants) != set(expected_constants):
         raise BuiltImageE2EError("installed runtime MCP constants disagree")
 
 
@@ -604,7 +674,7 @@ def verify_offline_mcp(
     npx_path: str,
     path_env: str | None = None,
     run_process: Callable[..., ProcessResult] = run_bounded_process,
-) -> str | None:
+) -> str:
     """Run exact/range JSON-RPC probes under the agent and a foreign HOME."""
 
     if path_env is None:
@@ -635,7 +705,8 @@ def verify_offline_mcp(
                 reported_server_versions.add(server_version)
                 if len(reported_server_versions) > 1:
                     raise BuiltImageE2EError("offline MCP serverInfo versions disagree")
-    return next(iter(reported_server_versions), None)
+    server_version = next(iter(reported_server_versions), None)
+    return "not-emitted" if server_version is None else "emitted-consistent"
 
 
 def _safe_error(exc: Exception) -> str:
@@ -650,7 +721,7 @@ def main() -> int:
         attestation = load_attestation(sys.stdin.buffer)
         verify_installed_runtime(attestation)
         npx_path, path_env = find_npx()
-        server_version = verify_offline_mcp(
+        version_proof = verify_offline_mcp(
             attestation,
             npx_path=npx_path,
             path_env=path_env,
@@ -658,9 +729,6 @@ def main() -> int:
     except Exception as exc:
         print(_safe_error(exc), file=sys.stderr)
         return 1
-    version_proof = (
-        json.dumps(server_version) if server_version is not None else "not-emitted"
-    )
     print(
         "mcp-built-image-e2e: PASS "
         f"(four offline JSON-RPC probes green; serverInfo.version={version_proof})"

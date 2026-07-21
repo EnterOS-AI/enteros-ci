@@ -11,7 +11,6 @@ from pathlib import Path, PurePosixPath
 import signal
 import sys
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -204,33 +203,62 @@ def _installed_fixture(tmp_path: Path, monkeypatch, *, version: str = "0.4.35"):
     scripts.joinpath("prebake-mgmt-mcp.sh").write_bytes(b"helper\n")
 
     distribution = _FakeDistribution(tmp_path, version=version)
-    runtime_module = SimpleNamespace(__file__=str(package / "__init__.py"))
-    identity_module = SimpleNamespace(
-        __file__=str(identity_path),
-        MANAGEMENT_MCP_NPM_PACKAGE="@molecule-ai/mcp-server",
-        MANAGEMENT_MCP_PINNED_VERSION="1.9.5",
-        MANAGEMENT_MCP_COMPATIBLE_RANGE="^1.8.0",
-        MANAGEMENT_MCP_REGISTRY=(
-            "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
-        ),
-        MANAGEMENT_MCP_REGISTRY_SCOPE="@molecule-ai",
-        REQUIRED_TOOL="provision_workspace",
-    )
-    modules = {
-        "molecule_runtime": runtime_module,
-        "molecule_runtime.platform_agent_identity": identity_module,
-    }
     monkeypatch.setattr(
         built_image.metadata,
         "distribution",
         lambda _name: distribution,
     )
-    monkeypatch.setattr(
-        built_image.importlib,
-        "import_module",
-        lambda name: modules[name],
+    return distribution
+
+
+def _import_probe_output(
+    tmp_path: Path,
+    *,
+    runtime_origin: Path | None = None,
+    identity_origin: Path | None = None,
+    required_tool: str = "provision_workspace",
+) -> str:
+    package = tmp_path / "molecule_runtime"
+    return json.dumps(
+        {
+            "runtime_origin": str(runtime_origin or package / "__init__.py"),
+            "identity_origin": str(
+                identity_origin or package / "platform_agent_identity.py"
+            ),
+            "constants": {
+                "MANAGEMENT_MCP_NPM_PACKAGE": "@molecule-ai/mcp-server",
+                "MANAGEMENT_MCP_PINNED_VERSION": "1.9.5",
+                "MANAGEMENT_MCP_COMPATIBLE_RANGE": "^1.8.0",
+                "MANAGEMENT_MCP_REGISTRY": (
+                    "https://git.moleculesai.app/api/packages/molecule-ai/npm/"
+                ),
+                "MANAGEMENT_MCP_REGISTRY_SCOPE": "@molecule-ai",
+                "REQUIRED_TOOL": required_tool,
+            },
+        }
     )
-    return distribution, runtime_module, identity_module
+
+
+def _import_probe_runner(
+    tmp_path: Path,
+    *,
+    runtime_origin: Path | None = None,
+    identity_origin: Path | None = None,
+    required_tool: str = "provision_workspace",
+):
+    def fake_run(_argv, **_kwargs):
+        return built_image.ProcessResult(
+            returncode=0,
+            stdout=_import_probe_output(
+                tmp_path,
+                runtime_origin=runtime_origin,
+                identity_origin=identity_origin,
+                required_tool=required_tool,
+            ),
+            stderr="",
+        )
+
+    return fake_run
 
 
 def test_installed_runtime_matches_distribution_origin_helper_and_constants(
@@ -238,7 +266,43 @@ def test_installed_runtime_matches_distribution_origin_helper_and_constants(
 ) -> None:
     _installed_fixture(tmp_path, monkeypatch)
 
-    built_image.verify_installed_runtime(_attestation())
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return built_image.ProcessResult(
+            returncode=0,
+            stdout=_import_probe_output(tmp_path),
+            stderr="",
+        )
+
+    built_image.verify_installed_runtime(_attestation(), run_process=fake_run)
+
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[:2] == [sys.executable, "-I"]
+    assert kwargs["timeout_seconds"] == built_image.PROCESS_TIMEOUT_SECONDS
+    assert kwargs["max_output_bytes"] == built_image.MAX_PROCESS_OUTPUT_BYTES
+    assert "PYTHONPATH" not in kwargs["env"]
+
+
+def test_installed_runtime_redacts_failed_import_child_output(
+    tmp_path, monkeypatch
+) -> None:
+    _installed_fixture(tmp_path, monkeypatch)
+    marker = "credential=must-not-log"
+
+    def fake_run(_argv, **_kwargs):
+        return built_image.ProcessResult(
+            returncode=1,
+            stdout=marker,
+            stderr=marker,
+        )
+
+    with pytest.raises(built_image.BuiltImageE2EError) as caught:
+        built_image.verify_installed_runtime(_attestation(), run_process=fake_run)
+
+    assert marker not in str(caught.value)
 
 
 def test_installed_runtime_rejects_distribution_version_drift(
@@ -253,14 +317,16 @@ def test_installed_runtime_rejects_distribution_version_drift(
 def test_installed_runtime_rejects_shadowed_import_origin(
     tmp_path, monkeypatch
 ) -> None:
-    _distribution, runtime_module, _identity = _installed_fixture(tmp_path, monkeypatch)
+    _installed_fixture(tmp_path, monkeypatch)
     shadow = tmp_path / "shadow" / "molecule_runtime" / "__init__.py"
     shadow.parent.mkdir(parents=True)
     shadow.write_text("")
-    runtime_module.__file__ = str(shadow)
 
     with pytest.raises(built_image.BuiltImageE2EError, match="import origin"):
-        built_image.verify_installed_runtime(_attestation())
+        built_image.verify_installed_runtime(
+            _attestation(),
+            run_process=_import_probe_runner(tmp_path, runtime_origin=shadow),
+        )
 
 
 def test_installed_runtime_rejects_helper_digest_drift(tmp_path, monkeypatch) -> None:
@@ -270,7 +336,10 @@ def test_installed_runtime_rejects_helper_digest_drift(tmp_path, monkeypatch) ->
     )
 
     with pytest.raises(built_image.BuiltImageE2EError, match="helper digest"):
-        built_image.verify_installed_runtime(_attestation())
+        built_image.verify_installed_runtime(
+            _attestation(),
+            run_process=_import_probe_runner(tmp_path),
+        )
 
 
 def test_installed_runtime_rejects_oversized_helper(tmp_path, monkeypatch) -> None:
@@ -278,17 +347,25 @@ def test_installed_runtime_rejects_oversized_helper(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(built_image, "MAX_INSTALLED_HELPER_BYTES", 4, raising=False)
 
     with pytest.raises(built_image.BuiltImageE2EError, match="helper is too large"):
-        built_image.verify_installed_runtime(_attestation())
+        built_image.verify_installed_runtime(
+            _attestation(),
+            run_process=_import_probe_runner(tmp_path),
+        )
 
 
 def test_installed_runtime_rejects_executable_constant_drift(
     tmp_path, monkeypatch
 ) -> None:
-    _distribution, _runtime, identity = _installed_fixture(tmp_path, monkeypatch)
-    identity.REQUIRED_TOOL = "different_tool"
+    _installed_fixture(tmp_path, monkeypatch)
 
     with pytest.raises(built_image.BuiltImageE2EError, match="constants"):
-        built_image.verify_installed_runtime(_attestation())
+        built_image.verify_installed_runtime(
+            _attestation(),
+            run_process=_import_probe_runner(
+                tmp_path,
+                required_tool="different_tool",
+            ),
+        )
 
 
 def test_validate_jsonrpc_requires_initialize_and_management_tool() -> None:
@@ -480,13 +557,13 @@ def test_offline_probes_cover_exact_and_range_under_both_homes(
             stderr="",
         )
 
-    reported_version = built_image.verify_offline_mcp(
+    version_proof = built_image.verify_offline_mcp(
         _attestation(),
         npx_path="/opt/node/bin/npx",
         run_process=fake_run,
     )
 
-    assert reported_version == "1.0.0"
+    assert version_proof == "emitted-consistent"
     assert len(calls) == 4
     specs = [call[0][-1] for call in calls]
     assert specs == [
@@ -572,6 +649,26 @@ def test_offline_probes_reject_inconsistent_server_info_version_presence() -> No
         )
 
 
+def test_offline_probes_do_not_return_child_controlled_server_info_version() -> None:
+    marker = "credential=must-not-log"
+
+    def fake_run(_argv, **_kwargs):
+        return built_image.ProcessResult(
+            returncode=0,
+            stdout=_jsonrpc_output(version=marker).decode(),
+            stderr="",
+        )
+
+    version_proof = built_image.verify_offline_mcp(
+        _attestation(),
+        npx_path="/opt/node/bin/npx",
+        run_process=fake_run,
+    )
+
+    assert version_proof == "emitted-consistent"
+    assert marker not in version_proof
+
+
 def test_find_npx_honors_the_sanctioned_node_bin_override(tmp_path) -> None:
     node_bin = tmp_path / "node-bin"
     node_bin.mkdir()
@@ -621,11 +718,11 @@ def test_cli_success_includes_optional_server_info_version(monkeypatch, capsys) 
     monkeypatch.setattr(
         built_image,
         "verify_offline_mcp",
-        lambda *_args, **_kwargs: "1.0.0",
+        lambda *_args, **_kwargs: "emitted-consistent",
     )
 
     assert built_image.main() == 0
     captured = capsys.readouterr()
     assert built_image.SENTINEL in captured.out
-    assert 'serverInfo.version="1.0.0"' in captured.out
+    assert "serverInfo.version=emitted-consistent" in captured.out
     assert captured.err == ""

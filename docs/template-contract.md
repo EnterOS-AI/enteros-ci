@@ -151,7 +151,8 @@ home and a foreign home (four JSON-RPC launches). Every launch must complete
 `initialize`, acknowledge initialization, answer `tools/list`, and expose the attested
 required tool. If `serverInfo.version` is emitted it must be bounded and identical across
 the four launches, but it is not the npm artifact version and must not be compared to the
-npm pin.
+npm pin. The verifier never echoes that child-controlled value; it reports only whether
+the value was consistently emitted.
 
 Because existing Tier-4 probes use privileged host mounts, fork PRs must be skipped by an
 explicit fork guard before any privileged step, while internal PRs and `main` pushes must
