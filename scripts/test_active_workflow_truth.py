@@ -85,8 +85,17 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     archive_runs = "\n".join(step["run"] for step in archive["steps"] if "run" in step)
     assert (
         "python3 -m pip install --break-system-packages "
-        "--disable-pip-version-check --no-deps --only-binary=:all: PyYAML==6.0.3"
+        "--disable-pip-version-check --no-deps --only-binary=:all: "
+        "--require-hashes -r scripts/requirements-official-consumer-contract.txt"
         in archive_runs
+    )
+    parser_requirements = (
+        ROOT / "scripts" / "requirements-official-consumer-contract.txt"
+    ).read_text()
+    assert "PyYAML==6.0.3" in parser_requirements
+    assert (
+        "--hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d"
+        in parser_requirements
     )
     assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
     assert "strict_json_loads" in archive_runs

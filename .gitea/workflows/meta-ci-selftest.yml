@@ -16,6 +16,7 @@ on:
       - "scripts/test_mcp_pin_lockstep.py"
       - "scripts/official_consumer_contract.py"
       - "scripts/test_official_consumer_contract.py"
+      - "scripts/requirements-official-consumer-contract.txt"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -28,6 +29,7 @@ on:
       - "scripts/test_mcp_pin_lockstep.py"
       - "scripts/official_consumer_contract.py"
       - "scripts/test_official_consumer_contract.py"
+      - "scripts/requirements-official-consumer-contract.txt"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -74,7 +76,7 @@ jobs:
         run: >-
           python3 -m pip install --break-system-packages
           --disable-pip-version-check --no-deps --only-binary=:all:
-          PyYAML==6.0.3
+          --require-hashes -r scripts/requirements-official-consumer-contract.txt
       - name: Validate immutable consumer artifact pins
         env:
           GIT_ASKPASS: /bin/false

@@ -175,13 +175,22 @@ workflow key remains `official-consumer-archives`) rejects duplicate JSON fields
 persisted checkout credentials, and fetches each exact commit anonymously. It extracts
 only three bounded regular-file blobs with `git show`: `.runtime-version`,
 `.gitea/workflows/ci.yml`, and `tests/test_ci_runtime_image_pin.py`. The standalone
-artifact checker verifies the runtime pin. The archive job installs the exact, no-deps
-`PyYAML==6.0.3` wheel, and `official_consumer_contract.py` treats both remaining blobs as
-inert UTF-8 data. A duplicate-key-rejecting YAML loader proves the active workflow
-triggers, Docker runner, `t4-conformance` dependency path, exact fork guards, immutable
-ref scope, fail-closed shell mode, and ordered fetch/attest/build/create/copy/start/sentinel
-commands directly. It also rejects error masking, shell ref mutation, verifier bind
-mounts, and image-tag drift. The Python test file is only a bounded regression marker;
+artifact checker verifies the runtime pin. The archive job installs `PyYAML==6.0.3` as a
+no-deps binary wheel under a checked-in hash lock, and
+`official_consumer_contract.py` treats both remaining blobs as inert UTF-8 data. A
+duplicate-key-rejecting YAML loader proves the active workflow triggers, least-privilege
+permissions, Docker runner, immutable credential-free checkout, `t4-conformance`
+dependency path into an isolated, unconditional `always()` aggregate, exact fork guards,
+immutable ref scope, fail-closed shell mode, and ordered
+fetch/attest/build/create/copy/start/sentinel commands directly. The fetched checker and
+verifier must be Git-content-sealed before checker execution, reviewed attestation
+loading, and verifier copy. Only the reviewed loader bodies may import that verifier.
+The generated attestation must be atomically installed, SHA-256-sealed, and rechecked
+immediately before both parsing and verifier startup. The checker also rejects dangerous
+execution environment overrides, error masking, dynamic command dispatch, background races,
+unsafe exit traps, unreviewed executable heredocs, shell ref mutation, pre-sentinel
+privileged or host-bound operations, verifier bind mounts, and image-tag drift. The
+Python test file is only a bounded regression marker;
 pytest collection or skip behavior is not a trust input. Consumer code is never imported
 or executed. The job also requires all four extracted runtime pins
 to be identical, so four individually valid templates cannot hide fleet drift. Dedicated

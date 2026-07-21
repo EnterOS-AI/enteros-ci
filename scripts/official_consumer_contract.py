@@ -29,6 +29,7 @@ _WORKFLOW_PATH = Path(".gitea/workflows/ci.yml")
 _TEST_PATH = Path("tests/test_ci_runtime_image_pin.py")
 _PROOF_JOB = "t4-conformance"
 _AGGREGATE_JOBS = frozenset({"validate", "all-required"})
+_CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 _T4_TAG_ASSIGNMENT = (
     'T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"'
 )
@@ -48,6 +49,46 @@ _FORK_GUARDS = frozenset(
             "github.event_name == 'pull_request' && "
             "github.event.pull_request.head.repo.fork == true"
         ),
+    }
+)
+_FORK_EXPRESSION = (
+    "github.event_name == 'pull_request' && "
+    "github.event.pull_request.head.repo.fork == true"
+)
+_DANGEROUS_ENVIRONMENT_NAMES = frozenset(
+    {
+        "BASH_ENV",
+        "BASHOPTS",
+        "CDPATH",
+        "CURL_CA_BUNDLE",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "DOCKER_TLS_VERIFY",
+        "ENV",
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "GITHUB_ENV",
+        "GITHUB_PATH",
+        "IFS",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SHELLOPTS",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
     }
 )
 _REQUIRED_TESTS = {
@@ -312,6 +353,16 @@ def _validate_dependency_graph(jobs: dict[str, Any]) -> set[str]:
         raise OfficialConsumerContractError(
             "t4-conformance proof does not reach a downstream aggregate"
         )
+    always_aggregates = {
+        name
+        for name in aggregates
+        if _normalize_condition(_mapping(jobs[name], f"workflow job {name}").get("if"))
+        == "always()"
+    }
+    if not always_aggregates:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof does not reach an unconditional always aggregate"
+        )
     for name in reachable:
         if name == _PROOF_JOB:
             continue
@@ -336,26 +387,51 @@ def _validate_dependency_graph(jobs: dict[str, Any]) -> set[str]:
 
 
 def _validate_always_aggregate(job: dict[str, Any], name: str) -> None:
+    steps = _steps(job, f"workflow job {name}")
+    try:
+        _validate_safe_environment(job, f"workflow {name} always aggregate")
+        for step in steps:
+            _validate_safe_environment(step, f"workflow {name} always aggregate step")
+    except OfficialConsumerContractError as exc:
+        raise OfficialConsumerContractError(
+            f"workflow {name} always aggregate execution boundary is unsafe"
+        ) from exc
+    if (
+        "defaults" in job
+        or "container" in job
+        or "services" in job
+        or len(steps) != 1
+        or "uses" in steps[0]
+    ):
+        raise OfficialConsumerContractError(
+            f"workflow {name} always aggregate execution boundary is unsafe"
+        )
+
     result_expression = "${{ needs.t4-conformance.result }}"
-    for step in _steps(job, f"workflow job {name}"):
+    saw_result = False
+    saw_conditional = False
+    saw_non_failing_assertion = False
+    for step in steps:
         script = step.get("run")
         if not isinstance(script, str):
             continue
+        if result_expression not in script:
+            continue
+        saw_result = True
+        if _normalize_condition(step.get("if")) is not None:
+            saw_conditional = True
+            continue
+        if "shell" in step:
+            saw_non_failing_assertion = True
+            continue
         units = _script_units(script)
-        if any(
-            unit.text
-            in {
-                f'test "{result_expression}" = success',
-                f'test "{result_expression}" = "success"',
-            }
-            and not unit.controls
-            for unit in units
-        ):
-            return
-        assignment = next(
+        if any(_relaxes_fail_closed_shell_mode(unit.text) for unit in units):
+            saw_non_failing_assertion = True
+            continue
+        assignment_entry = next(
             (
-                match
-                for unit in units
+                (index, match)
+                for index, unit in enumerate(units)
                 if not unit.controls
                 and (
                     match := re.fullmatch(
@@ -366,27 +442,118 @@ def _validate_always_aggregate(job: dict[str, Any], name: str) -> None:
             ),
             None,
         )
-        if assignment is None:
+        if assignment_entry is None:
+            saw_non_failing_assertion = True
             continue
+        assignment_index, assignment = assignment_entry
         variable = assignment.group("name")
-        failure_condition = next(
+        variable_assignments = [
+            candidate.text
+            for candidate in units
+            if re.match(
+                rf"^{re.escape(variable)}(?:\[[^]]*\])?\s*(?:\+?=)",
+                candidate.text,
+            )
+        ]
+        if (
+            variable_assignments != [assignment.group(0)]
+            or re.search(rf"\$\{{{re.escape(variable)}(?::?[=+])", script)
+            or re.search(
+                r"(?m)^\s*(?:(?:builtin|command)\s+)?(?:eval|source|unset|read|"
+                r"readarray|mapfile|declare|typeset|local|readonly|export)\b",
+                script,
+            )
+            or re.search(r"(?m)^\s*\.\s+", script)
+            or re.search(r"(?m)^\s*printf\b[^\n]*\s-v(?:\s|$)", script)
+            or re.search(
+                r"(?m)^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{",
+                script,
+            )
+        ):
+            saw_non_failing_assertion = True
+            continue
+        failure_index = next(
             (
-                unit.text
-                for unit in units
-                if re.match(
-                    rf'^if \[\[? "\${variable}" != "?success"? \]\]?; then$',
+                index
+                for index, unit in enumerate(units)
+                if re.fullmatch(
+                    rf'if \[ "\${variable}" != "success" \]; then',
                     unit.text,
                 )
             ),
             None,
         )
-        if failure_condition is not None and any(
-            unit.text == "exit 1" and failure_condition in unit.controls
-            for unit in units
+        if failure_index is None or assignment_index >= failure_index:
+            saw_non_failing_assertion = True
+            continue
+        failure_condition = units[failure_index].text
+        for exit_index, unit in enumerate(
+            units[failure_index + 1 :], failure_index + 1
         ):
-            return
+            if unit.text != "exit 1" or failure_condition not in unit.controls:
+                continue
+            nested_controls = tuple(
+                control for control in unit.controls if control != failure_condition
+            )
+            if not nested_controls:
+                return
+            if len(nested_controls) != 1:
+                continue
+            carveout = nested_controls[0]
+            carveout_match = re.fullmatch(
+                rf'if \[ "\${variable}" = "skipped" \] && '
+                r'\[ "\$(?P<fork>[A-Za-z_][A-Za-z0-9_]*)" = "true" \]; then',
+                carveout,
+            )
+            if carveout_match is None or not any(
+                candidate.text == "else"
+                and candidate.controls == (failure_condition, carveout)
+                for candidate in units[failure_index + 1 : exit_index]
+            ):
+                continue
+            if _aggregate_fork_binding_is_exact(
+                job, step, units, failure_index, carveout_match.group("fork")
+            ):
+                return
+        saw_non_failing_assertion = True
+    if saw_conditional:
+        raise OfficialConsumerContractError(
+            f"workflow {name} always aggregate assertion must be unconditional"
+        )
+    if saw_result and saw_non_failing_assertion:
+        raise OfficialConsumerContractError(
+            f"workflow {name} always aggregate does not fail closed"
+        )
     raise OfficialConsumerContractError(
         f"workflow {name} always aggregate does not enforce t4-conformance success"
+    )
+
+
+def _aggregate_fork_binding_is_exact(
+    job: dict[str, Any],
+    step: dict[str, Any],
+    units: list[_ShellUnit],
+    before_index: int,
+    variable: str,
+) -> bool:
+    direct = f'"${{{{ {_FORK_EXPRESSION} }}}}"'
+    assignments = [
+        (index, match.group("value"))
+        for index, unit in enumerate(units)
+        if (match := re.fullmatch(rf"{re.escape(variable)}=(?P<value>.+)", unit.text))
+        is not None
+    ]
+    if len(assignments) != 1 or assignments[0][0] >= before_index:
+        return False
+    value = assignments[0][1]
+    if value == direct:
+        return True
+    if value != '"${IS_FORK_PR:-false}"' or "IS_FORK_PR" in _env(
+        step, "aggregate step"
+    ):
+        return False
+    return _normalize_condition(_env(job, "aggregate job").get("IS_FORK_PR")) == (
+        _FORK_EXPRESSION
     )
 
 
@@ -433,8 +600,66 @@ _FUNCTION_HEADER_RE = re.compile(
     r"^(?:function\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{$"
 )
 _REQUIRED_EXECUTABLES = frozenset(
-    {"docker", "git", "grep", "mv", "python3", "tee", "test"}
+    {"docker", "git", "grep", "mv", "python3", "sha256sum", "tee", "test"}
 )
+_CLEANUP_FUNCTIONS = frozenset(
+    {"cleanup_mcp_e2e", "cleanup_mcp_proof_fetch", "cleanup_t4_build"}
+)
+_SAFE_PROBE_TRAPS = frozenset(
+    {
+        'trap \'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; '
+        'docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true\' EXIT',
+        'trap \'docker rm -f "$CAPLESS_PROBE" "$T4_PROBE" '
+        '>/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" '
+        ">/dev/null 2>&1 || true' EXIT",
+    }
+)
+_CLEANUP_FILE_VARIABLES = frozenset(
+    {
+        "ATTESTATION",
+        "ATTESTATION_SHA256",
+        "ATTESTATION_TMP",
+        "MCP_ATTESTATION",
+        "MCP_ATTESTATION_SHA256",
+        "MCP_ATTESTATION_TMP",
+        "MCP_E2E_LOG",
+        "MCP_VERIFY_LOG",
+        "RUNTIME_VERSION_FILE",
+    }
+)
+
+
+def _validate_cleanup_function(name: str, units: list[str]) -> None:
+    if name not in _CLEANUP_FUNCTIONS:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof contains an unsupported shell function"
+        )
+    safe_exact = {
+        'docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true',
+        'docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true',
+        'if [ "$KEEP_MCP_PROOF" -ne 1 ]; then',
+        'if [ "$KEEP_T4_IMAGE" -ne 1 ]; then',
+        "fi",
+    }
+    safe_roots = {
+        'rm -rf -- "$CI_ROOT"',
+        'rm -rf -- "$MOLECULE_CI_ROOT"',
+    }
+    safe_files = re.compile(
+        r"rm -f -- "
+        + r"(?:\"\$(?:"
+        + "|".join(sorted(_CLEANUP_FILE_VARIABLES))
+        + r")\"(?:\s+|$))+"
+    )
+    if not units or any(
+        unit not in safe_exact
+        and unit not in safe_roots
+        and safe_files.fullmatch(unit) is None
+        for unit in units
+    ):
+        raise OfficialConsumerContractError(
+            "workflow cleanup function contains an unsupported command"
+        )
 
 
 def _opens_control(unit: str) -> bool:
@@ -448,17 +673,39 @@ def _closes_control(unit: str) -> bool:
     return unit in {"fi", "done", "esac", "}", ")"}
 
 
+def _shell_command(unit: str) -> tuple[list[str], int] | None:
+    try:
+        tokens = shlex.split(unit, posix=True)
+    except ValueError:
+        return None
+    position = 0
+    if tokens[:1] == ["if"]:
+        position += 1
+    if position < len(tokens) and tokens[position] == "!":
+        position += 1
+    while position < len(tokens) and re.fullmatch(
+        r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
+    ):
+        position += 1
+    while position < len(tokens) and tokens[position] in {"builtin", "command"}:
+        position += 1
+    return (tokens, position) if position < len(tokens) else None
+
+
 def _script_units(script: str) -> list[_ShellUnit]:
-    """Return reachable shell syntax units, excluding function and heredoc bodies.
+    """Return reachable shell units after validating bounded cleanup functions.
 
     This is intentionally a narrow parser for the reviewed official workflow
-    shape. Unknown nesting stays visible and therefore fails later predicates.
+    shape. Heredoc bodies remain data, while unknown nesting fails closed.
     """
 
     physical = script.splitlines()
     units: list[_ShellUnit] = []
     controls: list[str] = []
     in_function = False
+    function_name = ""
+    function_units: list[str] = []
+    safe_functions: set[str] = set()
     index = 0
     while index < len(physical):
         pending = ""
@@ -479,16 +726,41 @@ def _script_units(script: str) -> list[_ShellUnit]:
 
         function_header = _FUNCTION_HEADER_RE.fullmatch(unit)
         if not in_function and function_header:
-            if function_header.group("name") in _REQUIRED_EXECUTABLES:
+            function_name = function_header.group("name")
+            if function_name in _REQUIRED_EXECUTABLES:
                 raise OfficialConsumerContractError(
                     "workflow proof shadows a required executable"
                 )
+            if function_name in safe_functions:
+                raise OfficialConsumerContractError(
+                    "workflow ordered executable proof redefines a cleanup function"
+                )
             in_function = True
+            function_units = []
             continue
         if in_function:
             if unit == "}":
+                _validate_cleanup_function(function_name, function_units)
+                safe_functions.add(function_name)
                 in_function = False
+                function_name = ""
+                function_units = []
+            else:
+                function_units.append(unit)
             continue
+
+        command = _shell_command(unit)
+        if command is not None and command[0][command[1]] == "trap":
+            trap = re.fullmatch(
+                r"trap (?P<function>cleanup_(?:mcp_e2e|mcp_proof_fetch|t4_build)) EXIT",
+                unit,
+            )
+            if unit not in _SAFE_PROBE_TRAPS and (
+                trap is None or trap.group("function") not in safe_functions
+            ):
+                raise OfficialConsumerContractError(
+                    "workflow proof contains an unsupported exit trap"
+                )
 
         if _closes_control(unit) and controls:
             controls.pop()
@@ -585,6 +857,103 @@ def _env(container: dict[str, Any], label: str) -> dict[str, Any]:
     if value is None:
         return {}
     return _mapping(value, f"{label} env")
+
+
+def _dangerous_environment_name(name: str) -> bool:
+    normalized = name.upper()
+    if normalized == "GITHUB_SERVER_URL":
+        return False
+    return normalized in _DANGEROUS_ENVIRONMENT_NAMES or normalized.startswith(
+        (
+            "ACTIONS_",
+            "BASH_FUNC_",
+            "BUILDX_",
+            "DOCKER_",
+            "DYLD_",
+            "GIT_",
+            "GITHUB_",
+            "LD_",
+            "NODE_",
+            "NPM_",
+            "PIP_",
+            "PNPM_",
+            "PYTHON",
+            "RUNNER_",
+            "YARN_",
+        )
+    )
+
+
+def _validate_safe_environment(container: dict[str, Any], label: str) -> None:
+    environment = _env(container, label)
+    dangerous_name = next(
+        (name for name in environment if _dangerous_environment_name(name)), None
+    )
+    if dangerous_name is not None or (
+        "GITHUB_SERVER_URL" in environment
+        and environment["GITHUB_SERVER_URL"] != "https://git.moleculesai.app"
+    ):
+        raise OfficialConsumerContractError(
+            f"{label} contains a dangerous environment override"
+        )
+
+
+def _validate_permissions(workflow: dict[str, Any], proof_job: dict[str, Any]) -> None:
+    expected = {"contents": "read"}
+    if workflow.get("permissions") != expected:
+        raise OfficialConsumerContractError(
+            "workflow must declare exact contents: read permissions"
+        )
+    if "permissions" in proof_job and proof_job["permissions"] != expected:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job must retain exact contents: read permissions"
+        )
+
+
+def _validate_checkout_step(step: dict[str, Any]) -> None:
+    if step.get("uses") != _CHECKOUT_ACTION:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof uses a non-immutable allowlisted action"
+        )
+    options = _mapping(step.get("with"), "t4-conformance checkout with")
+    if options.get("persist-credentials") is not False:
+        raise OfficialConsumerContractError(
+            "t4-conformance checkout must set persist-credentials: false"
+        )
+    if options != {"persist-credentials": False}:
+        raise OfficialConsumerContractError(
+            "t4-conformance checkout has unsupported options"
+        )
+    if _normalize_condition(step.get("if")) is not None or set(step).difference(
+        {"name", "uses", "with"}
+    ):
+        raise OfficialConsumerContractError(
+            "t4-conformance checkout must be unconditional and side-effect bounded"
+        )
+
+
+def _strict_inert_fork_notice(step: dict[str, Any]) -> bool:
+    if set(step).difference({"name", "if", "run"}):
+        return False
+    script = step.get("run")
+    if not isinstance(script, str):
+        return False
+    units = _script_units(script)
+    if len(units) != 1 or units[0].controls or units[0].heredoc_bodies:
+        return False
+    unit = units[0].text
+    if any(
+        character in unit for character in ("$", "`", "\\", ";", "|", "&", "<", ">")
+    ):
+        return False
+    tokens = _tokens(unit, "fork notice")
+    return (
+        len(tokens) == 2
+        and tokens[0] == "echo"
+        and tokens[1].startswith("::notice::")
+        and unit.startswith('echo "::notice::')
+        and unit.endswith('"')
+    )
 
 
 def _validate_ref_scopes(
@@ -684,6 +1053,164 @@ def _tokens(unit: str, label: str) -> list[str]:
         raise OfficialConsumerContractError(
             f"workflow {label} command is not statically parseable"
         ) from exc
+
+
+def _relaxes_fail_closed_shell_mode(unit: str) -> bool:
+    command = _shell_command(unit)
+    if command is None:
+        return False
+    tokens, command_index = command
+    if tokens[command_index] != "set":
+        return False
+    options = tokens[command_index + 1 :]
+    for index, token in enumerate(options):
+        if re.fullmatch(r"\+[A-Za-z]*[eu][A-Za-z]*", token):
+            return True
+        if token == "+o" and index + 1 < len(options):
+            if options[index + 1] in {"errexit", "nounset", "pipefail"}:
+                return True
+    return False
+
+
+def _dangerous_shell_environment_override(unit: str) -> bool:
+    if any(marker in unit for marker in ("$GITHUB_PATH", "${GITHUB_PATH}")):
+        return True
+    command = _shell_command(unit)
+    if command is not None and command[0][command[1]] in {
+        "alias",
+        "enable",
+        "hash",
+        "shopt",
+        "unalias",
+    }:
+        return True
+    if _EXACT_FETCH_RE.fullmatch(unit) is not None:
+        return False
+    assignments = re.finditer(r"(?<![A-Za-z0-9_])(?P<name>[A-Z_][A-Z0-9_]*)=", unit)
+    return any(
+        match.group("name") == "GITHUB_SERVER_URL"
+        or _dangerous_environment_name(match.group("name"))
+        for match in assignments
+    )
+
+
+def _contains_background_operator(unit: str) -> bool:
+    for index, character in enumerate(unit):
+        if character != "&":
+            continue
+        previous = unit[index - 1] if index else ""
+        following = unit[index + 1] if index + 1 < len(unit) else ""
+        if previous in {"&", ">", "<"} or following in {"&", ">"}:
+            continue
+        return True
+    return False
+
+
+def _uses_dynamic_command_dispatch(unit: str) -> bool:
+    try:
+        tokens = shlex.split(unit, posix=True)
+    except ValueError:
+        return False
+    position = 0
+    if tokens[:1] == ["if"]:
+        position += 1
+    if position < len(tokens) and tokens[position] == "!":
+        position += 1
+    while position < len(tokens) and re.fullmatch(
+        r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
+    ):
+        position += 1
+    while position < len(tokens) and tokens[position] in {
+        "builtin",
+        "command",
+        "env",
+        "exec",
+    }:
+        position += 1
+        while position < len(tokens) and re.fullmatch(
+            r"[A-Z_][A-Z0-9_]*=.*", tokens[position]
+        ):
+            position += 1
+    return position < len(tokens) and any(
+        marker in tokens[position] for marker in ("$", "`")
+    )
+
+
+def _validate_pre_sentinel_shell(
+    trace: list[_TraceUnit], loader_index: int, sentinel_index: int
+) -> None:
+    for index, unit in enumerate(trace[: sentinel_index + 1]):
+        if unit.heredoc_bodies and index != loader_index:
+            raise OfficialConsumerContractError(
+                "workflow proof contains an unreviewed executable heredoc before "
+                "the verifier sentinel"
+            )
+        if _relaxes_fail_closed_shell_mode(unit.text):
+            raise OfficialConsumerContractError(
+                "workflow proof relaxes fail-closed shell mode before the sentinel"
+            )
+        if _dangerous_shell_environment_override(unit.text):
+            raise OfficialConsumerContractError(
+                "workflow proof contains a dangerous environment override"
+            )
+        if _uses_dynamic_command_dispatch(unit.text):
+            raise OfficialConsumerContractError(
+                "workflow proof uses dynamic command dispatch before the verifier sentinel"
+            )
+        if _contains_background_operator(unit.text):
+            raise OfficialConsumerContractError(
+                "workflow proof starts background work before the verifier sentinel"
+            )
+
+
+def _validate_no_privileged_pre_sentinel(
+    trace: list[_TraceUnit],
+    sentinel_index: int,
+    allowed_docker_indexes: frozenset[int],
+) -> None:
+    forbidden_option = re.compile(
+        r"(?:^|\s)(?:--privileged(?:=true)?|--pid(?:=|\s+)host|"
+        r"--network(?:=|\s+)host|--volume(?:=|\s+)|-v(?:=|\s+)|"
+        r"--mount(?:=|\s+)|--volumes-from(?:=|\s+))"
+    )
+    safe_runtime_probe = [
+        "docker",
+        "run",
+        "--rm",
+        "--entrypoint",
+        "python3",
+        "$T4_TAG",
+        "-c",
+        "from importlib.metadata import version; "
+        'print(version("molecules-workspace-runtime"))',
+    ]
+    safe_cleanup = {
+        'docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true',
+        'docker rm "$MCP_VERIFY_CONTAINER" >/dev/null',
+    }
+    for index, unit in enumerate(trace[:sentinel_index]):
+        text = unit.text
+        if (
+            forbidden_option.search(text)
+            or "/var/run/docker.sock" in text
+            or re.search(r"\b(?:nsenter|pkexec|sudo|unshare)\b", text)
+        ):
+            raise OfficialConsumerContractError(
+                "workflow privileged or host-bound operation precedes the verifier sentinel"
+            )
+        docker_command = re.search(r"(?:^|[;&|]\s*|\$\(\s*|^if !\s+)docker\s+", text)
+        if docker_command is None or index in allowed_docker_indexes:
+            continue
+        if text == "if ! docker info >/dev/null 2>&1; then" or text in safe_cleanup:
+            continue
+        if (
+            text.startswith("docker run ")
+            and _tokens(text, "pre-sentinel docker run") == safe_runtime_probe
+        ):
+            continue
+        raise OfficialConsumerContractError(
+            "workflow privileged or host-bound operation precedes the verifier sentinel"
+        )
 
 
 def _option_values(tokens: list[str], option: str) -> list[str]:
@@ -851,6 +1378,39 @@ def _validate_tag_binding(script: str, stage: str) -> None:
         )
 
 
+_PATH_ATTESTATION_LOADER = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from mcp_built_image_e2e import load_attestation
+
+with Path(sys.argv[2]).open("rb") as stream:
+    sys.stdout.write(load_attestation(stream).runtime_version)"""
+_IMPORTLIB_ATTESTATION_LOADER = """\
+import importlib.util
+from pathlib import Path
+import sys
+
+verifier_path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "_molecule_ci_mcp_built_image_e2e", verifier_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load immutable built-image verifier")
+verifier = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = verifier
+spec.loader.exec_module(verifier)
+with Path(sys.argv[2]).open("rb") as stream:
+    print(verifier.load_attestation(stream).runtime_version)"""
+_ALLOWED_ATTESTATION_LOADER_BODIES = frozenset(
+    {
+        _PATH_ATTESTATION_LOADER,
+        _IMPORTLIB_ATTESTATION_LOADER,
+    }
+)
+
+
 def _has_attestation_load(unit: _TraceUnit) -> bool:
     if "python3 " not in unit.text or "<<" not in unit.text:
         return False
@@ -888,6 +1448,8 @@ def _has_attestation_load(unit: _TraceUnit) -> bool:
         )
 
     for body in unit.heredoc_bodies:
+        if body.strip() not in _ALLOWED_ATTESTATION_LOADER_BODIES:
+            continue
         try:
             module = ast.parse(body, mode="exec")
         except SyntaxError:
@@ -897,11 +1459,134 @@ def _has_attestation_load(unit: _TraceUnit) -> bool:
     return False
 
 
+def _validate_attestation_loader(
+    trace: list[_TraceUnit],
+    remote_index: int,
+    loader_index: int,
+    start_index: int,
+) -> str:
+    unit = trace[loader_index]
+    if unit.controls or len(unit.heredoc_bodies) != 1:
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader is not top-level and exact"
+        )
+    body = unit.heredoc_bodies[0].strip()
+    prefix = r'(?:EXPECTED_RUNTIME_VERSION="\$\()?'
+    if body == _PATH_ATTESTATION_LOADER:
+        loader_pattern = (
+            prefix
+            + r'python3 - "\$(?P<root>[A-Z_][A-Z0-9_]*)" '
+            + r'"\$(?P<attestation>[A-Z_][A-Z0-9_]*)" <<\'PY\''
+        )
+    elif body == _IMPORTLIB_ATTESTATION_LOADER:
+        loader_pattern = (
+            prefix
+            + r'python3 - "\$(?P<root>[A-Z_][A-Z0-9_]*)/'
+            + r'scripts/mcp_built_image_e2e\.py" '
+            + r'"\$(?P<attestation>[A-Z_][A-Z0-9_]*)" <<\'PY\''
+        )
+    else:
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader contains unreviewed Python"
+        )
+    loader = re.fullmatch(loader_pattern, unit.text)
+    remote = re.search(
+        r'git\s+-C\s+"\$([A-Z_][A-Z0-9_]*)"\s+remote add origin',
+        trace[remote_index].text,
+    )
+    if loader is None or remote is None:
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader source is invalid"
+        )
+    if _binding_snapshot(
+        trace, loader_index, loader.group("root")
+    ) != _binding_snapshot(trace, remote_index, remote.group(1)):
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader source is divergent"
+        )
+
+    start_attestation, _ = _start_bindings(trace[start_index].text)
+    start_attestation_name = _variable_token_name(
+        start_attestation, "attestation input"
+    )
+    if _binding_snapshot(
+        trace, loader_index, loader.group("attestation")
+    ) != _binding_snapshot(trace, start_index, start_attestation_name):
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader reads a divergent attestation"
+        )
+    return loader.group("root")
+
+
 def _require_top_level(trace: list[_TraceUnit], index: int, label: str) -> None:
     if trace[index].controls:
         raise OfficialConsumerContractError(
             f"workflow ordered executable proof hides {label} behind shell control flow"
         )
+
+
+def _start_command(unit: str) -> bool:
+    if not unit.startswith("docker start "):
+        return False
+    tokens = _tokens(unit, "verifier start")
+    if (
+        len(tokens) != 10
+        or tokens[:4] != ["docker", "start", "--attach", "--interactive"]
+        or tokens[4] != "$MCP_VERIFY_CONTAINER"
+        or tokens[5] != "<"
+        or re.fullmatch(r"\$[A-Z_][A-Z0-9_]*", tokens[6]) is None
+        or tokens[7:9] != ["|", "tee"]
+        or re.fullmatch(r"\$[A-Z_][A-Z0-9_]*", tokens[9]) is None
+    ):
+        raise OfficialConsumerContractError(
+            "workflow verifier start masks or alters the required command"
+        )
+    return True
+
+
+def _start_bindings(unit: str) -> tuple[str, str]:
+    if not _start_command(unit):
+        raise OfficialConsumerContractError("workflow verifier start is invalid")
+    tokens = _tokens(unit, "verifier start")
+    return tokens[6], tokens[9]
+
+
+_SENTINEL_ASSERTION_RE = re.compile(
+    r"^(?P<conditional>if ! )?grep -qxF "
+    r"(?P<quote>['\"])mcp-built-image-e2e:sentinel:executed(?P=quote) "
+    r'"?(?P<log>\$[A-Z_][A-Z0-9_]*)"?(?P<tail>; then)?$'
+)
+
+
+def _sentinel_assertion(unit: str) -> bool:
+    if not (unit.startswith("grep ") or unit.startswith("if ! grep ")):
+        return False
+    if "mcp-built-image-e2e:sentinel:executed" not in unit:
+        return False
+    match = _SENTINEL_ASSERTION_RE.fullmatch(unit)
+    if match is None or (match.group("conditional") is None) != (
+        match.group("tail") is None
+    ):
+        raise OfficialConsumerContractError(
+            "workflow sentinel assertion masks or alters the required command"
+        )
+    return True
+
+
+def _validate_sentinel_assertion(trace: list[_TraceUnit], sentinel_index: int) -> str:
+    unit = trace[sentinel_index]
+    match = _SENTINEL_ASSERTION_RE.fullmatch(unit.text)
+    if match is None:
+        raise OfficialConsumerContractError("workflow sentinel assertion is invalid")
+    if match.group("conditional") is not None and not any(
+        candidate.text == "exit 1" and candidate.controls == (unit.text,)
+        for candidate in trace[sentinel_index + 1 :]
+        if candidate.step_index == unit.step_index
+    ):
+        raise OfficialConsumerContractError(
+            "workflow sentinel assertion does not fail closed"
+        )
+    return match.group("log")
 
 
 _STABLE_RUNNER_VARIABLES = frozenset(
@@ -938,6 +1623,19 @@ def _binding_snapshot(
     if name in seen:
         raise OfficialConsumerContractError(f"workflow has a recursive {name} binding")
     value = _binding_before(trace, index, name)
+    if (
+        re.fullmatch(r'"(?:[^"`\\]|\\.)*"', value) is None
+        or "$(" in value
+        or "`" in value
+    ):
+        raise OfficialConsumerContractError(
+            f"workflow has a dynamic or unsafe {name} binding"
+        )
+    unparsed = _SHELL_VARIABLE_RE.sub("", value)
+    if "$" in unparsed:
+        raise OfficialConsumerContractError(
+            f"workflow has a dynamic or unsafe {name} binding"
+        )
     nested: list[tuple[str, object]] = []
     for match in _SHELL_VARIABLE_RE.finditer(value):
         dependency = match.group("braced") or match.group("plain")
@@ -961,23 +1659,74 @@ def _variable_token_name(token: str, label: str) -> str:
     return match.group(1)
 
 
+def _exact_sha_check(unit: _TraceUnit, sidecar: str) -> bool:
+    return (
+        unit.text.startswith("sha256sum ")
+        and not unit.controls
+        and _tokens(unit.text, "attestation content seal")
+        == [
+            "sha256sum",
+            "--check",
+            sidecar,
+        ]
+    )
+
+
+def _loader_seal_check_index(
+    trace: list[_TraceUnit], loader_index: int, sidecar: str
+) -> int | None:
+    if loader_index > 0 and _exact_sha_check(trace[loader_index - 1], sidecar):
+        return loader_index - 1
+    if (
+        loader_index > 1
+        and not trace[loader_index - 1].controls
+        and re.fullmatch(r'[A-Z_][A-Z0-9_]*="\$\(', trace[loader_index - 1].text)
+        and _exact_sha_check(trace[loader_index - 2], sidecar)
+    ):
+        return loader_index - 2
+    return None
+
+
+def _attestation_reference_is_allowed(
+    unit: _TraceUnit,
+    attestation: str,
+    sidecar: str,
+    loader_index: int,
+    current_index: int,
+    start_index: int,
+) -> bool:
+    if current_index == loader_index or current_index == start_index:
+        return True
+    tokens = _tokens(unit.text, "attestation use")
+    if tokens in (["test", "-s", attestation], ["test", "-f", attestation]):
+        return True
+    if re.fullmatch(
+        rf'if \[ ! -s "{re.escape(attestation)}" \]'
+        r'(?: \|\| \[ ! -s "\$[A-Z_][A-Z0-9_]*" \])?; then',
+        unit.text,
+    ):
+        return True
+    return _exact_sha_check(unit, sidecar)
+
+
 def _validate_attestation_flow(
-    trace: list[_TraceUnit], lockstep_index: int, start_index: int
+    trace: list[_TraceUnit],
+    lockstep_index: int,
+    loader_index: int,
+    start_index: int,
 ) -> None:
-    lockstep = trace[lockstep_index].text
-    redirection = re.search(r">\s*(\"?\$[A-Z_][A-Z0-9_]*\"?)", lockstep)
-    if redirection is None:
+    lockstep_tokens = _tokens(trace[lockstep_index].text, "MCP lockstep")
+    if len(lockstep_tokens) != 7 or lockstep_tokens[2:6] != [
+        "--repo-root",
+        ".",
+        "--json",
+        ">",
+    ]:
         raise OfficialConsumerContractError(
-            "workflow ordered executable proof does not persist the attestation"
+            "workflow ordered executable proof does not persist the attestation safely"
         )
-    produced = redirection.group(1).replace('"', "")
-    start = trace[start_index].text
-    consumed_match = re.search(r"<\s*(\"?\$[A-Z_][A-Z0-9_]*\"?)", start)
-    if consumed_match is None:
-        raise OfficialConsumerContractError(
-            "workflow ordered executable proof does not pipe the attestation"
-        )
-    consumed = consumed_match.group(1).replace('"', "")
+    produced = lockstep_tokens[6]
+    consumed, _ = _start_bindings(trace[start_index].text)
     produced_name = _variable_token_name(produced, "attestation output")
     consumed_name = _variable_token_name(consumed, "attestation input")
     consumed_at_generation = _binding_snapshot(trace, lockstep_index, consumed_name)
@@ -986,29 +1735,86 @@ def _validate_attestation_flow(
         raise OfficialConsumerContractError(
             "workflow ordered executable proof consumes a different attestation"
         )
-    if produced == consumed:
-        return
     produced_value = _binding_before(trace, lockstep_index, produced_name)
     if produced_value != f'"${{{consumed_name}}}.tmp"':
         raise OfficialConsumerContractError(
             "workflow ordered executable proof consumes a different attestation"
         )
-    expected_moves = {
-        f'mv "{produced}" "{consumed}"',
-        f'mv -f "{produced}" "{consumed}"',
-    }
-    if not any(
-        unit.text in expected_moves and not unit.controls
-        for unit in trace[lockstep_index + 1 : start_index]
+
+    move_index = lockstep_index + 1
+    optional_size_check = _tokens(
+        trace[move_index].text, "attestation temporary file check"
+    )
+    if optional_size_check == ["test", "-s", produced]:
+        move_index += 1
+    if move_index >= loader_index or (
+        trace[move_index].controls
+        or _tokens(trace[move_index].text, "attestation move")
+        not in (["mv", produced, consumed], ["mv", "-f", produced, consumed])
     ):
         raise OfficialConsumerContractError(
             "workflow ordered executable proof consumes a different attestation"
         )
 
+    seal_index = move_index + 1
+    if seal_index >= loader_index:
+        raise OfficialConsumerContractError(
+            "workflow attestation content seal is missing"
+        )
+    seal_tokens = _tokens(trace[seal_index].text, "attestation content seal")
+    if (
+        trace[seal_index].controls
+        or len(seal_tokens) != 4
+        or seal_tokens[:2] != ["sha256sum", consumed]
+        or seal_tokens[2] != ">"
+        or re.fullmatch(r"\$[A-Z_][A-Z0-9_]*", seal_tokens[3]) is None
+    ):
+        raise OfficialConsumerContractError(
+            "workflow attestation content seal is missing"
+        )
+    sidecar = seal_tokens[3]
+    sidecar_name = _variable_token_name(sidecar, "attestation content seal")
+    if _binding_before(trace, seal_index, sidecar_name) != (
+        f'"${{{consumed_name}}}.sha256"'
+    ):
+        raise OfficialConsumerContractError(
+            "workflow attestation content seal has a divergent path"
+        )
+
+    loader_check_index = _loader_seal_check_index(trace, loader_index, sidecar)
+    if loader_check_index is None:
+        raise OfficialConsumerContractError(
+            "workflow attestation content seal is not checked before parsing"
+        )
+    if start_index == 0 or not _exact_sha_check(trace[start_index - 1], sidecar):
+        raise OfficialConsumerContractError(
+            "workflow attestation content seal is not checked immediately before start"
+        )
+    sidecar_at_generation = _binding_snapshot(trace, seal_index, sidecar_name)
+    for check_index in (loader_check_index, start_index - 1):
+        if _binding_snapshot(trace, check_index, sidecar_name) != sidecar_at_generation:
+            raise OfficialConsumerContractError(
+                "workflow attestation content seal has a divergent path"
+            )
+
+    for index, unit in enumerate(trace[seal_index + 1 : start_index], seal_index + 1):
+        if attestation_in_unit := (consumed in unit.text or sidecar in unit.text):
+            if attestation_in_unit and not _attestation_reference_is_allowed(
+                unit,
+                consumed,
+                sidecar,
+                loader_index,
+                index,
+                start_index,
+            ):
+                raise OfficialConsumerContractError(
+                    "workflow attestation is rewritten after its content seal"
+                )
+
 
 def _validate_verifier_copy(
     trace: list[_TraceUnit], remote_index: int, copy_index: int
-) -> None:
+) -> str:
     tokens = _tokens(trace[copy_index].text, "docker cp")
     if len(tokens) != 4 or tokens[:2] != ["docker", "cp"]:
         raise OfficialConsumerContractError(
@@ -1054,13 +1860,19 @@ def _validate_verifier_copy(
         raise OfficialConsumerContractError(
             "workflow ordered executable proof copies an unreviewed verifier"
         )
+    return copy_root
 
 
 def _validate_lockstep_checker(
     trace: list[_TraceUnit], remote_index: int, lockstep_index: int
-) -> None:
+) -> str:
     tokens = _tokens(trace[lockstep_index].text, "MCP lockstep")
-    if len(tokens) < 2 or tokens[0] != "python3":
+    if (
+        len(tokens) != 7
+        or tokens[0] != "python3"
+        or tokens[2:6] != ["--repo-root", ".", "--json", ">"]
+        or re.fullmatch(r"\$[A-Z_][A-Z0-9_]*", tokens[6]) is None
+    ):
         raise OfficialConsumerContractError(
             "workflow ordered executable proof uses an unreviewed lockstep checker"
         )
@@ -1080,6 +1892,62 @@ def _validate_lockstep_checker(
     ) != _binding_snapshot(trace, remote_index, remote_match.group(1)):
         raise OfficialConsumerContractError(
             "workflow ordered executable proof uses an unreviewed lockstep checker"
+        )
+    return checker_match.group(1)
+
+
+def _validate_reviewed_tool_content_seal(
+    trace: list[_TraceUnit], use_index: int, root_name: str
+) -> None:
+    if use_index == 0:
+        raise OfficialConsumerContractError(
+            "workflow reviewed tool content seal is missing"
+        )
+    seal = trace[use_index - 1]
+    expected = [
+        "git",
+        "-C",
+        f"${root_name}",
+        "diff",
+        "--quiet",
+        "--no-ext-diff",
+        "--no-textconv",
+        "$MOLECULE_CI_REF",
+        "--",
+        "scripts/mcp_pin_lockstep.py",
+        "scripts/mcp_built_image_e2e.py",
+    ]
+    if seal.controls or _tokens(seal.text, "reviewed tool content seal") != expected:
+        raise OfficialConsumerContractError(
+            "workflow reviewed tool content seal is missing or not adjacent"
+        )
+    if _binding_snapshot(trace, use_index, root_name) != _binding_snapshot(
+        trace, use_index - 1, root_name
+    ):
+        raise OfficialConsumerContractError(
+            "workflow reviewed tool content seal uses a divergent source root"
+        )
+
+
+def _validate_verifier_container_binding(
+    trace: list[_TraceUnit], create_index: int, copy_index: int, start_index: int
+) -> None:
+    expected = (
+        r'"mcp-(?:built-image-e2e|verify)-'
+        r'\$\{GITHUB_RUN_ID:-local\}-\$\{GITHUB_RUN_ATTEMPT:-1\}"'
+    )
+    value = _binding_before(trace, create_index, "MCP_VERIFY_CONTAINER")
+    if re.fullmatch(expected, value) is None:
+        raise OfficialConsumerContractError(
+            "workflow verifier container name is not run-scoped"
+        )
+    snapshot = _binding_snapshot(trace, create_index, "MCP_VERIFY_CONTAINER")
+    if any(
+        _binding_snapshot(trace, index, "MCP_VERIFY_CONTAINER") != snapshot
+        for index in (copy_index, start_index)
+    ):
+        raise OfficialConsumerContractError(
+            "workflow verifier container binding changes during the proof"
         )
 
 
@@ -1173,7 +2041,8 @@ def _validate_ordered_proof(
     )
     if not _has_attestation_load(trace[loader_index]):
         raise OfficialConsumerContractError(
-            "workflow ordered executable proof is missing the hardened attestation load"
+            "workflow ordered executable proof is missing the hardened attestation "
+            "load from the reviewed attestation loader"
         )
     build_index = _find_trace(
         trace, _build_command, loader_index + 1, "the final-image build"
@@ -1189,22 +2058,13 @@ def _validate_ordered_proof(
     )
     start_index = _find_trace(
         trace,
-        lambda unit: (
-            unit.startswith("docker start ")
-            and "--attach" in unit
-            and "--interactive" in unit
-            and "$MCP_VERIFY_CONTAINER" in unit
-        ),
+        _start_command,
         copy_index + 1,
         "the offline verifier start",
     )
     sentinel_index = _find_trace(
         trace,
-        lambda unit: (
-            (unit.startswith("grep ") or unit.startswith("if ! grep "))
-            and "-qxF" in unit
-            and "mcp-built-image-e2e:sentinel:executed" in unit
-        ),
+        _sentinel_assertion,
         start_index + 1,
         "the verifier sentinel assertion",
     )
@@ -1254,8 +2114,6 @@ def _validate_ordered_proof(
                 "ordered executable proof step does not enable fail-closed shell mode"
             )
 
-    build_step = trace[build_index].step_index
-    create_step = trace[create_index].step_index
     image_mutation = re.compile(
         r"^(?:command\s+)?docker\s+(?:build\b|buildx\s+build\b|tag\b|load\b|"
         r"import\b|commit\b|image\s+(?:build|tag|load|import)\b)"
@@ -1267,15 +2125,54 @@ def _validate_ordered_proof(
         raise OfficialConsumerContractError(
             "verifier does not use the same final image that was built"
         )
+
+    _validate_pre_sentinel_shell(trace, loader_index, sentinel_index)
+    _validate_no_privileged_pre_sentinel(
+        trace,
+        sentinel_index,
+        frozenset({build_index, create_index, copy_index, start_index}),
+    )
+    _validate_verifier_container_binding(trace, create_index, copy_index, start_index)
+    _, start_log = _start_bindings(trace[start_index].text)
+    sentinel_log = _validate_sentinel_assertion(trace, sentinel_index)
+    start_log_name = _variable_token_name(start_log, "verifier log")
+    sentinel_log_name = _variable_token_name(sentinel_log, "sentinel log")
+    if _binding_snapshot(trace, start_index, start_log_name) != _binding_snapshot(
+        trace, sentinel_index, sentinel_log_name
+    ):
+        raise OfficialConsumerContractError(
+            "workflow sentinel assertion reads a different verifier log"
+        )
+
+    build_step = trace[build_index].step_index
+    create_step = trace[create_index].step_index
     if "$T4_TAG" not in _tokens(trace[create_index].text, "docker create"):
         raise OfficialConsumerContractError(
             "verifier does not use the same final image that was built"
         )
     _validate_tag_binding(scripts[build_step], trace[build_index].text)
     _validate_tag_binding(scripts[create_step], trace[create_index].text)
-    _validate_lockstep_checker(trace, remote_index, lockstep_index)
-    _validate_verifier_copy(trace, remote_index, copy_index)
-    _validate_attestation_flow(trace, lockstep_index, start_index)
+    checker_root = _validate_lockstep_checker(trace, remote_index, lockstep_index)
+    verifier_root = _validate_verifier_copy(trace, remote_index, copy_index)
+    _validate_reviewed_tool_content_seal(trace, lockstep_index, checker_root)
+    _validate_reviewed_tool_content_seal(trace, copy_index, verifier_root)
+    _validate_attestation_flow(trace, lockstep_index, loader_index, start_index)
+    loader_root = _validate_attestation_loader(
+        trace, remote_index, loader_index, start_index
+    )
+    loader_guard_index = loader_index - 1
+    if (
+        loader_guard_index >= 0
+        and re.fullmatch(r'[A-Z_][A-Z0-9_]*="\$\(', trace[loader_guard_index].text)
+        is not None
+    ):
+        loader_guard_index -= 1
+    try:
+        _validate_reviewed_tool_content_seal(trace, loader_guard_index, loader_root)
+    except OfficialConsumerContractError as exc:
+        raise OfficialConsumerContractError(
+            "workflow reviewed attestation loader content seal is missing or stale"
+        ) from exc
 
 
 def _validate_workflow(workflow_text: str) -> None:
@@ -1291,9 +2188,16 @@ def _validate_workflow(workflow_text: str) -> None:
             "workflow is missing the t4-conformance proof job"
         )
     proof_job = _mapping(jobs[_PROOF_JOB], "t4-conformance proof job")
+    _validate_permissions(workflow, proof_job)
+    _validate_safe_environment(workflow, "workflow")
+    _validate_safe_environment(proof_job, "t4-conformance proof job")
     if "defaults" in proof_job:
         raise OfficialConsumerContractError(
             "t4-conformance proof cannot use a custom shell default"
+        )
+    if "container" in proof_job or "services" in proof_job:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job cannot use a container or services"
         )
     runners = proof_job.get("runs-on")
     runner_is_exact = runners == "docker-host" or (
@@ -1325,6 +2229,7 @@ def _validate_workflow(workflow_text: str) -> None:
             "t4-conformance proof job has an unsupported fork guard"
         )
     proof_step_indexes: set[int] = set()
+    checkout_indexes: list[int] = []
     proof_markers = (
         "mcp_pin_lockstep.py",
         "docker build",
@@ -1332,6 +2237,7 @@ def _validate_workflow(workflow_text: str) -> None:
         "mcp-built-image-e2e:sentinel:executed",
     )
     for step_index, step in enumerate(proof_steps):
+        _validate_safe_environment(step, "t4-conformance proof step")
         if "shell" in step:
             raise OfficialConsumerContractError(
                 "t4-conformance proof cannot use a custom shell"
@@ -1345,6 +2251,40 @@ def _validate_workflow(workflow_text: str) -> None:
             raise OfficialConsumerContractError(
                 "t4-conformance proof step has an unsupported fork guard"
             )
+        has_action = "uses" in step
+        has_script = "run" in step
+        if has_action and has_script:
+            raise OfficialConsumerContractError(
+                "t4-conformance proof step cannot combine uses and run"
+            )
+        if job_condition not in _NON_FORK_GUARDS:
+            is_unconditional_checkout = (
+                has_action
+                and step.get("uses") == _CHECKOUT_ACTION
+                and condition is None
+                and step_index == 0
+            )
+            if has_action and not is_unconditional_checkout:
+                if condition in _FORK_GUARDS:
+                    raise OfficialConsumerContractError(
+                        "t4-conformance fork-executable step is not a strict inert notice"
+                    )
+                if condition not in _NON_FORK_GUARDS:
+                    raise OfficialConsumerContractError(
+                        "t4-conformance fork-executable step lacks an exact non-fork guard"
+                    )
+            if has_script and condition in _FORK_GUARDS:
+                if not _strict_inert_fork_notice(step):
+                    raise OfficialConsumerContractError(
+                        "t4-conformance fork-executable step is not a strict inert notice"
+                    )
+            elif has_script and condition not in _NON_FORK_GUARDS:
+                raise OfficialConsumerContractError(
+                    "t4-conformance fork-executable step lacks an exact non-fork guard"
+                )
+        if has_action:
+            _validate_checkout_step(step)
+            checkout_indexes.append(step_index)
         script = step.get("run")
         executable = (
             "\n".join(_executable_lines(script)) if isinstance(script, str) else ""
@@ -1363,6 +2303,10 @@ def _validate_workflow(workflow_text: str) -> None:
                 raise OfficialConsumerContractError(
                     "t4-conformance proof step lacks an exact non-fork guard"
                 )
+    if checkout_indexes != [0]:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof must begin with exactly one immutable allowlisted action"
+        )
     if not proof_step_indexes:
         raise OfficialConsumerContractError(
             "t4-conformance proof job contains no executable proof"
