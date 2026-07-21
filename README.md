@@ -122,7 +122,7 @@ version/dist-tag — evaluation is version-specific), `contract-path` *or*
 
 ```yaml
 env:
-  MOLECULE_CI_REF: ce4f84f1c9851c3ee6a49a8d9862934dd9965c44
+  MOLECULE_CI_REF: 9a2fd33e4ece9e54a3e1364c74daa59336ed151b
 steps:
   - run: |
       mkdir .molecule-ci-ssot
