@@ -70,15 +70,26 @@ When the contracts schemas change, re-vendor (do NOT hand-edit):
 SDK_COMMIT=65d50bce414e963e168bc27f439e2463d397f62a
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-git -C "$tmp" init -q molecule-ai-sdk
-git -C "$tmp/molecule-ai-sdk" remote add origin \
+safe_home="$tmp/anonymous-home"
+mkdir -p "$safe_home/xdg"
+chmod 0700 "$safe_home" "$safe_home/xdg"
+safe_git() {
+  env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG \
+    HOME="$safe_home" CURL_HOME="$safe_home" \
+    XDG_CONFIG_HOME="$safe_home/xdg" \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null GIT_ASKPASS=/bin/false \
+    SSH_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 \
+    git -c credential.helper= "$@"
+}
+safe_git -C "$tmp" init -q molecule-ai-sdk
+safe_git -C "$tmp/molecule-ai-sdk" remote add origin \
   https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git
-GIT_TERMINAL_PROMPT=0 git -C "$tmp/molecule-ai-sdk" \
-  -c credential.helper= -c http.userAgent=curl/8.4.0 \
+safe_git -C "$tmp/molecule-ai-sdk" -c http.userAgent=curl/8.4.0 \
   fetch --depth=1 origin "$SDK_COMMIT"
-test "$(git -C "$tmp/molecule-ai-sdk" rev-parse FETCH_HEAD)" = "$SDK_COMMIT"
+test "$(safe_git -C "$tmp/molecule-ai-sdk" rev-parse FETCH_HEAD)" = "$SDK_COMMIT"
 for s in plugin-manifest workspace-template org-template repo-meta; do
-  git -C "$tmp/molecule-ai-sdk" show \
+  safe_git -C "$tmp/molecule-ai-sdk" show \
     "FETCH_HEAD:contracts/$s/$s.schema.json" > "$tmp/$s.schema.json"
   python3 -m json.tool "$tmp/$s.schema.json" >/dev/null
   cp "$tmp/$s.schema.json" "schemas/$s.schema.json"

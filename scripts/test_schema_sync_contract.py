@@ -27,6 +27,9 @@ def test_schema_sync_uses_one_immutable_sdk_snapshot() -> None:
     assert "GIT_CONFIG_GLOBAL=/dev/null" in script
     assert "-u GIT_CONFIG_PARAMETERS" in script
     assert "GIT_ASKPASS=/bin/false" in script
+    assert 'HOME="$SAFE_GIT_HOME"' in script
+    assert 'CURL_HOME="$SAFE_GIT_HOME"' in script
+    assert 'XDG_CONFIG_HOME="$SAFE_GIT_HOME/xdg"' in script
     assert "raw/branch/main" not in script
 
 
@@ -127,6 +130,13 @@ def test_schema_source_pin_must_match_current_sdk_main(tmp_path: Path) -> None:
     assert real_git is not None
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
+    hostile_home = tmp_path / "hostile-home"
+    hostile_home.mkdir()
+    (hostile_home / ".netrc").write_text(
+        "machine git.moleculesai.app login ambient password must-not-be-read\n",
+        encoding="utf-8",
+    )
+    safe_env_probe = tmp_path / "safe-env-probe"
     fake_git = fake_bin / "git"
     fake_git.write_text(
         "#!/usr/bin/env python3\n"
@@ -134,6 +144,16 @@ def test_schema_source_pin_must_match_current_sdk_main(tmp_path: Path) -> None:
         "import sys\n"
         f"real_git = {real_git!r}\n"
         f"upstream = {str(upstream)!r}\n"
+        f"hostile_home = {str(hostile_home)!r}\n"
+        f"safe_env_probe = {str(safe_env_probe)!r}\n"
+        "home = os.environ.get('HOME', '')\n"
+        "curl_home = os.environ.get('CURL_HOME', '')\n"
+        "xdg_home = os.environ.get('XDG_CONFIG_HOME', '')\n"
+        "if (home == hostile_home or os.path.isfile(os.path.join(home, '.netrc'))\n"
+        "        or curl_home != home or xdg_home != os.path.join(home, 'xdg')):\n"
+        "    sys.exit(97)\n"
+        "with open(safe_env_probe, 'a', encoding='utf-8') as probe:\n"
+        "    probe.write('isolated\\n')\n"
         "canonical = 'https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git'\n"
         "args = [upstream if arg == canonical else arg for arg in sys.argv[1:]]\n"
         "os.execv(real_git, [real_git, *args])\n",
@@ -144,7 +164,13 @@ def test_schema_source_pin_must_match_current_sdk_main(tmp_path: Path) -> None:
     result = subprocess.run(
         ["bash", "scripts/check-schemas-in-sync.sh"],
         cwd=consumer,
-        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HOME": str(hostile_home),
+            "CURL_HOME": str(hostile_home),
+            "XDG_CONFIG_HOME": str(hostile_home / "xdg"),
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -152,3 +178,4 @@ def test_schema_source_pin_must_match_current_sdk_main(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "does not match molecule-ai-sdk main" in result.stdout
+    assert safe_env_probe.is_file()

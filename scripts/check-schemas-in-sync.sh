@@ -32,6 +32,9 @@ safe_git() {
   env -u GIT_CONFIG_COUNT \
     -u GIT_CONFIG_PARAMETERS \
     -u GIT_CONFIG \
+    HOME="$SAFE_GIT_HOME" \
+    CURL_HOME="$SAFE_GIT_HOME" \
+    XDG_CONFIG_HOME="$SAFE_GIT_HOME/xdg" \
     GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
@@ -67,6 +70,9 @@ declare -A MAP=(
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+SAFE_GIT_HOME="$tmp/anonymous-home"
+mkdir -p "$SAFE_GIT_HOME/xdg"
+chmod 0700 "$SAFE_GIT_HOME" "$SAFE_GIT_HOME/xdg"
 
 drift=0
 sdk_checkout="$tmp/molecule-ai-sdk"
