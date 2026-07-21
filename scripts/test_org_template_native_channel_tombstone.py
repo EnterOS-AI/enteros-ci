@@ -20,8 +20,15 @@ def validator() -> Draft202012Validator:
     "document",
     [
         {"name": "retired", "defaults": {}, "channels": []},
+        {"name": "retired", "defaults": {}, "ChAnNeLs": []},
         {"name": "retired", "defaults": {"channels": []}},
+        {"name": "retired", "defaults": {"CHANNELS": []}},
         {"name": "retired", "workspaces": [{"name": "root", "channels": None}]},
+        {
+            "name": "retired",
+            "defaults": {},
+            "WorkSpaces": [{"name": "root", "Channels": []}],
+        },
         {
             "name": "retired",
             "workspaces": [
@@ -33,6 +40,15 @@ def validator() -> Draft202012Validator:
                             "channels": [{"type": "telegram", "enabled": False}],
                         }
                     ],
+                }
+            ],
+        },
+        {
+            "name": "retired",
+            "workspaces": [
+                {
+                    "name": "root",
+                    "Children": [{"name": "child", "cHaNnElS": []}],
                 }
             ],
         },

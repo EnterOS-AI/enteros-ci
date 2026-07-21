@@ -7,10 +7,22 @@
   "additionalProperties": true,
   "required": ["name"],
   "not": { "required": ["channels"] },
+  "allOf": [
+    { "$ref": "#/$defs/noNativeChannels" }
+  ],
   "anyOf": [
     { "required": ["workspaces"] },
     { "required": ["defaults"] }
   ],
+  "patternProperties": {
+    "^[dD][eE][fF][aA][uU][lL][tT][sSſ]$": {
+      "if": { "type": "object" },
+      "then": { "$ref": "#/$defs/noNativeChannels" }
+    },
+    "^[wW][oO][rR][kKK][sSſ][pP][aA][cC][eE][sSſ]$": {
+      "$ref": "#/$defs/workspaceCollectionChannelTombstone"
+    }
+  },
   "properties": {
     "name": { "type": "string", "minLength": 1, "description": "Org template name (required by validate-org-template.py)." },
     "description": { "type": "string", "description": "Optional human-readable description." },
@@ -21,6 +33,7 @@
       "description": "Org-wide defaults applied to every workspace (runtime, tier, plugins[], category_routing, idle_prompt/idle_interval_seconds, initial_prompt, ...). Per-workspace `plugins:` UNIONs with `defaults.plugins`. Channel connections are ordinary `kind: channel` plugins in this list; the retired native `channels` key is rejected. Modelled as an OPEN object because the contents are heterogeneous per-org; validate-org-template.py only requires that `workspaces` OR `defaults` is present.",
       "not": { "required": ["channels"] },
       "allOf": [
+        { "$ref": "#/$defs/noNativeChannels" },
         {
           "properties": {
             "runtime": { "$ref": "#/$defs/runtimeId", "description": "Open RuntimeId inherited by workspaces without an override." }
@@ -55,11 +68,48 @@
     }
   },
   "$defs": {
+    "noNativeChannels": {
+      "propertyNames": {
+        "not": {
+          "pattern": "^[cC][hH][aA][nN][nN][eE][lL][sSſ]$"
+        }
+      }
+    },
+    "workspaceCollectionChannelTombstone": {
+      "if": { "type": "array" },
+      "then": {
+        "items": { "$ref": "#/$defs/workspaceChannelTombstone" }
+      },
+      "else": {
+        "if": { "type": "object" },
+        "then": {
+          "additionalProperties": {
+            "$ref": "#/$defs/workspaceChannelTombstone"
+          }
+        }
+      }
+    },
+    "workspaceChannelTombstone": {
+      "if": { "type": "object" },
+      "then": {
+        "allOf": [
+          { "$ref": "#/$defs/noNativeChannels" }
+        ],
+        "patternProperties": {
+          "^[cC][hH][iI][lL][dD][rR][eE][nN]$": {
+            "$ref": "#/$defs/workspaceCollectionChannelTombstone"
+          }
+        }
+      }
+    },
     "unresolvedExternalRef": {
       "type": "object",
       "additionalProperties": true,
       "required": ["repo", "ref", "path"],
       "not": { "required": ["channels"] },
+      "allOf": [
+        { "$ref": "#/$defs/noNativeChannels" }
+      ],
       "description": "An UNRESOLVED `!external` workspace reference, as it appears in a folder-tree org.yaml AFTER the custom `!external` YAML tag is stripped at load time (molecule-dev pins the dev department, molecule-core#105 / internal#77). core's gitops resolver fetches `repo` at `ref` and expands `path` into a workspaceNode at platform import time; this object is the PRE-RESOLUTION ref, not the resolved node. Distinct oneOf branch from workspaceNode (which requires `name`, absent here).",
       "properties": {
         "repo": { "type": "string", "minLength": 1, "description": "Source repo holding the external workspace, e.g. `molecule-ai/molecule-dev-department`." },
@@ -72,6 +122,9 @@
       "additionalProperties": true,
       "required": ["name"],
       "not": { "required": ["channels"] },
+      "allOf": [
+        { "$ref": "#/$defs/workspaceChannelTombstone" }
+      ],
       "description": "A single workspace (agent) node. Recursive via `children[]`. Fields derived from the inline nodes (gemini-growth-team) and the folder-tree workspace.yaml (molecule-dev/community-manager). `name` is the only field validate-org-template.py requires; `plugins` must be a list when present.",
       "properties": {
         "name": { "type": "string", "minLength": 1, "description": "Workspace/agent name (required)." },

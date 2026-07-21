@@ -9,19 +9,14 @@ repository (the marketplace-catalog contract family, RFC
 | --- | --- | --- |
 | `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `a3d70972ee082a8d862fd083ec6f92bbea133185` |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `191f677a76a2973556554b580c4563bd2a572943` (SDK PR #120 native-channel root tombstone) |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `d5046dbb872142dfd1d292827ade9a4bf33ca19d` (SDK PR #120 merge) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
-currently SDK PR #120 head
-`65d50bce414e963e168bc27f439e2463d397f62a`; every row is fetched from that
+currently SDK PR #120 merge commit
+`d5046dbb872142dfd1d292827ade9a4bf33ca19d`; every row is fetched from that
 same immutable commit even when the table records an older, last
-contract-changing commit for the individual file. This molecule-ci change must
-remain unmerged until that rebased SDK head is merged. Until then the required
-sync gate intentionally reports the unmerged org-template contraction; the
-other three mirrored schemas already match current SDK main. After SDK #120
-merges, replace the pin with its merge commit and re-vendor all four schemas
-from that exact commit before making this PR mergeable.
+contract-changing commit for the individual file.
 
 > **`repo-meta.schema.json` is NOT a marketplace-artifact schema.** The other three
 > capture heterogeneous *published artifacts* and are `additionalProperties:true`.
@@ -67,7 +62,7 @@ When the contracts schemas change, re-vendor (do NOT hand-edit):
 
 ```sh
 # Pin this to the exact molecule-ai-sdk commit verified before the update.
-SDK_COMMIT=65d50bce414e963e168bc27f439e2463d397f62a
+SDK_COMMIT=d5046dbb872142dfd1d292827ade9a4bf33ca19d
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 safe_home="$tmp/anonymous-home"
