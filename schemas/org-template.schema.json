@@ -6,6 +6,7 @@
   "type": "object",
   "additionalProperties": true,
   "required": ["name"],
+  "not": { "required": ["channels"] },
   "anyOf": [
     { "required": ["workspaces"] },
     { "required": ["defaults"] }

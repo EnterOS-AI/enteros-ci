@@ -19,6 +19,7 @@ def validator() -> Draft202012Validator:
 @pytest.mark.parametrize(
     "document",
     [
+        {"name": "retired", "defaults": {}, "channels": []},
         {"name": "retired", "defaults": {"channels": []}},
         {"name": "retired", "workspaces": [{"name": "root", "channels": None}]},
         {
@@ -76,6 +77,7 @@ def test_preserves_plugins_and_category_routing_channels_business_key() -> None:
 
 def test_native_channel_definition_is_removed_not_merely_unused() -> None:
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert schema["not"] == {"required": ["channels"]}
     assert "channel" not in schema["$defs"]
     assert "channels" not in schema["$defs"]["workspaceNode"]["properties"]
     assert schema["$defs"]["workspaceNode"]["not"] == {"required": ["channels"]}
