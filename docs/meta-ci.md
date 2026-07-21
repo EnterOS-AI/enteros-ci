@@ -97,7 +97,7 @@ It follows the immutable metadata chain declared by the template pin:
   -> exact trusted npm tarball + SHA-512/SHA-1 + package identity
 ```
 
-The checker emits the full machine-readable attestation with
+The checker emits the full machine-readable attestation by running
 `python3 scripts/mcp_pin_lockstep.py --repo-root <template> --json`. It accepts only
 an exact stable runtime version from a tiny non-symlink regular file, canonical
 same-origin public Gitea package URLs with no query material, complete HTTP 200
@@ -126,6 +126,48 @@ Runtime release CI is the SSOT for helper implementation semantics. Template Tie
 the authority for final-image installation, later replacement/reinstall, cache ownership,
 and offline behavior. Keeping these boundaries explicit prevents a shell-text parser from
 being mistaken for executable image proof.
+
+### Final-image MCP verifier
+
+`scripts/mcp_built_image_e2e.py` is the central executable for the right-hand column
+above. It accepts only the bounded schema-v1 JSON emitted by
+`mcp_pin_lockstep.py --json` on stdin, then runs *inside the already-built final
+template image*. It proves:
+
+- the installed `molecules-workspace-runtime` distribution version equals the
+  attestation, and both imported runtime modules resolve to files recorded by that
+  distribution rather than a shadowing checkout; image-controlled imports execute in
+  a separate deadline/output-bounded process and only a strict proof object returns to
+  the verifier;
+- the installed `prebake-mgmt-mcp.sh` bytes match the attested wheel member digest and
+  the imported `platform_agent_identity` package, pin, range, registry, scope, and tool
+  constants match the attestation;
+- `npx -y --offline` can launch both the exact package pin and compatible range under
+  both `/home/agent` and a newly-created foreign `HOME`, while using the baked
+  `/home/agent/.npm` cache and `/home/agent/.npmrc`;
+- each of those four launches completes an MCP `initialize` plus `tools/list` exchange
+  and exposes the attested required management tool.
+
+An emitted `initialize.result.serverInfo.version` is bounded and must agree across all
+four launches, but it is deliberately **not** compared with the npm package version.
+It is server protocol/implementation metadata (the current package reports `1.0.0`),
+whereas the exact npm artifact version is independently proven by the static attestation
+and exact offline resolution. Its child-controlled literal value is never copied into CI
+logs; the PASS line reports only `emitted-consistent` or `not-emitted`.
+
+The verifier never invokes a shell. Every child is an argv-only process group with a
+hard deadline and combined-output cap; unexpected child output is not copied into error
+messages. The surrounding container invocation must supply the other half of the offline
+boundary: the same image tag already built for Tier-4, `--network none`, uid/gid 1000,
+dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, and a small `/tmp`
+tmpfs. Hermes additionally passes the existing sanctioned
+`MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin` override so its bundled `npx`
+is reachable.
+
+The stable `mcp-built-image-e2e:sentinel:executed` line proves the executable started;
+its nonzero exit remains the actual gate. Adding this central executable does not by
+itself claim template coverage: each official template must invoke an immutable reviewed
+copy against its final image in its existing hard-gated `t4-conformance` job.
 
 The same-repository self-test reads the four official immutable consumer refs from
 `scripts/fixtures/meta-ci/official-consumers.json`. The artifact-pin job (whose legacy
