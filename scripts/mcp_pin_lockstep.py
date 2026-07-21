@@ -166,8 +166,21 @@ def _fetch_bytes(url: str) -> bytes:
                 final_url = response.geturl()
                 if not _same_origin(url, final_url):
                     raise MCPPinLockstepError("package request redirected off origin")
-                length = response.headers.get("Content-Length")
-                if length and int(length) > _MAX_ARTIFACT_BYTES:
+                response_status = response.getcode()
+                if response_status != 200:
+                    raise MCPPinLockstepError(
+                        f"package fetch failed: HTTP {response_status} (not retryable)"
+                    )
+                length_header = response.headers.get("Content-Length")
+                expected_length: int | None = None
+                if length_header is not None:
+                    if not re.fullmatch(r"[0-9]+", length_header):
+                        raise MCPPinLockstepError("malformed package response")
+                    expected_length = int(length_header)
+                if (
+                    expected_length is not None
+                    and expected_length > _MAX_ARTIFACT_BYTES
+                ):
                     raise MCPPinLockstepError(
                         f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes"
                     )
@@ -175,6 +188,14 @@ def _fetch_bytes(url: str) -> bytes:
                 if len(payload) > _MAX_ARTIFACT_BYTES:
                     raise MCPPinLockstepError(
                         f"package response exceeds {_MAX_ARTIFACT_BYTES} bytes"
+                    )
+                if expected_length is not None and len(payload) < expected_length:
+                    raise http.client.IncompleteRead(
+                        payload, expected_length - len(payload)
+                    )
+                if expected_length is not None and len(payload) > expected_length:
+                    raise MCPPinLockstepError(
+                        "package response length does not match Content-Length"
                     )
                 return payload
         except urllib.error.HTTPError as exc:
@@ -667,6 +688,12 @@ def attest(
     }
 
 
+def _safe_failure_detail(exc: Exception) -> str:
+    if isinstance(exc, MCPPinLockstepError):
+        return str(exc) or "MCP lockstep check failed"
+    return "unexpected MCP lockstep checker failure"
+
+
 def run(
     repo_root: Path,
     *,
@@ -675,7 +702,7 @@ def run(
     try:
         attestation = attest(repo_root, fetch_bytes=fetch_bytes)
     except Exception as exc:  # runner boundary: unexpected conditions fail closed
-        return False, str(exc) or exc.__class__.__name__
+        return False, _safe_failure_detail(exc)
 
     runtime = attestation["runtime"]
     management = attestation["management_mcp"]
@@ -707,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             payload = attest(repo_root)
         except Exception as exc:
-            print(str(exc) or exc.__class__.__name__, file=sys.stderr)
+            print(_safe_failure_detail(exc), file=sys.stderr)
             return 1
         payload["checker_sentinel"] = SENTINEL
         print(json.dumps(payload, indent=2, sort_keys=True))

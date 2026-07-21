@@ -688,10 +688,22 @@ def test_redirect_handler_rejects_off_origin_location_before_follow():
 
 
 class _Response:
-    def __init__(self, url: str, payload: bytes):
+    def __init__(
+        self,
+        url: str,
+        payload: bytes,
+        *,
+        status: int = 200,
+        content_length: int | None = None,
+    ):
         self.url = url
         self.payload = payload
-        self.headers = {"Content-Length": str(len(payload))}
+        self.status = status
+        self.headers = {
+            "Content-Length": str(
+                len(payload) if content_length is None else content_length
+            )
+        }
 
     def __enter__(self):
         return self
@@ -701,6 +713,9 @@ class _Response:
 
     def geturl(self):
         return self.url
+
+    def getcode(self):
+        return self.status
 
     def read(self, limit: int):
         return self.payload[:limit]
@@ -716,6 +731,39 @@ def test_package_fetch_rejects_off_origin_final_response(monkeypatch):
 
     with pytest.raises(lockstep.MCPPinLockstepError, match="redirected off origin"):
         lockstep._fetch_bytes(url)
+
+
+def test_package_fetch_rejects_partial_content_status(monkeypatch):
+    url = lockstep.MOLECULE_RUNTIME_INDEX_URL
+    calls = 0
+
+    def opener(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        return _Response(url, b"valid-looking-prefix", status=206)
+
+    monkeypatch.setattr(lockstep, "_open_package_url", opener)
+
+    with pytest.raises(lockstep.MCPPinLockstepError, match="HTTP 206"):
+        lockstep._fetch_bytes(url)
+    assert calls == 1
+
+
+def test_package_fetch_retries_declared_length_truncation(monkeypatch):
+    url = lockstep.MOLECULE_RUNTIME_INDEX_URL
+    calls = 0
+
+    def opener(_request, *, timeout):
+        nonlocal calls
+        calls += 1
+        return _Response(url, b"valid-looking-prefix", content_length=100)
+
+    monkeypatch.setattr(lockstep, "_open_package_url", opener)
+    monkeypatch.setattr(lockstep.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(lockstep.MCPPinLockstepError, match="after 3 attempts"):
+        lockstep._fetch_bytes(url)
+    assert calls == 3
 
 
 def test_package_fetch_retries_only_transient_failures(monkeypatch):
@@ -851,3 +899,51 @@ def test_cli_failure_is_nonzero_and_secret_free(tmp_path):
     assert lockstep.SENTINEL in proc.stdout
     assert ".runtime-version" in proc.stdout
     assert "token" not in proc.stdout.lower()
+
+
+def test_json_cli_rejects_invalid_raw_pin_without_logging_it(tmp_path):
+    marker = "credential=must-not-log"
+    (tmp_path / ".runtime-version").write_text(marker)
+
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--repo-root", str(tmp_path), "--json"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert ".runtime-version must be an exact stable semver" in proc.stderr
+    assert marker not in proc.stdout + proc.stderr
+
+
+def test_runner_does_not_echo_unexpected_exception_text(tmp_path, monkeypatch):
+    marker = "credential=must-not-log"
+
+    def fail(_repo_root, *, fetch_bytes):
+        raise ValueError(marker)
+
+    monkeypatch.setattr(lockstep, "attest", fail)
+
+    ok, detail = lockstep.run(tmp_path)
+
+    assert not ok
+    assert detail == "unexpected MCP lockstep checker failure"
+    assert marker not in detail
+
+
+def test_json_cli_does_not_echo_unexpected_exception_text(
+    tmp_path, monkeypatch, capsys
+):
+    marker = "credential=must-not-log"
+
+    def fail(_repo_root):
+        raise ValueError(marker)
+
+    monkeypatch.setattr(lockstep, "attest", fail)
+
+    assert lockstep.main(["--repo-root", str(tmp_path), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "unexpected MCP lockstep checker failure"
+    assert marker not in captured.err

@@ -139,16 +139,33 @@ jobs:
             git -C "$fetch_dir" show "$actual:.runtime-version" \
               > "$proof_dir/.runtime-version"
             test "$(find "$proof_dir" -type f | wc -l | tr -d ' ')" = 1
-            runtime_version="$(tr -d '\r\n' < "$proof_dir/.runtime-version")"
+            attestation="$root/$name.lockstep.json"
+            python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" --json \
+              > "$attestation"
+            runtime_version="$(python3 - "$attestation" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          if payload.get("checker_sentinel") != "mcp-pin-lockstep:sentinel:executed":
+              raise SystemExit("MCP lockstep checker sentinel missing")
+          runtime = payload.get("runtime")
+          version = runtime.get("version") if isinstance(runtime, dict) else None
+          if not isinstance(version, str) or not re.fullmatch(
+              r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version
+          ):
+              raise SystemExit("MCP lockstep attestation runtime is invalid")
+          sys.stdout.write(version)
+          PY
+            )"
             if [ -z "$fleet_version" ]; then
               fleet_version="$runtime_version"
             elif [ "$runtime_version" != "$fleet_version" ]; then
-              echo "official consumer runtime drift: $name=$runtime_version, fleet=$fleet_version" >&2
+              echo "official consumer runtime drift: $name differs from fleet" >&2
               exit 1
             fi
-            log="$root/$name.lockstep.log"
-            python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" | tee "$log"
-            grep -qxF 'mcp-pin-lockstep:sentinel:executed' "$log"
           done < "$root/consumers.tsv"
           test -n "$fleet_version"
           printf 'official fleet runtime lockstep: %s\n' "$fleet_version"

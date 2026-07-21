@@ -1,5 +1,8 @@
+import os
 from pathlib import Path
 import re
+import subprocess
+import textwrap
 
 import yaml
 
@@ -78,9 +81,14 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     assert 'git -C "$fetch_dir" show "$actual:.runtime-version"' in archive_runs
     assert 'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
     assert "mcp-pin-lockstep:sentinel:executed" in archive_runs
-    assert 'runtime_version="$(tr -d' in archive_runs
+    assert "scripts/mcp_pin_lockstep.py --repo-root \"$proof_dir\" --json" in archive_runs
+    assert 'runtime_version="$(python3 - "$attestation"' in archive_runs
     assert 'runtime_version" != "$fleet_version' in archive_runs
     assert "official fleet runtime lockstep" in archive_runs
+    assert 'tr -d \'\\r\\n\' < "$proof_dir/.runtime-version"' not in archive_runs
+    assert archive_runs.index("--json") < archive_runs.index(
+        'runtime_version="$(python3 - "$attestation"'
+    )
     assert "git -C \"$fetch_dir\" archive" not in archive_runs
     assert 'python3 scripts/meta-ci.py --repo-root "$proof_dir"' not in archive_runs
     archive_gate = next(
@@ -97,6 +105,108 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     for job in (selftest, archive):
         checkout = next(step for step in job["steps"] if "uses" in step)
         assert checkout["with"]["persist-credentials"] is False
+
+
+def test_meta_ci_archive_gate_never_logs_raw_invalid_consumer_pin(tmp_path) -> None:
+    """The checker must reject a raw pin before the shell compares or prints it."""
+
+    workflow = yaml.safe_load((WORKFLOWS / "meta-ci-selftest.yml").read_text())
+    archive = workflow["jobs"]["official-consumer-archives"]
+    archive_runs = next(
+        step["run"]
+        for step in archive["steps"]
+        if step.get("name") == "Validate immutable consumer artifact pins"
+    )
+
+    scripts = tmp_path / "scripts"
+    fixture = scripts / "fixtures" / "meta-ci"
+    fixture.mkdir(parents=True)
+    fixture.joinpath("official-consumers.json").write_bytes(
+        (ROOT / "scripts/fixtures/meta-ci/official-consumers.json").read_bytes()
+    )
+    scripts.joinpath("mcp_pin_lockstep.py").write_text(
+        textwrap.dedent(
+            """\
+            import argparse
+            import json
+            import sys
+            from pathlib import Path
+
+            def strict_json_loads(payload, _label):
+                return json.loads(payload)
+
+            if __name__ == "__main__":
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--repo-root", required=True)
+                parser.add_argument("--json", action="store_true")
+                args = parser.parse_args()
+                pin = Path(args.repo_root, ".runtime-version").read_text().strip()
+                if pin != "0.4.35":
+                    print("invalid runtime pin", file=sys.stderr)
+                    raise SystemExit(1)
+                json.dump(
+                    {
+                        "checker_sentinel": "mcp-pin-lockstep:sentinel:executed",
+                        "runtime": {"version": pin},
+                    },
+                    sys.stdout,
+                )
+            """
+        )
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            while args[:1] == ["-c"]:
+                args = args[2:]
+            directory = None
+            if args[:1] == ["-C"]:
+                directory = Path(args[1])
+                args = args[2:]
+            command = args[0]
+            if command == "init":
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+            elif command == "remote":
+                pass
+            elif command == "fetch":
+                directory.joinpath("fetched").write_text(args[-1])
+            elif command == "rev-parse":
+                print(directory.joinpath("fetched").read_text())
+            elif command == "show":
+                consumer = directory.name.removesuffix(".fetch")
+                pin = "0.4.35" if consumer == "claude-code" else "credential=must-not-log"
+                print(pin)
+            else:
+                raise SystemExit(f"unexpected fake git command: {command}")
+            """
+        )
+    )
+    fake_git.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        ["bash", "-c", archive_runs],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "invalid runtime pin" in output
+    assert "credential=must-not-log" not in output
 
 
 def test_meta_ci_consumer_template_does_not_persist_checkout_credentials() -> None:

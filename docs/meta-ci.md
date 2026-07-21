@@ -100,7 +100,8 @@ It follows the immutable metadata chain declared by the template pin:
 The checker emits the full machine-readable attestation with
 `python3 scripts/mcp_pin_lockstep.py --repo-root <template> --json`. It accepts only
 an exact stable runtime version from a tiny non-symlink regular file, canonical
-same-origin public Gitea package URLs with no query material, bounded archives, one
+same-origin public Gitea package URLs with no query material, complete HTTP 200
+responses with bounded framing, bounded archives, one
 matching runtime wheel, unambiguous wheel identity headers, one literal declaration for
 each required metadata field, a non-empty packaged prebake helper, a compatible exact MCP
 pin, and an npm tarball whose integrity and package identity match the exact registry
