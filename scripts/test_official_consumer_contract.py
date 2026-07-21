@@ -923,6 +923,20 @@ def test_proof_cannot_shadow_required_commands_through_path() -> None:
         contract.validate_contract("codex", workflow, _test_contract("codex"))
 
 
+def test_proof_rejects_a_quoted_or_escaped_required_command_name() -> None:
+    workflow = _workflow().replace(
+        b'          git init "$CI_ROOT"\n',
+        b'          g\'\'it init "$CI_ROOT"\n',
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="quoted or escaped command name",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
 def test_proof_cannot_shadow_required_commands_with_builtin_hash() -> None:
     workflow = _workflow().replace(
         b'          git init "$CI_ROOT"\n',
@@ -1100,6 +1114,8 @@ def test_attestation_loader_requires_a_fresh_reviewed_tool_content_seal() -> Non
     "operation",
     (
         b"docker run --privileged attacker/image:latest",
+        b"command docker run --privileged attacker/image:latest",
+        b"d''ocker run --privileged attacker/image:latest",
         b"docker run --volume /:/host attacker/image:latest",
         b"docker run --pid=host attacker/image:latest",
         b"sudo nsenter --target 1 --mount -- id -u",
@@ -1111,6 +1127,21 @@ def test_privileged_or_host_bound_operations_cannot_precede_the_sentinel(
     workflow = _workflow().replace(
         b"          docker create --interactive",
         b"          " + operation + b"\n          docker create --interactive",
+        1,
+    )
+
+    with pytest.raises(
+        contract.OfficialConsumerContractError,
+        match="privileged or host-bound operation precedes|quoted or escaped command name",
+    ):
+        contract.validate_contract("codex", workflow, _test_contract("codex"))
+
+
+def test_command_wrapper_cannot_hide_an_unreviewed_docker_command() -> None:
+    workflow = _workflow().replace(
+        b"          docker create --interactive",
+        b"          command docker inspect attacker/image:latest\n"
+        b"          docker create --interactive",
         1,
     )
 
