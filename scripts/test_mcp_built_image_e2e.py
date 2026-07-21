@@ -30,6 +30,20 @@ def _load_module():
 built_image = _load_module()
 
 
+def _python_child_env() -> dict[str, str]:
+    """Keep only paths required to start this exact test interpreter."""
+
+    env = {"PATH": os.environ.get("PATH", "")}
+    for name in (
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ):
+        if value := os.environ.get(name):
+            env[name] = value
+    return env
+
+
 def _attestation_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -457,6 +471,19 @@ def test_validate_jsonrpc_rejects_boolean_response_ids() -> None:
         )
 
 
+def test_python_child_env_preserves_required_loader_paths(monkeypatch) -> None:
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/runtime/lib")
+    monkeypatch.setenv("DYLD_LIBRARY_PATH", "/runtime/dyld")
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/runtime/fallback")
+
+    assert _python_child_env() == {
+        "PATH": os.environ.get("PATH", ""),
+        "LD_LIBRARY_PATH": "/runtime/lib",
+        "DYLD_LIBRARY_PATH": "/runtime/dyld",
+        "DYLD_FALLBACK_LIBRARY_PATH": "/runtime/fallback",
+    }
+
+
 def test_run_bounded_uses_argv_without_shell_interpretation(tmp_path) -> None:
     marker = tmp_path / "must-not-exist"
     literal = f"$(touch {marker})"
@@ -465,7 +492,7 @@ def test_run_bounded_uses_argv_without_shell_interpretation(tmp_path) -> None:
     result = built_image.run_bounded_process(
         [sys.executable, "-c", code, literal],
         input_bytes=b"",
-        env={"PATH": os.environ.get("PATH", "")},
+        env=_python_child_env(),
         timeout_seconds=2,
         max_output_bytes=4096,
     )
@@ -482,7 +509,7 @@ def test_run_bounded_kills_a_timed_out_process_group() -> None:
         built_image.run_bounded_process(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             input_bytes=b"",
-            env={"PATH": os.environ.get("PATH", "")},
+            env=_python_child_env(),
             timeout_seconds=0.1,
             max_output_bytes=4096,
         )
@@ -523,7 +550,7 @@ def test_run_bounded_cleans_the_process_group_after_success(monkeypatch) -> None
     result = built_image.run_bounded_process(
         [sys.executable, "-c", "print('done')"],
         input_bytes=b"",
-        env={"PATH": os.environ.get("PATH", "")},
+        env=_python_child_env(),
         timeout_seconds=2,
         max_output_bytes=4096,
     )
@@ -537,7 +564,7 @@ def test_run_bounded_kills_a_process_that_exceeds_output_limit() -> None:
         built_image.run_bounded_process(
             [sys.executable, "-c", "print('x' * 10000)"],
             input_bytes=b"",
-            env={"PATH": os.environ.get("PATH", "")},
+            env=_python_child_env(),
             timeout_seconds=2,
             max_output_bytes=1024,
         )
