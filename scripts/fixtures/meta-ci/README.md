@@ -13,7 +13,9 @@ commits that wire the same immutable final-image MCP verifier into each Tier-4 j
 job rejects duplicate JSON fields, anonymously fetches each commit, and reads only three
 bounded static files: `.runtime-version`, `.gitea/workflows/ci.yml`, and
 `tests/test_ci_runtime_image_pin.py`. It fails if the four runtime pins differ, runs the
-standalone artifact checker, and statically proves that each workflow and its regression
-test pin the reviewed molecule-ci verifier and retain the offline, unprivileged,
-resource-bounded final-image contract. Consumer workflow and test code is never
+standalone artifact checker, and strictly parses each workflow with duplicate-key
+rejection. The parsed workflow—not consumer pytest collection—is the authoritative proof
+of triggers, runner, dependency reachability, exact fork guards, immutable fetch,
+same-image offline execution, resource bounds, and no-bind-mount behavior. The test file
+is retained only as a bounded regression marker. Consumer workflow and test code is never
 executed. The JSON remains reference data only and does not duplicate either verifier.

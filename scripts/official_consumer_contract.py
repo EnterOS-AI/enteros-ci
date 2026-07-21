@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Fail-closed static contract for official final-image MCP CI wiring.
+"""Fail-closed semantic contract for official final-image MCP CI wiring.
 
-The meta-CI archive job supplies two blobs from an exact consumer commit. This
-checker treats both blobs as data: it never imports or executes consumer code.
+The meta-CI archive job supplies two bounded blobs from an exact consumer
+commit.  Both are treated as inert data.  The workflow is parsed with a strict
+YAML loader and is the authoritative proof; the consumer pytest module is only
+a repository-local regression marker and is never imported or executed.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import re
+import shlex
 import stat
 import sys
+from typing import Any
+
+import yaml
 
 
 FINAL_IMAGE_VERIFIER_REF = "".join(("11b8598e5c0b3f0b1031733a8d5f6bc", "238f146a4"))
@@ -21,38 +27,28 @@ SENTINEL = "official-consumer-contract:sentinel:executed"
 _MAX_CONTRACT_BYTES = 512 * 1024
 _WORKFLOW_PATH = Path(".gitea/workflows/ci.yml")
 _TEST_PATH = Path("tests/test_ci_runtime_image_pin.py")
-_REF_MAPPING_RE = re.compile(
-    r"^(?P<indent> *)(?:MOLECULE_CI_REF|['\"]MOLECULE_CI_REF['\"])[ \t]*:"
-    r"[ \t]*(?P<value>.*?)[ \t]*$"
+_PROOF_JOB = "t4-conformance"
+_AGGREGATE_JOBS = frozenset({"validate", "all-required"})
+_T4_TAG_ASSIGNMENT = (
+    'T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"'
 )
-_REF_MAPPING_TOKEN_RE = re.compile(
-    r"(?<![\w${.])(?:MOLECULE_CI_REF|['\"]MOLECULE_CI_REF['\"])[ \t]*:"
+_NON_FORK_GUARDS = frozenset(
+    {
+        "github.event.pull_request.head.repo.fork != true",
+        (
+            "github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.fork == false"
+        ),
+    }
 )
-_STATIC_REF_VALUE_RE = re.compile(
-    r"^(?:([0-9a-f]{40})|'([0-9a-f]{40})'|\"([0-9a-f]{40})\")"
-    r"(?:[ \t]+#.*)?$"
-)
-_RUN_BLOCK_RE = re.compile(
-    r"^(?P<indent> *)(?:-[ \t]+)?run:[ \t]*[|>][+-]?(?:[ \t]+#.*)?$"
-)
-_MAPPING_HEADER_RE = re.compile(r"^[A-Za-z0-9_.-]+:[ \t]*(?:#.*)?$")
-_SHELL_REF_ASSIGNMENT_RE = re.compile(
-    r"(?<![\w$])['\"]?MOLECULE_CI_REF['\"]?[ \t]*(?:\+?=|<<)"
-)
-_SHELL_REF_PARAMETER_ASSIGNMENT_RE = re.compile(r"\$\{MOLECULE_CI_REF(?::?=|\+=)")
-_SHELL_REF_MUTATING_COMMAND_RE = re.compile(
-    r"\b(?:unset|read|readonly|declare|typeset|local)\b[^\n#]*"
-    r"\bMOLECULE_CI_REF\b|\bprintf\b[^\n#]*\s-v\s+MOLECULE_CI_REF\b"
-)
-_FINAL_IMAGE_FETCH_FRAGMENTS = (
-    "https://git.moleculesai.app/molecule-ai/molecule-ci.git",
-    "fetch",
-    "--no-tags",
-    "--depth 1",
-    'origin "$MOLECULE_CI_REF"',
-    "checkout -q --detach FETCH_HEAD",
-    "rev-parse HEAD",
-    "mcp_pin_lockstep.py",
+_FORK_GUARDS = frozenset(
+    {
+        "github.event.pull_request.head.repo.fork == true",
+        (
+            "github.event_name == 'pull_request' && "
+            "github.event.pull_request.head.repo.fork == true"
+        ),
+    }
 )
 _REQUIRED_TESTS = {
     "claude-code": (
@@ -67,64 +63,75 @@ _REQUIRED_TESTS = {
         "test_t4_runs_hardened_final_image_mcp_e2e_before_privileged_probe",
     ),
 }
-_WORKFLOW_FRAGMENTS = (
-    "https://git.moleculesai.app/molecule-ai/molecule-ci.git",
-    "GIT_ASKPASS=/bin/false",
-    "GIT_TERMINAL_PROMPT=0",
-    "credential.helper=",
-    "http.userAgent=curl/8.4.0",
-    "fetch",
-    "--no-tags",
-    "--depth 1",
-    'origin "$MOLECULE_CI_REF"',
-    "rev-parse HEAD",
-    "mcp_pin_lockstep.py",
-    "--repo-root . --json",
-    "mcp_built_image_e2e.py",
-    "load_attestation",
-    "docker build",
-    '-t "$T4_TAG"',
-    "docker create --interactive --name",
-    "--network none",
-    "--user 1000:1000 --workdir /tmp",
-    "--cap-drop ALL --security-opt no-new-privileges",
-    "--pids-limit 128 --memory 768m --cpus 1",
-    "--tmpfs /tmp:size=64m",
-    '--entrypoint python3 "$T4_TAG"',
-    "/mcp_built_image_e2e.py",
-    "docker cp",
-    "docker start --attach --interactive",
-    "grep -qxF 'mcp-built-image-e2e:sentinel:executed'",
-    "KEEP_T4_IMAGE=1",
-)
-_TEST_FRAGMENTS = (
-    "GIT_ASKPASS=/bin/false",
-    "credential.helper=",
-    "http.userAgent=curl/8.4.0",
-    "--no-tags",
-    "--depth 1",
-    'origin "$MOLECULE_CI_REF"',
-    "mcp_pin_lockstep.py",
-    "mcp_built_image_e2e.py",
-    "--network none",
-    "--user 1000:1000 --workdir /tmp",
-    "--cap-drop ALL --security-opt no-new-privileges",
-    "--pids-limit 128 --memory 768m --cpus 1",
-    "--tmpfs /tmp:size=64m",
-    "mcp-built-image-e2e:sentinel:executed",
-)
 
 
 class OfficialConsumerContractError(Exception):
     """A static official-consumer CI contract violation."""
 
 
+class _StrictWorkflowLoader(yaml.SafeLoader):
+    """SafeLoader variant with YAML-1.2 booleans and duplicate-key rejection."""
+
+
+# Copy before changing resolvers so importing this checker cannot mutate PyYAML's
+# process-global SafeLoader behavior in its own unit-test process.
+_StrictWorkflowLoader.yaml_implicit_resolvers = {
+    key: list(resolvers)
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+for _resolver_key, _resolvers in list(
+    _StrictWorkflowLoader.yaml_implicit_resolvers.items()
+):
+    _StrictWorkflowLoader.yaml_implicit_resolvers[_resolver_key] = [
+        resolver for resolver in _resolvers if resolver[0] != "tag:yaml.org,2002:bool"
+    ]
+_StrictWorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|false)$", re.IGNORECASE),
+    list("tTfF"),
+)
+
+
+def _construct_unique_mapping(
+    loader: _StrictWorkflowLoader, node: yaml.nodes.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise OfficialConsumerContractError(
+                "workflow contains an invalid YAML mapping key"
+            ) from exc
+        if duplicate:
+            raise OfficialConsumerContractError(
+                "workflow contains a duplicate YAML mapping key"
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictWorkflowLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 @dataclass(frozen=True)
-class _RunBlock:
-    header_index: int
-    body: str
-    job_index: int
+class _TraceUnit:
     step_index: int
+    text: str
+    controls: tuple[str, ...]
+    heredoc_bodies: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ShellUnit:
+    text: str
+    controls: tuple[str, ...]
+    heredoc_bodies: tuple[str, ...]
 
 
 def _decode_contract(payload: bytes, label: str) -> str:
@@ -136,17 +143,1234 @@ def _decode_contract(payload: bytes, label: str) -> str:
         raise OfficialConsumerContractError(f"{label} is not UTF-8") from exc
 
 
-def _normalized(text: str) -> str:
-    return " ".join(text.split())
-
-
-def _require_fragments(text: str, fragments: tuple[str, ...], label: str) -> None:
-    normalized = _normalized(text)
-    missing = [fragment for fragment in fragments if fragment not in normalized]
-    if missing:
+def _strict_workflow_load(workflow: str) -> dict[str, Any]:
+    try:
+        loaded = yaml.load(workflow, Loader=_StrictWorkflowLoader)
+    except OfficialConsumerContractError:
+        raise
+    except yaml.YAMLError as exc:
         raise OfficialConsumerContractError(
-            f"{label} contract is missing required final-image MCP assertions"
+            "workflow is not valid strict YAML"
+        ) from exc
+    if not isinstance(loaded, dict) or not all(isinstance(key, str) for key in loaded):
+        raise OfficialConsumerContractError(
+            "workflow root must be a string-keyed mapping"
         )
+    return loaded
+
+
+def _mapping(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise OfficialConsumerContractError(f"{label} must be a string-keyed mapping")
+    return value
+
+
+def _steps(job: dict[str, Any], label: str) -> list[dict[str, Any]]:
+    value = job.get("steps")
+    if not isinstance(value, list) or not value:
+        raise OfficialConsumerContractError(f"{label} must define non-empty steps")
+    result: list[dict[str, Any]] = []
+    for step in value:
+        result.append(_mapping(step, f"{label} step"))
+    return result
+
+
+def _needs(value: object, label: str) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str) and value:
+        return {value}
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) and item for item in value)
+    ):
+        return set(value)
+    raise OfficialConsumerContractError(f"{label} has invalid needs dependencies")
+
+
+def _normalize_condition(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return ""
+    condition = " ".join(value.strip().split())
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = " ".join(condition[3:-2].strip().split())
+    return condition
+
+
+def _validate_triggers(workflow: dict[str, Any]) -> None:
+    trigger = workflow.get("on")
+    if isinstance(trigger, list):
+        events = (
+            set(trigger) if all(isinstance(item, str) for item in trigger) else set()
+        )
+        configs: dict[str, object] = {}
+    elif isinstance(trigger, dict) and all(isinstance(key, str) for key in trigger):
+        events = set(trigger)
+        configs = trigger
+    else:
+        events = set()
+        configs = {}
+    if not {"push", "pull_request"}.issubset(events):
+        raise OfficialConsumerContractError(
+            "workflow must trigger the proof on push and pull_request"
+        )
+
+    for event in ("push", "pull_request"):
+        config = configs.get(event)
+        if config is None:
+            continue
+        if not isinstance(config, dict):
+            raise OfficialConsumerContractError(
+                f"workflow {event} trigger has an unsupported filter"
+            )
+        forbidden = {"paths", "paths-ignore", "branches-ignore", "tags", "tags-ignore"}
+        if forbidden.intersection(config):
+            raise OfficialConsumerContractError(
+                f"workflow {event} trigger can skip the proof"
+            )
+        if event == "push" and "branches" in config:
+            branches = config["branches"]
+            if not (
+                isinstance(branches, list)
+                and branches
+                and all(isinstance(branch, str) for branch in branches)
+                and "main" in branches
+            ):
+                raise OfficialConsumerContractError(
+                    "workflow push trigger does not include main"
+                )
+        if event == "pull_request" and "branches" in config:
+            raise OfficialConsumerContractError(
+                "workflow pull_request trigger can skip the proof"
+            )
+        if event == "pull_request" and "types" in config:
+            types = config["types"]
+            if not (
+                isinstance(types, list)
+                and all(isinstance(activity, str) for activity in types)
+                and {"opened", "synchronize", "reopened"}.issubset(set(types))
+            ):
+                raise OfficialConsumerContractError(
+                    "workflow pull_request trigger omits a required activity"
+                )
+
+
+def _continue_on_error_is_masking(container: dict[str, Any]) -> bool:
+    return (
+        "continue-on-error" in container and container["continue-on-error"] is not False
+    )
+
+
+def _validate_dependency_graph(jobs: dict[str, Any]) -> set[str]:
+    dependencies: dict[str, set[str]] = {}
+    for name, raw_job in jobs.items():
+        job = _mapping(raw_job, f"workflow job {name}")
+        dependencies[name] = _needs(job.get("needs"), f"workflow job {name}")
+        unknown = dependencies[name].difference(jobs)
+        if unknown:
+            raise OfficialConsumerContractError(
+                f"workflow job {name} has an unknown dependency"
+            )
+
+    complete: set[str] = set()
+    active: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in active:
+            raise OfficialConsumerContractError(
+                "workflow dependency graph contains a dependency cycle"
+            )
+        if name in complete:
+            return
+        active.add(name)
+        for dependency in dependencies[name]:
+            visit(dependency)
+        active.remove(name)
+        complete.add(name)
+
+    for name in dependencies:
+        visit(name)
+
+    reverse: dict[str, set[str]] = {name: set() for name in jobs}
+    for name, required in dependencies.items():
+        for dependency in required:
+            reverse[dependency].add(name)
+    reachable = {_PROOF_JOB}
+    frontier = [_PROOF_JOB]
+    while frontier:
+        dependency = frontier.pop()
+        for consumer in reverse.get(dependency, set()):
+            if consumer not in reachable:
+                reachable.add(consumer)
+                frontier.append(consumer)
+
+    aggregates = reachable.intersection(_AGGREGATE_JOBS)
+    if not aggregates:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof does not reach a downstream aggregate"
+        )
+    for name in reachable:
+        if name == _PROOF_JOB:
+            continue
+        job = _mapping(jobs[name], f"workflow job {name}")
+        condition = _normalize_condition(job.get("if"))
+        if condition not in (None, "always()"):
+            raise OfficialConsumerContractError(
+                "t4-conformance downstream aggregate is conditionally unreachable"
+            )
+        if _continue_on_error_is_masking(job):
+            raise OfficialConsumerContractError(
+                "t4-conformance dependency chain uses continue-on-error"
+            )
+        for step in _steps(job, f"workflow job {name}"):
+            if _continue_on_error_is_masking(step):
+                raise OfficialConsumerContractError(
+                    "t4-conformance dependency chain uses continue-on-error"
+                )
+        if name in _AGGREGATE_JOBS and condition == "always()":
+            _validate_always_aggregate(job, name)
+    return reachable
+
+
+def _validate_always_aggregate(job: dict[str, Any], name: str) -> None:
+    result_expression = "${{ needs.t4-conformance.result }}"
+    for step in _steps(job, f"workflow job {name}"):
+        script = step.get("run")
+        if not isinstance(script, str):
+            continue
+        units = _script_units(script)
+        if any(
+            unit.text
+            in {
+                f'test "{result_expression}" = success',
+                f'test "{result_expression}" = "success"',
+            }
+            and not unit.controls
+            for unit in units
+        ):
+            return
+        assignment = next(
+            (
+                match
+                for unit in units
+                if not unit.controls
+                and (
+                    match := re.fullmatch(
+                        rf'(?P<name>[A-Za-z_][A-Za-z0-9_]*)="{re.escape(result_expression)}"',
+                        unit.text,
+                    )
+                )
+            ),
+            None,
+        )
+        if assignment is None:
+            continue
+        variable = assignment.group("name")
+        failure_condition = next(
+            (
+                unit.text
+                for unit in units
+                if re.match(
+                    rf'^if \[\[? "\${variable}" != "?success"? \]\]?; then$',
+                    unit.text,
+                )
+            ),
+            None,
+        )
+        if failure_condition is not None and any(
+            unit.text == "exit 1" and failure_condition in unit.controls
+            for unit in units
+        ):
+            return
+    raise OfficialConsumerContractError(
+        f"workflow {name} always aggregate does not enforce t4-conformance success"
+    )
+
+
+def _strip_shell_comment(line: str) -> str:
+    single = False
+    double = False
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and not single:
+            escaped = True
+            continue
+        if character == "'" and not double:
+            single = not single
+            continue
+        if character == '"' and not single:
+            double = not double
+            continue
+        if (
+            character == "#"
+            and not single
+            and not double
+            and (index == 0 or line[index - 1].isspace())
+        ):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _executable_lines(script: str) -> list[str]:
+    return [
+        stripped.strip()
+        for line in script.splitlines()
+        if (stripped := _strip_shell_comment(line)).strip()
+    ]
+
+
+_HEREDOC_RE = re.compile(
+    r"<<(?P<strip>-)?\s*(?:(?P<quote>['\"])(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P=quote)|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+_FUNCTION_HEADER_RE = re.compile(
+    r"^(?:function\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{$"
+)
+_REQUIRED_EXECUTABLES = frozenset(
+    {"docker", "git", "grep", "mv", "python3", "tee", "test"}
+)
+
+
+def _opens_control(unit: str) -> bool:
+    return bool(re.match(r"^(?:if|for|while|until|case)\b", unit)) or unit in {
+        "{",
+        "(",
+    }
+
+
+def _closes_control(unit: str) -> bool:
+    return unit in {"fi", "done", "esac", "}", ")"}
+
+
+def _script_units(script: str) -> list[_ShellUnit]:
+    """Return reachable shell syntax units, excluding function and heredoc bodies.
+
+    This is intentionally a narrow parser for the reviewed official workflow
+    shape. Unknown nesting stays visible and therefore fails later predicates.
+    """
+
+    physical = script.splitlines()
+    units: list[_ShellUnit] = []
+    controls: list[str] = []
+    in_function = False
+    index = 0
+    while index < len(physical):
+        pending = ""
+        while index < len(physical):
+            line = _strip_shell_comment(physical[index]).strip()
+            index += 1
+            if not line and not pending:
+                continue
+            if line.endswith("\\"):
+                pending += line[:-1].rstrip() + " "
+                continue
+            unit = (pending + line).strip()
+            break
+        else:
+            break
+        if not unit:
+            continue
+
+        function_header = _FUNCTION_HEADER_RE.fullmatch(unit)
+        if not in_function and function_header:
+            if function_header.group("name") in _REQUIRED_EXECUTABLES:
+                raise OfficialConsumerContractError(
+                    "workflow proof shadows a required executable"
+                )
+            in_function = True
+            continue
+        if in_function:
+            if unit == "}":
+                in_function = False
+            continue
+
+        if _closes_control(unit) and controls:
+            controls.pop()
+
+        heredoc_bodies: list[str] = []
+        for match in _HEREDOC_RE.finditer(unit):
+            delimiter = match.group("quoted") or match.group("plain")
+            strip_tabs = match.group("strip") is not None
+            body: list[str] = []
+            found = False
+            while index < len(physical):
+                raw = physical[index]
+                index += 1
+                candidate = raw.lstrip("\t") if strip_tabs else raw
+                if candidate == delimiter:
+                    found = True
+                    break
+                body.append(raw)
+            if not found:
+                raise OfficialConsumerContractError(
+                    "workflow proof script contains an unterminated heredoc"
+                )
+            heredoc_bodies.append("\n".join(body))
+
+        units.append(_ShellUnit(unit, tuple(controls), tuple(heredoc_bodies)))
+        if _opens_control(unit):
+            controls.append(unit)
+
+    if in_function or controls:
+        raise OfficialConsumerContractError(
+            "workflow proof script has unbalanced shell control flow"
+        )
+    return units
+
+
+def _logical_units(script: str) -> list[str]:
+    return [unit.text for unit in _script_units(script)]
+
+
+_MUTATING_COMMAND_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:builtin\s+|command\s+)?"
+    r"(?:eval|unset|read|readarray|mapfile|declare|typeset|local|readonly|export|source)\b"
+)
+_PRINTF_V_RE = re.compile(r"(?:^|[;&|]\s*)printf\b[^;&|\n]*\s-v(?:\s|$)")
+_SPLIT_REF_NAME_RE = re.compile(r"MOLECULE_CI_(?:['\"\\]+)REF")
+
+
+def _validate_ref_script(script: str) -> None:
+    executable = "\n".join(_executable_lines(script))
+    if (
+        _MUTATING_COMMAND_RE.search(executable)
+        or _PRINTF_V_RE.search(executable)
+        or "GITHUB_ENV" in executable
+        or "BASH_ENV" in executable
+    ):
+        if "MOLECULE_CI_REF" not in executable and not _SPLIT_REF_NAME_RE.search(
+            executable
+        ):
+            raise OfficialConsumerContractError(
+                "proof script uses unsupported environment mutation"
+            )
+        raise OfficialConsumerContractError("proof script can mutate MOLECULE_CI_REF")
+    if "MOLECULE_CI_REF" not in executable and not _SPLIT_REF_NAME_RE.search(
+        executable
+    ):
+        return
+    if _SPLIT_REF_NAME_RE.search(executable):
+        raise OfficialConsumerContractError("proof script can mutate MOLECULE_CI_REF")
+    for occurrence in re.finditer("MOLECULE_CI_REF", executable):
+        start = occurrence.start()
+        end = occurrence.end()
+        simple_read = (
+            start > 0
+            and executable[start - 1] == "$"
+            and (
+                end == len(executable)
+                or not (executable[end].isalnum() or executable[end] in "_[")
+            )
+        )
+        braced_read = (
+            start > 1
+            and executable[start - 2 : start] == "${"
+            and end < len(executable)
+            and executable[end] == "}"
+        )
+        if not (simple_read or braced_read):
+            raise OfficialConsumerContractError(
+                "proof script can mutate MOLECULE_CI_REF"
+            )
+
+
+def _env(container: dict[str, Any], label: str) -> dict[str, Any]:
+    value = container.get("env")
+    if value is None:
+        return {}
+    return _mapping(value, f"{label} env")
+
+
+def _validate_ref_scopes(
+    workflow: dict[str, Any], jobs: dict[str, Any], proof_steps: list[dict[str, Any]]
+) -> None:
+    workflow_env = _env(workflow, "workflow")
+    assignments = 0
+    for job_name, raw_job in jobs.items():
+        job = _mapping(raw_job, f"workflow job {job_name}")
+        job_env = _env(job, f"workflow job {job_name}")
+        scopes = [
+            job_env,
+            *[
+                _env(step, f"workflow job {job_name} step")
+                for step in _steps(job, f"workflow job {job_name}")
+            ],
+        ]
+        for scope in scopes:
+            if "MOLECULE_CI_REF" in scope:
+                assignments += 1
+                if scope["MOLECULE_CI_REF"] != FINAL_IMAGE_VERIFIER_REF:
+                    raise OfficialConsumerContractError(
+                        "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
+                    )
+    if "MOLECULE_CI_REF" in workflow_env:
+        assignments += 1
+        if workflow_env["MOLECULE_CI_REF"] != FINAL_IMAGE_VERIFIER_REF:
+            raise OfficialConsumerContractError(
+                "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
+            )
+    if not assignments:
+        raise OfficialConsumerContractError(
+            "workflow does not pin the reviewed molecule-ci verifier"
+        )
+
+    proof_job = _mapping(jobs[_PROOF_JOB], "t4-conformance proof job")
+    proof_job_env = _env(proof_job, "t4-conformance proof job")
+    ref_read = False
+    for step in proof_steps:
+        script = step.get("run")
+        if not isinstance(script, str):
+            continue
+        _validate_ref_script(script)
+        if "$MOLECULE_CI_REF" not in "\n".join(_executable_lines(script)):
+            continue
+        ref_read = True
+        effective = {
+            **workflow_env,
+            **proof_job_env,
+            **_env(step, "t4-conformance proof step"),
+        }
+        if effective.get("MOLECULE_CI_REF") != FINAL_IMAGE_VERIFIER_REF:
+            raise OfficialConsumerContractError(
+                "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
+            )
+    if not ref_read:
+        raise OfficialConsumerContractError(
+            "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
+        )
+
+
+def _starts_git_command(unit: str, operation: str) -> bool:
+    return (
+        bool(
+            re.match(
+                r"^(?:if\s+)?(?:[A-Z_][A-Z0-9_]*=[^ ]+\s+)*git\b",
+                unit,
+            )
+        )
+        and operation in unit
+    )
+
+
+_EXACT_FETCH_RE = re.compile(
+    r"^(?:if )?GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 "
+    r"git -c credential\.helper= -c http\.userAgent=curl/8\.4\.0 "
+    r'-C "\$[A-Z_][A-Z0-9_]*" fetch (?:-q )?--no-tags --depth 1 '
+    r'origin "\$MOLECULE_CI_REF"(?:; then)?$'
+)
+
+
+def _exact_fetch_command(unit: str) -> bool:
+    if not (_starts_git_command(unit, " fetch ") and "MOLECULE_CI_REF" in unit):
+        return False
+    match = _EXACT_FETCH_RE.fullmatch(unit)
+    if match is None or unit.startswith("if ") != unit.endswith("; then"):
+        raise OfficialConsumerContractError(
+            "workflow exact-ref fetch masks or alters a required command"
+        )
+    return True
+
+
+def _tokens(unit: str, label: str) -> list[str]:
+    try:
+        return shlex.split(unit, posix=True)
+    except ValueError as exc:
+        raise OfficialConsumerContractError(
+            f"workflow {label} command is not statically parseable"
+        ) from exc
+
+
+def _option_values(tokens: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    for index, token in enumerate(tokens):
+        if token == option:
+            if index + 1 < len(tokens):
+                values.append(tokens[index + 1])
+        elif token.startswith(f"{option}="):
+            values.append(token[len(option) + 1 :])
+    return values
+
+
+def _build_command(unit: str) -> bool:
+    if not unit.startswith("docker build "):
+        return False
+    tokens = _tokens(unit, "docker build")
+    tags = _option_values(tokens, "-t") + _option_values(tokens, "--tag")
+    if tags != ["$T4_TAG"]:
+        raise OfficialConsumerContractError(
+            "verifier does not use the same final image that was built"
+        )
+    command = [
+        "docker",
+        "build",
+        "--build-arg",
+        "RUNTIME_VERSION=$EXPECTED_RUNTIME_VERSION",
+        "-t",
+        "$T4_TAG",
+        ".",
+    ]
+    if tokens not in (command, command + ["--no-cache", "2>&1", "|", "tail", "-5"]):
+        raise OfficialConsumerContractError(
+            "workflow final-image build is unsafe or ambiguous"
+        )
+    return True
+
+
+def _create_command(unit: str) -> bool:
+    if not unit.startswith("docker create "):
+        return False
+    tokens = _tokens(unit, "docker create")
+    if any(
+        token.startswith("-v")
+        or token == "--volume"
+        or token.startswith("--volume=")
+        or token == "--mount"
+        or token.startswith("--mount=")
+        or token == "--volumes-from"
+        or token.startswith("--volumes-from=")
+        for token in tokens
+    ):
+        raise OfficialConsumerContractError("final-image verifier uses a bind mount")
+    required_options = {
+        ("--name", "$MCP_VERIFY_CONTAINER"),
+        ("--network", "none"),
+        ("--user", "1000:1000"),
+        ("--workdir", "/tmp"),
+        ("--cap-drop", "ALL"),
+        ("--security-opt", "no-new-privileges"),
+        ("--pids-limit", "128"),
+        ("--memory", "768m"),
+        ("--cpus", "1"),
+        ("--tmpfs", "/tmp:size=64m"),
+        ("--entrypoint", "python3"),
+    }
+    if (
+        any(
+            _option_values(tokens, option) != [value]
+            for option, value in required_options
+        )
+        or tokens.count("--interactive") != 1
+    ):
+        raise OfficialConsumerContractError(
+            "final-image verifier has unsafe or ambiguous container options"
+        )
+
+    allowed_value_options = {option for option, _ in required_options} | {"--env"}
+    allowed_flags = {"--interactive"}
+    position = 2
+    env_values: list[str] = []
+    while position < len(tokens):
+        token = tokens[position]
+        if token == "$T4_TAG":
+            break
+        if token in allowed_flags:
+            position += 1
+            continue
+        matched_option = next(
+            (
+                option
+                for option in allowed_value_options
+                if token == option or token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if matched_option is None:
+            if re.fullmatch(r"\$[A-Z_][A-Z0-9_]*TAG", token):
+                raise OfficialConsumerContractError(
+                    "verifier does not use the same final image that was built"
+                )
+            raise OfficialConsumerContractError(
+                "final-image verifier has unsafe or ambiguous container options"
+            )
+        if token == matched_option:
+            if position + 1 >= len(tokens):
+                raise OfficialConsumerContractError(
+                    "final-image verifier has unsafe or ambiguous container options"
+                )
+            value = tokens[position + 1]
+            position += 2
+        else:
+            value = token[len(matched_option) + 1 :]
+            position += 1
+        if matched_option == "--env":
+            env_values.append(value)
+
+    if env_values not in (
+        [],
+        ["MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin"],
+    ):
+        raise OfficialConsumerContractError(
+            "final-image verifier has unsafe or ambiguous container options"
+        )
+    tail = tokens[position:]
+    if tail not in (
+        ["$T4_TAG", "/mcp_built_image_e2e.py"],
+        ["$T4_TAG", "/mcp_built_image_e2e.py", ">/dev/null"],
+    ):
+        raise OfficialConsumerContractError(
+            "final-image verifier has unsafe or ambiguous container options"
+        )
+    return True
+
+
+def _find_trace(trace: list[_TraceUnit], predicate: Any, start: int, label: str) -> int:
+    for index in range(start, len(trace)):
+        if predicate(trace[index].text):
+            if "|| true" in trace[index].text or "|| :" in trace[index].text:
+                raise OfficialConsumerContractError(
+                    "ordered executable proof masks a required command failure"
+                )
+            return index
+    raise OfficialConsumerContractError(
+        f"workflow ordered executable proof is missing {label}"
+    )
+
+
+def _validate_tag_binding(script: str, stage: str) -> None:
+    units = _logical_units(script)
+    try:
+        stage_index = units.index(stage)
+    except ValueError as exc:
+        raise OfficialConsumerContractError(
+            "verifier does not use the same final image that was built"
+        ) from exc
+    assignments = [
+        unit
+        for unit in units[:stage_index]
+        if re.match(r"^T4_TAG(?:\[[^]]*\])?\s*(?:\+?=)", unit)
+    ]
+    if assignments != [_T4_TAG_ASSIGNMENT]:
+        raise OfficialConsumerContractError(
+            "verifier does not use the same final image that was built"
+        )
+
+
+def _has_attestation_load(unit: _TraceUnit) -> bool:
+    if "python3 " not in unit.text or "<<" not in unit.text:
+        return False
+    conditional_nodes = (
+        ast.Assert,
+        ast.AsyncFunctionDef,
+        ast.BoolOp,
+        ast.ClassDef,
+        ast.comprehension,
+        ast.For,
+        ast.FunctionDef,
+        ast.If,
+        ast.IfExp,
+        ast.Lambda,
+        ast.Match,
+        ast.Try,
+        ast.While,
+    )
+
+    def contains_reachable_call(node: ast.AST, conditional: bool = False) -> bool:
+        conditional = conditional or isinstance(node, conditional_nodes)
+        if isinstance(node, ast.Call):
+            function = node.func
+            if (
+                (isinstance(function, ast.Name) and function.id == "load_attestation")
+                or (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "load_attestation"
+                )
+            ) and not conditional:
+                return True
+        return any(
+            contains_reachable_call(child, conditional)
+            for child in ast.iter_child_nodes(node)
+        )
+
+    for body in unit.heredoc_bodies:
+        try:
+            module = ast.parse(body, mode="exec")
+        except SyntaxError:
+            continue
+        if contains_reachable_call(module):
+            return True
+    return False
+
+
+def _require_top_level(trace: list[_TraceUnit], index: int, label: str) -> None:
+    if trace[index].controls:
+        raise OfficialConsumerContractError(
+            f"workflow ordered executable proof hides {label} behind shell control flow"
+        )
+
+
+_STABLE_RUNNER_VARIABLES = frozenset(
+    {
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "RUNNER_TEMP",
+    }
+)
+_SHELL_VARIABLE_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Z_][A-Z0-9_]*)(?::-[^}]*)?\}|"
+    r"(?P<plain>[A-Z_][A-Z0-9_]*))"
+)
+
+
+def _binding_before(trace: list[_TraceUnit], index: int, name: str) -> str:
+    step_index = trace[index].step_index
+    pattern = re.compile(rf"^{re.escape(name)}=(?P<value>.+)$")
+    bindings = [
+        match.group("value")
+        for unit in trace[:index]
+        if unit.step_index == step_index
+        and not unit.controls
+        and (match := pattern.fullmatch(unit.text)) is not None
+    ]
+    if len(bindings) != 1:
+        raise OfficialConsumerContractError(f"workflow has an ambiguous {name} binding")
+    return bindings[0]
+
+
+def _binding_snapshot(
+    trace: list[_TraceUnit], index: int, name: str, seen: frozenset[str] = frozenset()
+) -> tuple[str, tuple[tuple[str, object], ...]]:
+    if name in seen:
+        raise OfficialConsumerContractError(f"workflow has a recursive {name} binding")
+    value = _binding_before(trace, index, name)
+    nested: list[tuple[str, object]] = []
+    for match in _SHELL_VARIABLE_RE.finditer(value):
+        dependency = match.group("braced") or match.group("plain")
+        if dependency in _STABLE_RUNNER_VARIABLES:
+            continue
+        nested.append(
+            (
+                dependency,
+                _binding_snapshot(trace, index, dependency, seen | {name}),
+            )
+        )
+    return value, tuple(nested)
+
+
+def _variable_token_name(token: str, label: str) -> str:
+    match = re.fullmatch(r"\$([A-Z_][A-Z0-9_]*)", token)
+    if match is None:
+        raise OfficialConsumerContractError(
+            f"workflow ordered executable proof has an invalid {label} path"
+        )
+    return match.group(1)
+
+
+def _validate_attestation_flow(
+    trace: list[_TraceUnit], lockstep_index: int, start_index: int
+) -> None:
+    lockstep = trace[lockstep_index].text
+    redirection = re.search(r">\s*(\"?\$[A-Z_][A-Z0-9_]*\"?)", lockstep)
+    if redirection is None:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof does not persist the attestation"
+        )
+    produced = redirection.group(1).replace('"', "")
+    start = trace[start_index].text
+    consumed_match = re.search(r"<\s*(\"?\$[A-Z_][A-Z0-9_]*\"?)", start)
+    if consumed_match is None:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof does not pipe the attestation"
+        )
+    consumed = consumed_match.group(1).replace('"', "")
+    produced_name = _variable_token_name(produced, "attestation output")
+    consumed_name = _variable_token_name(consumed, "attestation input")
+    consumed_at_generation = _binding_snapshot(trace, lockstep_index, consumed_name)
+    consumed_at_start = _binding_snapshot(trace, start_index, consumed_name)
+    if consumed_at_generation != consumed_at_start:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof consumes a different attestation"
+        )
+    if produced == consumed:
+        return
+    produced_value = _binding_before(trace, lockstep_index, produced_name)
+    if produced_value != f'"${{{consumed_name}}}.tmp"':
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof consumes a different attestation"
+        )
+    expected_moves = {
+        f'mv "{produced}" "{consumed}"',
+        f'mv -f "{produced}" "{consumed}"',
+    }
+    if not any(
+        unit.text in expected_moves and not unit.controls
+        for unit in trace[lockstep_index + 1 : start_index]
+    ):
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof consumes a different attestation"
+        )
+
+
+def _validate_verifier_copy(
+    trace: list[_TraceUnit], remote_index: int, copy_index: int
+) -> None:
+    tokens = _tokens(trace[copy_index].text, "docker cp")
+    if len(tokens) != 4 or tokens[:2] != ["docker", "cp"]:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof has an invalid verifier copy"
+        )
+    source, destination = tokens[2], tokens[3]
+    if destination != "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py":
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof copies the verifier elsewhere"
+        )
+    source_match = re.fullmatch(
+        r"\$([A-Z_][A-Z0-9_]*)/scripts/mcp_built_image_e2e\.py", source
+    )
+    if source_match is not None:
+        copy_root = source_match.group(1)
+    elif source == "$VERIFIER":
+        verifier_value = _binding_before(trace, copy_index, "VERIFIER")
+        verifier_match = re.fullmatch(
+            r'"\$([A-Z_][A-Z0-9_]*)/scripts/mcp_built_image_e2e\.py"',
+            verifier_value,
+        )
+        if verifier_match is None:
+            raise OfficialConsumerContractError(
+                "workflow ordered executable proof copies an unreviewed verifier"
+            )
+        copy_root = verifier_match.group(1)
+    else:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof copies an unreviewed verifier"
+        )
+    remote_match = re.search(
+        r'git\s+-C\s+"\$([A-Z_][A-Z0-9_]*)"\s+remote add origin',
+        trace[remote_index].text,
+    )
+    if remote_match is None:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof copies an unreviewed verifier"
+        )
+    fetch_root = remote_match.group(1)
+    if _binding_snapshot(trace, remote_index, fetch_root) != _binding_snapshot(
+        trace, copy_index, copy_root
+    ):
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof copies an unreviewed verifier"
+        )
+
+
+def _validate_lockstep_checker(
+    trace: list[_TraceUnit], remote_index: int, lockstep_index: int
+) -> None:
+    tokens = _tokens(trace[lockstep_index].text, "MCP lockstep")
+    if len(tokens) < 2 or tokens[0] != "python3":
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof uses an unreviewed lockstep checker"
+        )
+    checker_match = re.fullmatch(
+        r"\$([A-Z_][A-Z0-9_]*)/scripts/mcp_pin_lockstep\.py", tokens[1]
+    )
+    remote_match = re.search(
+        r'git\s+-C\s+"\$([A-Z_][A-Z0-9_]*)"\s+remote add origin',
+        trace[remote_index].text,
+    )
+    if checker_match is None or remote_match is None:
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof uses an unreviewed lockstep checker"
+        )
+    if _binding_snapshot(
+        trace, lockstep_index, checker_match.group(1)
+    ) != _binding_snapshot(trace, remote_index, remote_match.group(1)):
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof uses an unreviewed lockstep checker"
+        )
+
+
+def _validate_ordered_proof(
+    proof_steps: list[dict[str, Any]],
+    proof_step_indexes: set[int],
+    job_condition: str | None,
+) -> None:
+    scripts: dict[int, str] = {}
+    trace: list[_TraceUnit] = []
+    for step_index, step in enumerate(proof_steps):
+        script = step.get("run")
+        if not isinstance(script, str):
+            continue
+        scripts[step_index] = script
+        units = _script_units(script)
+        if step_index in proof_step_indexes and (
+            not units or units[0].text != "set -euo pipefail"
+        ):
+            raise OfficialConsumerContractError(
+                "ordered executable proof step does not enable fail-closed shell mode"
+            )
+        trace.extend(
+            _TraceUnit(
+                step_index,
+                unit.text,
+                unit.controls,
+                unit.heredoc_bodies,
+            )
+            for unit in units
+        )
+
+    remote_index = _find_trace(
+        trace,
+        lambda unit: (
+            unit.startswith("git ")
+            and " remote add origin " in unit
+            and unit.endswith("https://git.moleculesai.app/molecule-ai/molecule-ci.git")
+        ),
+        0,
+        "the canonical molecule-ci remote",
+    )
+    fetch_index = _find_trace(
+        trace,
+        _exact_fetch_command,
+        remote_index + 1,
+        "the anonymous exact-ref fetch",
+    )
+    checkout_index = _find_trace(
+        trace,
+        lambda unit: (
+            unit.startswith("git ") and " checkout -q --detach FETCH_HEAD" in unit
+        ),
+        fetch_index + 1,
+        "the detached checkout",
+    )
+    rev_index = _find_trace(
+        trace,
+        lambda unit: (
+            "rev-parse HEAD" in unit and not unit.startswith(("echo ", "printf "))
+        ),
+        checkout_index + 1,
+        "the fetched-ref resolution",
+    )
+    comparison_index = _find_trace(
+        trace,
+        lambda unit: (
+            "$MOLECULE_CI_REF" in unit
+            and unit.startswith(("test ", "if [", "if [["))
+            and (" = " in unit or " != " in unit)
+        ),
+        rev_index,
+        "the fetched-ref equality check",
+    )
+    lockstep_index = _find_trace(
+        trace,
+        lambda unit: (
+            unit.startswith("python3 ")
+            and "mcp_pin_lockstep.py" in unit
+            and "--repo-root ." in unit
+            and "--json" in unit
+        ),
+        comparison_index + 1,
+        "the immutable pin attestation",
+    )
+    loader_index = _find_trace(
+        trace,
+        lambda unit: "python3 " in unit and "<<" in unit,
+        lockstep_index + 1,
+        "the attestation parser",
+    )
+    if not _has_attestation_load(trace[loader_index]):
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof is missing the hardened attestation load"
+        )
+    build_index = _find_trace(
+        trace, _build_command, loader_index + 1, "the final-image build"
+    )
+    create_index = _find_trace(
+        trace, _create_command, build_index + 1, "the unprivileged verifier container"
+    )
+    copy_index = _find_trace(
+        trace,
+        lambda unit: unit.startswith("docker cp "),
+        create_index + 1,
+        "the verifier copy",
+    )
+    start_index = _find_trace(
+        trace,
+        lambda unit: (
+            unit.startswith("docker start ")
+            and "--attach" in unit
+            and "--interactive" in unit
+            and "$MCP_VERIFY_CONTAINER" in unit
+        ),
+        copy_index + 1,
+        "the offline verifier start",
+    )
+    sentinel_index = _find_trace(
+        trace,
+        lambda unit: (
+            (unit.startswith("grep ") or unit.startswith("if ! grep "))
+            and "-qxF" in unit
+            and "mcp-built-image-e2e:sentinel:executed" in unit
+        ),
+        start_index + 1,
+        "the verifier sentinel assertion",
+    )
+    keep_index = _find_trace(
+        trace,
+        lambda unit: unit == "KEEP_T4_IMAGE=1",
+        sentinel_index + 1,
+        "the post-proof image handoff",
+    )
+
+    stages = (
+        (remote_index, "the canonical molecule-ci remote"),
+        (checkout_index, "the detached checkout"),
+        (rev_index, "the fetched-ref resolution"),
+        (comparison_index, "the fetched-ref equality check"),
+        (lockstep_index, "the immutable pin attestation"),
+        (loader_index, "the attestation parser"),
+        (build_index, "the final-image build"),
+        (create_index, "the verifier container"),
+        (copy_index, "the verifier copy"),
+        (start_index, "the verifier start"),
+        (sentinel_index, "the sentinel assertion"),
+        (keep_index, "the image handoff"),
+    )
+    for index, label in stages:
+        _require_top_level(trace, index, label)
+    if trace[fetch_index].controls not in (
+        (),
+        ("for attempt in 1 2 3; do",),
+    ):
+        raise OfficialConsumerContractError(
+            "workflow ordered executable proof hides the exact-ref fetch behind shell control flow"
+        )
+
+    stage_indexes = {index for index, _ in stages} | {fetch_index}
+    for step_index in {trace[index].step_index for index in stage_indexes}:
+        condition = _normalize_condition(proof_steps[step_index].get("if"))
+        if condition in _FORK_GUARDS or (
+            job_condition not in _NON_FORK_GUARDS and condition not in _NON_FORK_GUARDS
+        ):
+            raise OfficialConsumerContractError(
+                "workflow ordered executable proof stage lacks an exact non-fork guard"
+            )
+        units = _script_units(scripts[step_index])
+        if not units or units[0].text != "set -euo pipefail":
+            raise OfficialConsumerContractError(
+                "ordered executable proof step does not enable fail-closed shell mode"
+            )
+
+    build_step = trace[build_index].step_index
+    create_step = trace[create_index].step_index
+    image_mutation = re.compile(
+        r"^(?:command\s+)?docker\s+(?:build\b|buildx\s+build\b|tag\b|load\b|"
+        r"import\b|commit\b|image\s+(?:build|tag|load|import)\b)"
+    )
+    if any(
+        image_mutation.match(unit.text)
+        for unit in trace[build_index + 1 : create_index]
+    ):
+        raise OfficialConsumerContractError(
+            "verifier does not use the same final image that was built"
+        )
+    if "$T4_TAG" not in _tokens(trace[create_index].text, "docker create"):
+        raise OfficialConsumerContractError(
+            "verifier does not use the same final image that was built"
+        )
+    _validate_tag_binding(scripts[build_step], trace[build_index].text)
+    _validate_tag_binding(scripts[create_step], trace[create_index].text)
+    _validate_lockstep_checker(trace, remote_index, lockstep_index)
+    _validate_verifier_copy(trace, remote_index, copy_index)
+    _validate_attestation_flow(trace, lockstep_index, start_index)
+
+
+def _validate_workflow(workflow_text: str) -> None:
+    workflow = _strict_workflow_load(workflow_text)
+    _validate_triggers(workflow)
+    if "defaults" in workflow:
+        raise OfficialConsumerContractError(
+            "workflow proof cannot use a custom shell default"
+        )
+    jobs = _mapping(workflow.get("jobs"), "workflow jobs")
+    if _PROOF_JOB not in jobs:
+        raise OfficialConsumerContractError(
+            "workflow is missing the t4-conformance proof job"
+        )
+    proof_job = _mapping(jobs[_PROOF_JOB], "t4-conformance proof job")
+    if "defaults" in proof_job:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof cannot use a custom shell default"
+        )
+    runners = proof_job.get("runs-on")
+    runner_is_exact = runners == "docker-host" or (
+        isinstance(runners, list)
+        and len(runners) == 2
+        and all(isinstance(runner, str) for runner in runners)
+        and set(runners) == {"ubuntu-latest", "docker-host"}
+    )
+    if not runner_is_exact:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job has unsupported runner labels; "
+            "docker-host is required"
+        )
+    if "validate-static" not in _needs(
+        proof_job.get("needs"), "t4-conformance proof job"
+    ):
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job must depend on validate-static"
+        )
+    if _continue_on_error_is_masking(proof_job):
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job uses continue-on-error"
+        )
+
+    proof_steps = _steps(proof_job, "t4-conformance proof job")
+    job_condition = _normalize_condition(proof_job.get("if"))
+    if job_condition is not None and job_condition not in _NON_FORK_GUARDS:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job has an unsupported fork guard"
+        )
+    proof_step_indexes: set[int] = set()
+    proof_markers = (
+        "mcp_pin_lockstep.py",
+        "docker build",
+        "docker create",
+        "mcp-built-image-e2e:sentinel:executed",
+    )
+    for step_index, step in enumerate(proof_steps):
+        if "shell" in step:
+            raise OfficialConsumerContractError(
+                "t4-conformance proof cannot use a custom shell"
+            )
+        if _continue_on_error_is_masking(step):
+            raise OfficialConsumerContractError(
+                "t4-conformance proof step uses continue-on-error"
+            )
+        condition = _normalize_condition(step.get("if"))
+        if condition is not None and condition not in _NON_FORK_GUARDS | _FORK_GUARDS:
+            raise OfficialConsumerContractError(
+                "t4-conformance proof step has an unsupported fork guard"
+            )
+        script = step.get("run")
+        executable = (
+            "\n".join(_executable_lines(script)) if isinstance(script, str) else ""
+        )
+        bears_proof = any(marker in executable for marker in proof_markers)
+        if bears_proof:
+            proof_step_indexes.add(step_index)
+            if condition in _FORK_GUARDS:
+                raise OfficialConsumerContractError(
+                    "t4-conformance proof runs only on a fork"
+                )
+            if (
+                job_condition not in _NON_FORK_GUARDS
+                and condition not in _NON_FORK_GUARDS
+            ):
+                raise OfficialConsumerContractError(
+                    "t4-conformance proof step lacks an exact non-fork guard"
+                )
+    if not proof_step_indexes:
+        raise OfficialConsumerContractError(
+            "t4-conformance proof job contains no executable proof"
+        )
+
+    _validate_dependency_graph(jobs)
+    _validate_ref_scopes(workflow, jobs, proof_steps)
+    _validate_ordered_proof(proof_steps, proof_step_indexes, job_condition)
 
 
 def _static_string(node: ast.AST) -> str | None:
@@ -188,884 +1412,44 @@ def _test_ref(module: ast.Module) -> str | None:
     return _static_string(assignments[0])
 
 
-def _function_nodes(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> list[ast.AST]:
-    nodes: list[ast.AST] = []
-    stack = list(reversed(function.body))
-    while stack:
-        node = stack.pop()
-        nodes.append(node)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        stack.extend(reversed(list(ast.iter_child_nodes(node))))
-    return nodes
-
-
-def _is_workflow_load(node: ast.AST) -> bool:
-    if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "safe_load"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "yaml"
-        and len(node.args) == 1
-        and not node.keywords
-    ):
-        return False
-    source = node.args[0]
-    return (
-        isinstance(source, ast.Call)
-        and isinstance(source.func, ast.Attribute)
-        and source.func.attr == "read_text"
-        and isinstance(source.func.value, ast.Name)
-        and source.func.value.id == "CI_WORKFLOW"
-        and not source.args
-        and not source.keywords
-    )
-
-
-def _target_names(target: ast.AST) -> set[str]:
-    if isinstance(target, ast.Name):
-        return {target.id}
-    if isinstance(target, (ast.List, ast.Tuple)):
-        return {name for element in target.elts for name in _target_names(element)}
-    return set()
-
-
-def _is_workflow_derived(
-    expression: ast.AST,
-    derived_names: set[str],
-    derived_functions: set[str],
-    local_derived: frozenset[str] = frozenset(),
-) -> bool:
-    """Prove that an expression preserves parsed workflow data.
-
-    This intentionally supports only the selection and collection shapes used
-    by the official tests. Unknown transformations fail closed rather than
-    letting a literal decoy inherit provenance from an unrelated child node.
-    """
-
-    if _is_workflow_load(expression):
-        return True
-    if isinstance(expression, ast.Name):
-        return expression.id in derived_names or expression.id in local_derived
-    if isinstance(expression, ast.Subscript):
-        if (
-            isinstance(expression.value, (ast.List, ast.Tuple))
-            and isinstance(expression.slice, ast.Constant)
-            and isinstance(expression.slice.value, int)
-        ):
-            elements = expression.value.elts
-            index = expression.slice.value
-            if -len(elements) <= index < len(elements):
-                return _is_workflow_derived(
-                    elements[index], derived_names, derived_functions, local_derived
-                )
-            return False
-        return _is_workflow_derived(
-            expression.value, derived_names, derived_functions, local_derived
-        )
-    if isinstance(expression, ast.Attribute):
-        return _is_workflow_derived(
-            expression.value, derived_names, derived_functions, local_derived
-        )
-    if isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
-        return bool(expression.elts) and all(
-            _is_workflow_derived(
-                element, derived_names, derived_functions, local_derived
-            )
-            for element in expression.elts
-        )
-    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-        scope = set(local_derived)
-        has_derived_source = False
-        for generator in expression.generators:
-            if _is_workflow_derived(
-                generator.iter, derived_names, derived_functions, frozenset(scope)
-            ):
-                scope.update(_target_names(generator.target))
-                has_derived_source = True
-        return has_derived_source and _is_workflow_derived(
-            expression.elt, derived_names, derived_functions, frozenset(scope)
-        )
-    if isinstance(expression, ast.Call):
-        if isinstance(expression.func, ast.Name):
-            if expression.func.id in derived_functions:
-                return True
-            if expression.func.id in {
-                "enumerate",
-                "list",
-                "next",
-                "set",
-                "sorted",
-                "str",
-                "tuple",
-            }:
-                if (
-                    not expression.args
-                    or expression.keywords
-                    or (expression.func.id != "enumerate" and len(expression.args) != 1)
-                    or len(expression.args) > 2
-                ):
-                    return False
-                return _is_workflow_derived(
-                    expression.args[0],
-                    derived_names,
-                    derived_functions,
-                    local_derived,
-                )
-            return False
-        if isinstance(expression.func, ast.Attribute):
-            receiver_is_derived = _is_workflow_derived(
-                expression.func.value,
-                derived_names,
-                derived_functions,
-                local_derived,
-            )
-            if expression.func.attr == "get":
-                if (
-                    not receiver_is_derived
-                    or expression.keywords
-                    or len(expression.args) not in (1, 2)
-                ):
-                    return False
-                if len(expression.args) == 2:
-                    default = expression.args[1]
-                    if not (
-                        isinstance(default, ast.Constant)
-                        and default.value in (None, "")
-                    ):
-                        return False
-                return True
-            if expression.func.attr in {"copy", "items", "keys", "values"}:
-                return (
-                    receiver_is_derived
-                    and not expression.args
-                    and not expression.keywords
-                )
-        return False
-    if isinstance(expression, ast.UnaryOp):
-        return _is_workflow_derived(
-            expression.operand, derived_names, derived_functions, local_derived
-        )
-    if isinstance(expression, ast.BoolOp):
-        return bool(expression.values) and all(
-            _is_workflow_derived(value, derived_names, derived_functions, local_derived)
-            for value in expression.values
-        )
-    if isinstance(expression, ast.IfExp):
-        return all(
-            _is_workflow_derived(part, derived_names, derived_functions, local_derived)
-            for part in (expression.body, expression.orelse)
-        )
-    return False
-
-
-def _update_assignment_state(
-    targets: list[ast.AST],
-    value: ast.AST,
-    derived_names: set[str],
-    string_bindings: dict[str, tuple[str, ...]],
-    derived_functions: set[str],
-) -> None:
-    assigned = {name for target in targets for name in _target_names(target)}
-    value_is_derived = _is_workflow_derived(value, derived_names, derived_functions)
-    sequence = _static_string_sequence(value, string_bindings)
-    for name in assigned:
-        if value_is_derived:
-            derived_names.add(name)
-        else:
-            derived_names.discard(name)
-        if sequence is None:
-            string_bindings.pop(name, None)
-        else:
-            string_bindings[name] = sequence
-
-
-def _function_returns_workflow(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-    derived_functions: set[str],
-) -> bool:
-    if _contains_pytest_collection_control(function):
-        return False
-    returns = [
-        node for node in _function_nodes(function) if isinstance(node, ast.Return)
-    ]
-    if (
-        len(returns) != 1
-        or not function.body
-        or returns[0] is not function.body[-1]
-        or returns[0].value is None
-    ):
-        return False
-
-    derived_names: set[str] = set()
-    string_bindings: dict[str, tuple[str, ...]] = {}
-    for index, statement in enumerate(function.body[:-1]):
-        if isinstance(statement, ast.Assign):
-            _update_assignment_state(
-                statement.targets,
-                statement.value,
-                derived_names,
-                string_bindings,
-                derived_functions,
-            )
-        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
-            _update_assignment_state(
-                [statement.target],
-                statement.value,
-                derived_names,
-                string_bindings,
-                derived_functions,
-            )
-        elif isinstance(statement, (ast.Assert, ast.Pass)):
-            continue
-        elif (
-            index == 0
-            and isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            continue
-        else:
-            return False
-
-    return _is_workflow_derived(returns[0].value, derived_names, derived_functions)
-
-
-def _workflow_returning_functions(
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
-) -> set[str]:
-    derived_functions: set[str] = set()
-    # Function provenance is monotonic and can grow at most once per function.
-    for _ in range(len(functions) + 1):
-        previous = set(derived_functions)
-        for name, function in functions.items():
-            if _function_returns_workflow(function, derived_functions):
-                derived_functions.add(name)
-        if derived_functions == previous:
-            break
-    return derived_functions
-
-
-def _comparison_parts(
-    comparison: ast.Compare,
-) -> list[tuple[ast.AST, ast.cmpop, ast.AST]]:
-    operands = [comparison.left, *comparison.comparators]
-    return [
-        (operands[index], operator, operands[index + 1])
-        for index, operator in enumerate(comparison.ops)
-    ]
-
-
-def _is_name(expression: ast.AST, name: str) -> bool:
-    return isinstance(expression, ast.Name) and expression.id == name
-
-
-def _asserts_name_against_workflow(
-    assertion: ast.Assert,
-    name: str,
-    operator_types: tuple[type[ast.cmpop], ...],
-    derived_names: set[str],
-    derived_functions: set[str],
-) -> bool:
-    if not isinstance(assertion.test, ast.Compare):
-        return False
-    for left, operator, right in _comparison_parts(assertion.test):
-        if not isinstance(operator, operator_types):
-            continue
-        if _is_name(left, name) and _is_workflow_derived(
-            right, derived_names, derived_functions
-        ):
-            return True
-        if _is_name(right, name) and _is_workflow_derived(
-            left, derived_names, derived_functions
-        ):
-            return True
-    return False
-
-
-def _static_string_sequence(
-    expression: ast.AST, bindings: dict[str, tuple[str, ...]]
-) -> tuple[str, ...] | None:
-    if isinstance(expression, ast.Name):
-        return bindings.get(expression.id)
-    if not isinstance(expression, (ast.List, ast.Set, ast.Tuple)):
-        return None
-    values = tuple(_static_string(element) for element in expression.elts)
-    if any(value is None for value in values):
-        return None
-    return tuple(value for value in values if value is not None)
-
-
-def _stored_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-    }
-
-
-def _has_workflow_source(expression: ast.AST, derived_functions: set[str]) -> bool:
-    return any(
-        _is_workflow_load(node)
-        or (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in derived_functions
-        )
-        for node in ast.walk(expression)
-    )
-
-
-@dataclass
-class _FunctionEvidence:
-    execution_guaranteed: bool = True
-    saw_workflow_load: bool = False
-    asserted_ref: bool = False
-    asserted_fork: bool = False
-    asserted_no_volume: bool = False
-    asserted_fragments: list[str] = field(default_factory=list)
-
-
-def _record_assertion(
-    evidence: _FunctionEvidence,
-    assertion: ast.Assert,
-    derived_names: set[str],
-    derived_functions: set[str],
-) -> None:
-    if not isinstance(assertion.test, ast.Compare):
-        return
-    if _asserts_name_against_workflow(
-        assertion,
-        "MOLECULE_CI_REF",
-        (ast.Eq,),
-        derived_names,
-        derived_functions,
-    ):
-        evidence.asserted_ref = True
-    if _asserts_name_against_workflow(
-        assertion,
-        "FORK_RUN",
-        (ast.Eq, ast.In),
-        derived_names,
-        derived_functions,
-    ):
-        evidence.asserted_fork = True
-    for left, operator, right in _comparison_parts(assertion.test):
-        if (
-            isinstance(operator, ast.NotIn)
-            and _static_string(left) == "--volume"
-            and _is_workflow_derived(right, derived_names, derived_functions)
-        ):
-            evidence.asserted_no_volume = True
-        value = _static_string(left)
-        if (
-            isinstance(operator, ast.In)
-            and value is not None
-            and _is_workflow_derived(right, derived_names, derived_functions)
-        ):
-            evidence.asserted_fragments.append(value)
-
-
-def _record_static_loop_assertions(
-    evidence: _FunctionEvidence,
-    loop: ast.For | ast.AsyncFor,
-    string_bindings: dict[str, tuple[str, ...]],
-    derived_names: set[str],
-    derived_functions: set[str],
-) -> bool:
-    target_names = _target_names(loop.target)
-    sequence = _static_string_sequence(loop.iter, string_bindings)
-    if (
-        len(target_names) != 1
-        or not sequence
-        or loop.orelse
-        or not loop.body
-        or not all(isinstance(statement, ast.Assert) for statement in loop.body)
-    ):
-        return False
-    target_name = next(iter(target_names))
-    for assertion in loop.body:
-        _record_assertion(evidence, assertion, derived_names, derived_functions)
-        if not isinstance(assertion.test, ast.Compare):
-            continue
-        if any(
-            isinstance(operator, ast.In)
-            and _is_name(left, target_name)
-            and _is_workflow_derived(right, derived_names, derived_functions)
-            for left, operator, right in _comparison_parts(assertion.test)
-        ):
-            evidence.asserted_fragments.extend(sequence)
-    return True
-
-
-def _contains_pytest_collection_control(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> bool:
-    for node in _function_nodes(function):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name) and node.func.id in {
-            "importorskip",
-            "skip",
-            "xfail",
-        }:
-            return True
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {
-            "importorskip",
-            "skip",
-            "xfail",
-        }:
-            return True
-    return False
-
-
-def _function_evidence(
-    function: ast.FunctionDef,
-    derived_functions: set[str],
-) -> _FunctionEvidence:
-    """Collect guaranteed evidence in source order from one regression test.
-
-    Only direct top-level assertions and non-empty static loops whose bodies
-    contain assertions exclusively are guaranteed. Conditional/nested evidence
-    is ignored, and any assignment replaces the prior provenance for its name.
-    """
-
-    evidence = _FunctionEvidence(
-        execution_guaranteed=not _contains_pytest_collection_control(function)
-    )
-    derived_names: set[str] = set()
-    string_bindings: dict[str, tuple[str, ...]] = {}
-
-    for index, statement in enumerate(function.body):
-        if isinstance(statement, ast.Assign):
-            evidence.saw_workflow_load |= _has_workflow_source(
-                statement.value, derived_functions
-            )
-            _update_assignment_state(
-                statement.targets,
-                statement.value,
-                derived_names,
-                string_bindings,
-                derived_functions,
-            )
-            continue
-        if isinstance(statement, ast.AnnAssign) and statement.value is not None:
-            evidence.saw_workflow_load |= _has_workflow_source(
-                statement.value, derived_functions
-            )
-            _update_assignment_state(
-                [statement.target],
-                statement.value,
-                derived_names,
-                string_bindings,
-                derived_functions,
-            )
-            continue
-        if isinstance(statement, ast.Assert):
-            _record_assertion(evidence, statement, derived_names, derived_functions)
-            continue
-        if isinstance(statement, (ast.For, ast.AsyncFor)):
-            if not _record_static_loop_assertions(
-                evidence,
-                statement,
-                string_bindings,
-                derived_names,
-                derived_functions,
-            ):
-                evidence.execution_guaranteed = False
-            continue
-        if isinstance(statement, ast.Pass):
-            continue
-        if (
-            index == 0
-            and isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            continue
-        evidence.execution_guaranteed = False
-        for name in _stored_names(statement):
-            derived_names.discard(name)
-            string_bindings.pop(name, None)
-
-    return evidence
-
-
-def _line_indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _parent_index(lines: list[str], index: int) -> int:
-    child_indent = _line_indent(lines[index])
-    for cursor in range(index - 1, -1, -1):
-        stripped = lines[cursor].strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if _line_indent(lines[cursor]) < child_indent:
-            return cursor
-    return -1
-
-
-def _job_index(lines: list[str], index: int) -> int:
-    candidate = -1
-    for cursor in range(index - 1, -1, -1):
-        stripped = lines[cursor].strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = _line_indent(lines[cursor])
-        if indent == 2 and candidate == -1 and _MAPPING_HEADER_RE.fullmatch(stripped):
-            candidate = cursor
-            continue
-        if indent == 0:
-            if stripped == "jobs:" and candidate != -1:
-                return candidate
-            return -1
-    return -1
-
-
-def _step_index(lines: list[str], index: int, job_index: int) -> int:
-    candidate = -1
-    for cursor in range(index, job_index, -1):
-        stripped = lines[cursor].strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = _line_indent(lines[cursor])
-        if indent == 6 and stripped.startswith("-") and candidate == -1:
-            candidate = cursor
-            continue
-        if indent == 4:
-            if stripped == "steps:" and candidate != -1:
-                return candidate
-            return -1
-    return -1
-
-
-def _ref_scope(lines: list[str], assignment_index: int) -> tuple[str, int] | None:
-    parent_index = _parent_index(lines, assignment_index)
-    if parent_index == -1 or lines[parent_index].strip() != "env:":
-        return None
-    env_indent = _line_indent(lines[parent_index])
-    if _line_indent(lines[assignment_index]) != env_indent + 2:
-        return None
-    if env_indent == 0:
-        return ("workflow", 0)
-    job_index = _job_index(lines, parent_index)
-    if job_index == -1:
-        return None
-    if env_indent == 4:
-        return ("job", job_index)
-    if env_indent == 8:
-        step_index = _step_index(lines, parent_index, job_index)
-        if step_index != -1:
-            return ("step", step_index)
-    return None
-
-
-def _run_blocks(lines: list[str]) -> list[_RunBlock]:
-    blocks: list[_RunBlock] = []
-    index = 0
-    while index < len(lines):
-        match = _RUN_BLOCK_RE.fullmatch(lines[index])
-        if match is None:
-            index += 1
-            continue
-        header_indent = len(match.group("indent"))
-        end = index + 1
-        while end < len(lines):
-            if lines[end].strip() and _line_indent(lines[end]) <= header_indent:
-                break
-            end += 1
-        job_index = _job_index(lines, index)
-        step_index = _step_index(lines, index, job_index) if job_index != -1 else -1
-        blocks.append(
-            _RunBlock(
-                header_index=index,
-                body="\n".join(lines[index + 1 : end]),
-                job_index=job_index,
-                step_index=step_index,
-            )
-        )
-        index = end
-    return blocks
-
-
-def _static_ref_value(value: str) -> str | None:
-    match = _STATIC_REF_VALUE_RE.fullmatch(value)
-    if match is None:
-        return None
-    return next(part for part in match.groups() if part is not None)
-
-
-def _run_block_reassigns_ref(block: _RunBlock) -> bool:
-    for line in block.body.splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        if (
-            _SHELL_REF_ASSIGNMENT_RE.search(line)
-            or _SHELL_REF_PARAMETER_ASSIGNMENT_RE.search(line)
-            or _SHELL_REF_MUTATING_COMMAND_RE.search(line)
-        ):
-            return True
-    return False
-
-
-def _validate_workflow_ref_wiring(workflow: str) -> None:
-    lines = workflow.splitlines()
-    assignments: list[tuple[int, re.Match[str]]] = []
-    for index, line in enumerate(lines):
-        match = _REF_MAPPING_RE.fullmatch(line)
-        if match is not None:
-            assignments.append((index, match))
-            continue
-        if not line.lstrip().startswith("#") and _REF_MAPPING_TOKEN_RE.search(line):
-            raise OfficialConsumerContractError(
-                "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
-            )
-
-    if not assignments:
-        raise OfficialConsumerContractError(
-            "workflow does not pin the reviewed molecule-ci verifier"
-        )
-
-    values = [_static_ref_value(match.group("value")) for _, match in assignments]
-    if any(value is None for value in values):
-        raise OfficialConsumerContractError(
-            "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
-        )
-    if any(value != FINAL_IMAGE_VERIFIER_REF for value in values):
-        if len(values) == 1:
-            raise OfficialConsumerContractError(
-                "workflow does not pin the reviewed molecule-ci verifier"
-            )
-        raise OfficialConsumerContractError(
-            "workflow contains a dynamic or divergent MOLECULE_CI_REF assignment"
-        )
-
-    scopes: set[tuple[str, int]] = set()
-    for (index, _), _value in zip(assignments, values, strict=True):
-        scope = _ref_scope(lines, index)
-        if scope is None:
-            raise OfficialConsumerContractError(
-                "workflow MOLECULE_CI_REF assignment is not in an effective env scope"
-            )
-        if scope in scopes:
-            raise OfficialConsumerContractError(
-                "workflow overwrites MOLECULE_CI_REF within one env scope"
-            )
-        scopes.add(scope)
-
-    blocks = _run_blocks(lines)
-    if any(_run_block_reassigns_ref(block) for block in blocks):
-        raise OfficialConsumerContractError(
-            "workflow reassigns MOLECULE_CI_REF inside a run script"
-        )
-
-    proof_blocks = [block for block in blocks if "mcp_pin_lockstep.py" in block.body]
-    if len(proof_blocks) != 1:
-        raise OfficialConsumerContractError(
-            "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
-        )
-    proof = proof_blocks[0]
-    normalized_proof = _normalized(proof.body)
-    applicable_scopes = {
-        ("workflow", 0),
-        ("job", proof.job_index),
-        ("step", proof.step_index),
-    }
-    if (
-        proof.job_index == -1
-        or proof.step_index == -1
-        or not scopes.intersection(applicable_scopes)
-        or any(
-            fragment not in normalized_proof
-            for fragment in _FINAL_IMAGE_FETCH_FRAGMENTS
-        )
-    ):
-        raise OfficialConsumerContractError(
-            "workflow final-image fetch does not use the reviewed MOLECULE_CI_REF"
-        )
-
-
-def _validate_workflow(workflow: str) -> None:
-    _validate_workflow_ref_wiring(workflow)
-    _require_fragments(workflow, _WORKFLOW_FRAGMENTS, "workflow")
-
-
-def _statement_bound_names(statement: ast.stmt) -> set[str]:
-    names: set[str] = set()
-    stack: list[ast.AST] = [statement]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                if alias.name != "*":
-                    names.add(alias.asname or alias.name.split(".", 1)[0])
-            continue
-        if isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names.add(node.id)
-        stack.extend(ast.iter_child_nodes(node))
-    return names
-
-
-def _statement_mutates_test_collection(
-    statement: ast.stmt, required_names: set[str]
-) -> bool:
-    stack: list[ast.AST] = [statement]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.ctx, (ast.Store, ast.Del))
-            and node.attr in {"__test__", "pytestmark"}
-            and isinstance(node.value, ast.Name)
-            and node.value.id in required_names
-        ):
-            return True
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "setattr"
-            and len(node.args) >= 2
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in required_names
-            and _static_string(node.args[1]) in {"__test__", "pytestmark"}
-        ):
-            return True
-        stack.extend(ast.iter_child_nodes(node))
-    return False
-
-
 def _validate_test_contract(consumer: str, test_source: str) -> None:
+    """Check regression-file identity only; workflow semantics are authoritative."""
+
     try:
         module = ast.parse(test_source, filename=str(_TEST_PATH))
     except SyntaxError as exc:
         raise OfficialConsumerContractError(
             "test contract is not valid Python"
         ) from exc
-
     if _test_ref(module) != FINAL_IMAGE_VERIFIER_REF:
         raise OfficialConsumerContractError(
             "test contract does not pin the reviewed molecule-ci verifier"
         )
-
-    required_names = _REQUIRED_TESTS[consumer]
-    definitions = {
-        name: [
+    for name in _REQUIRED_TESTS[consumer]:
+        definitions = [
             node
             for node in module.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == name
         ]
-        for name in required_names
-    }
-    missing_names = [name for name, nodes in definitions.items() if not nodes]
-    if missing_names:
-        raise OfficialConsumerContractError(
-            "test contract is missing a required regression test"
-        )
-
-    if any(
-        len(definitions[name]) != 1
-        or not isinstance(definitions[name][0], ast.FunctionDef)
-        for name in required_names
-    ):
-        raise OfficialConsumerContractError(
-            "required regression test is not guaranteed to execute"
-        )
-    required_functions = [
-        definitions[name][0]
-        for name in required_names
-        if isinstance(definitions[name][0], ast.FunctionDef)
-    ]
-    required_name_set = set(required_names)
-    if any(
-        "pytestmark" in _statement_bound_names(statement)
-        or "__test__" in _statement_bound_names(statement)
-        for statement in module.body
-    ):
-        raise OfficialConsumerContractError(
-            "required regression test is not guaranteed to execute"
-        )
-    for function in required_functions:
-        definition_index = module.body.index(function)
-        if any(
-            function.name in _statement_bound_names(statement)
-            or _statement_mutates_test_collection(statement, required_name_set)
-            for statement in module.body[definition_index + 1 :]
+        if not definitions:
+            raise OfficialConsumerContractError(
+                "test contract is missing a required regression test"
+            )
+        if (
+            len(definitions) != 1
+            or not isinstance(definitions[0], ast.FunctionDef)
+            or definitions[0].decorator_list
         ):
             raise OfficialConsumerContractError(
-                "required regression test is not guaranteed to execute"
+                "required regression test is not a plain synchronous function"
             )
-    if any(function.decorator_list for function in required_functions):
-        raise OfficialConsumerContractError(
-            "required regression test is not guaranteed to execute"
-        )
-
-    functions = {
-        node.name: node
-        for node in module.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    derived_functions = _workflow_returning_functions(functions)
-    if any(
-        not any(isinstance(node, ast.Assert) for node in ast.walk(function))
-        for function in required_functions
-    ):
-        raise OfficialConsumerContractError(
-            "required regression test contains no assertions"
-        )
-
-    evidence = [
-        _function_evidence(function, derived_functions)
-        for function in required_functions
-    ]
-    if any(not item.execution_guaranteed for item in evidence):
-        raise OfficialConsumerContractError(
-            "required regression test is not guaranteed to execute"
-        )
-    if not any(item.saw_workflow_load for item in evidence):
-        raise OfficialConsumerContractError(
-            "required regression test does not statically read the CI workflow"
-        )
-
-    if not any(item.asserted_ref for item in evidence):
-        raise OfficialConsumerContractError(
-            "required regression test does not compare the immutable verifier ref"
-        )
-    if not any(item.asserted_fork for item in evidence):
-        raise OfficialConsumerContractError(
-            "required regression test does not assert the non-fork guard"
-        )
-    if not any(item.asserted_no_volume for item in evidence):
-        raise OfficialConsumerContractError(
-            "required regression test does not reject verifier bind mounts"
-        )
-
-    _require_fragments(
-        " ".join(fragment for item in evidence for fragment in item.asserted_fragments),
-        _TEST_FRAGMENTS,
-        "test",
-    )
 
 
 def validate_contract(
     consumer: str, workflow_payload: bytes, test_payload: bytes
 ) -> None:
-    """Validate one official consumer's workflow and regression test as data."""
+    """Validate one official consumer's workflow and regression marker as data."""
 
     if consumer not in _REQUIRED_TESTS:
         raise OfficialConsumerContractError("unsupported official consumer")
@@ -1097,7 +1481,7 @@ def _read_regular_file(repo_root: Path, relative_path: Path) -> bytes:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="validate static final-image MCP wiring in an official consumer"
+        description="validate semantic final-image MCP wiring in an official consumer"
     )
     parser.add_argument("--consumer", required=True, choices=tuple(_REQUIRED_TESTS))
     parser.add_argument("--repo-root", required=True, type=Path)

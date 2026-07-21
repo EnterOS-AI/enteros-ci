@@ -41,9 +41,13 @@ def test_active_workflows_do_not_call_the_github_cli() -> None:
     for path in sorted(WORKFLOWS.glob("*.yml")):
         for line_number, line in enumerate(path.read_text().splitlines(), 1):
             if github_cli.search(line) or "actions@github.com" in line:
-                violations.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}"
+                )
 
-    assert not violations, "GitHub-only commands remain in active workflows:\n" + "\n".join(violations)
+    assert not violations, (
+        "GitHub-only commands remain in active workflows:\n" + "\n".join(violations)
+    )
 
 
 def test_active_workflows_do_not_expose_workflow_call() -> None:
@@ -55,7 +59,9 @@ def test_active_workflows_do_not_expose_workflow_call() -> None:
         if workflow_call.search(content) or remote_use.search(content):
             violations.append(str(path.relative_to(ROOT)))
 
-    assert not violations, "unsupported reusable workflow surface remains: " + ", ".join(violations)
+    assert not violations, (
+        "unsupported reusable workflow surface remains: " + ", ".join(violations)
+    )
 
 
 def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> None:
@@ -69,12 +75,18 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     selftest_runs = "\n".join(
         step["run"] for step in selftest["steps"] if "run" in step
     )
-    assert "python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci" in selftest_runs
+    assert (
+        "python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci"
+        in selftest_runs
+    )
     assert "grep -qxF 'meta-ci:sentinel:executed'" in selftest_runs
 
     assert "uses" not in archive
-    archive_runs = "\n".join(
-        step["run"] for step in archive["steps"] if "run" in step
+    archive_runs = "\n".join(step["run"] for step in archive["steps"] if "run" in step)
+    assert (
+        "python3 -m pip install --break-system-packages "
+        "--disable-pip-version-check --no-deps --only-binary=:all: PyYAML==6.0.3"
+        in archive_runs
     )
     assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
     assert "strict_json_loads" in archive_runs
@@ -88,17 +100,19 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     assert "tests/test_ci_runtime_image_pin.py" in archive_runs
     assert "max_size=524288" in archive_runs
     assert "max_size=32" in archive_runs
-    assert 'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
+    assert (
+        'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
+    )
     assert "mcp-pin-lockstep:sentinel:executed" in archive_runs
-    assert "scripts/mcp_pin_lockstep.py --repo-root \"$proof_dir\" --json" in archive_runs
+    assert 'scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" --json' in archive_runs
     assert 'runtime_version="$(python3 - "$attestation"' in archive_runs
     assert 'runtime_version" != "$fleet_version' in archive_runs
     assert "official fleet runtime lockstep" in archive_runs
-    assert 'tr -d \'\\r\\n\' < "$proof_dir/.runtime-version"' not in archive_runs
+    assert "tr -d '\\r\\n' < \"$proof_dir/.runtime-version\"" not in archive_runs
     assert archive_runs.index("--json") < archive_runs.index(
         'runtime_version="$(python3 - "$attestation"'
     )
-    assert "git -C \"$fetch_dir\" archive" not in archive_runs
+    assert 'git -C "$fetch_dir" archive' not in archive_runs
     assert 'python3 scripts/meta-ci.py --repo-root "$proof_dir"' not in archive_runs
     archive_gate = next(
         step

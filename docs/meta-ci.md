@@ -175,11 +175,15 @@ workflow key remains `official-consumer-archives`) rejects duplicate JSON fields
 persisted checkout credentials, and fetches each exact commit anonymously. It extracts
 only three bounded regular-file blobs with `git show`: `.runtime-version`,
 `.gitea/workflows/ci.yml`, and `tests/test_ci_runtime_image_pin.py`. The standalone
-artifact checker verifies the runtime pin, while `official_consumer_contract.py` treats
-the workflow and test as inert UTF-8 data and fails closed unless both pin the reviewed
-immutable final-image verifier and retain the anonymous fetch, non-fork, same-image,
-offline, unprivileged, resource-bounded, no-bind-mount contract. It never imports or
-executes consumer repository code. The job also requires all four extracted runtime pins
+artifact checker verifies the runtime pin. The archive job installs the exact, no-deps
+`PyYAML==6.0.3` wheel, and `official_consumer_contract.py` treats both remaining blobs as
+inert UTF-8 data. A duplicate-key-rejecting YAML loader proves the active workflow
+triggers, Docker runner, `t4-conformance` dependency path, exact fork guards, immutable
+ref scope, fail-closed shell mode, and ordered fetch/attest/build/create/copy/start/sentinel
+commands directly. It also rejects error masking, shell ref mutation, verifier bind
+mounts, and image-tag drift. The Python test file is only a bounded regression marker;
+pytest collection or skip behavior is not a trust input. Consumer code is never imported
+or executed. The job also requires all four extracted runtime pins
 to be identical, so four individually valid templates cannot hide fleet drift. Dedicated
 sentinels prove both checkers actually ran.
 
