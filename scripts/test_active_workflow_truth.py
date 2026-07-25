@@ -41,9 +41,13 @@ def test_active_workflows_do_not_call_the_github_cli() -> None:
     for path in sorted(WORKFLOWS.glob("*.yml")):
         for line_number, line in enumerate(path.read_text().splitlines(), 1):
             if github_cli.search(line) or "actions@github.com" in line:
-                violations.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}"
+                )
 
-    assert not violations, "GitHub-only commands remain in active workflows:\n" + "\n".join(violations)
+    assert not violations, (
+        "GitHub-only commands remain in active workflows:\n" + "\n".join(violations)
+    )
 
 
 def test_active_workflows_do_not_expose_workflow_call() -> None:
@@ -55,7 +59,9 @@ def test_active_workflows_do_not_expose_workflow_call() -> None:
         if workflow_call.search(content) or remote_use.search(content):
             violations.append(str(path.relative_to(ROOT)))
 
-    assert not violations, "unsupported reusable workflow surface remains: " + ", ".join(violations)
+    assert not violations, (
+        "unsupported reusable workflow surface remains: " + ", ".join(violations)
+    )
 
 
 def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> None:
@@ -69,27 +75,53 @@ def test_meta_ci_selftest_keeps_local_execution_and_immutable_archive_gate() -> 
     selftest_runs = "\n".join(
         step["run"] for step in selftest["steps"] if "run" in step
     )
-    assert "python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci" in selftest_runs
+    assert (
+        "python3 scripts/meta-ci.py --repo-root scripts/fixtures/meta-ci"
+        in selftest_runs
+    )
     assert "grep -qxF 'meta-ci:sentinel:executed'" in selftest_runs
 
     assert "uses" not in archive
-    archive_runs = "\n".join(
-        step["run"] for step in archive["steps"] if "run" in step
+    archive_runs = "\n".join(step["run"] for step in archive["steps"] if "run" in step)
+    assert (
+        "python3 -m pip install --break-system-packages "
+        "--disable-pip-version-check --no-deps --only-binary=:all: "
+        "--require-hashes -r scripts/requirements-official-consumer-contract.txt"
+        in archive_runs
+    )
+    parser_requirements = (
+        ROOT / "scripts" / "requirements-official-consumer-contract.txt"
+    ).read_text()
+    assert "PyYAML==6.0.3" in parser_requirements
+    assert (
+        "--hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d"
+        in parser_requirements
     )
     assert "scripts/fixtures/meta-ci/official-consumers.json" in archive_runs
     assert "strict_json_loads" in archive_runs
-    assert 'git -C "$fetch_dir" show "$actual:.runtime-version"' in archive_runs
-    assert 'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
+    assert 'git -C "$fetch_dir" ls-tree "$actual" -- "$contract_path"' in archive_runs
+    assert 'git -C "$fetch_dir" cat-file -s "${actual}:$contract_path"' in archive_runs
+    assert 'git -C "$fetch_dir" show "${actual}:$contract_path"' in archive_runs
+    assert ".runtime-version" in archive_runs
+    assert "scripts/official_consumer_contract.py" in archive_runs
+    assert "official-consumer-contract:sentinel:executed" in archive_runs
+    assert ".gitea/workflows/ci.yml" in archive_runs
+    assert "tests/test_ci_runtime_image_pin.py" in archive_runs
+    assert "max_size=524288" in archive_runs
+    assert "max_size=32" in archive_runs
+    assert (
+        'python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir"' in archive_runs
+    )
     assert "mcp-pin-lockstep:sentinel:executed" in archive_runs
-    assert "scripts/mcp_pin_lockstep.py --repo-root \"$proof_dir\" --json" in archive_runs
+    assert 'scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" --json' in archive_runs
     assert 'runtime_version="$(python3 - "$attestation"' in archive_runs
     assert 'runtime_version" != "$fleet_version' in archive_runs
     assert "official fleet runtime lockstep" in archive_runs
-    assert 'tr -d \'\\r\\n\' < "$proof_dir/.runtime-version"' not in archive_runs
+    assert "tr -d '\\r\\n' < \"$proof_dir/.runtime-version\"" not in archive_runs
     assert archive_runs.index("--json") < archive_runs.index(
         'runtime_version="$(python3 - "$attestation"'
     )
-    assert "git -C \"$fetch_dir\" archive" not in archive_runs
+    assert 'git -C "$fetch_dir" archive' not in archive_runs
     assert 'python3 scripts/meta-ci.py --repo-root "$proof_dir"' not in archive_runs
     archive_gate = next(
         step
@@ -154,6 +186,19 @@ def test_meta_ci_archive_gate_never_logs_raw_invalid_consumer_pin(tmp_path) -> N
             """
         )
     )
+    scripts.joinpath("official_consumer_contract.py").write_text(
+        textwrap.dedent(
+            """\
+            import argparse
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--consumer", required=True)
+            parser.add_argument("--repo-root", required=True)
+            args = parser.parse_args()
+            print(f"official-consumer-contract:sentinel:executed {args.consumer}")
+            """
+        )
+    )
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -181,10 +226,17 @@ def test_meta_ci_archive_gate_never_logs_raw_invalid_consumer_pin(tmp_path) -> N
                 directory.joinpath("fetched").write_text(args[-1])
             elif command == "rev-parse":
                 print(directory.joinpath("fetched").read_text())
+            elif command == "ls-tree":
+                print(f"100644 blob {'0' * 40}\\t{args[-1]}")
+            elif command == "cat-file":
+                print("16")
             elif command == "show":
-                consumer = directory.name.removesuffix(".fetch")
-                pin = "0.4.35" if consumer == "claude-code" else "credential=must-not-log"
-                print(pin)
+                if args[-1].endswith(":.runtime-version"):
+                    consumer = directory.name.removesuffix(".fetch")
+                    pin = "0.4.35" if consumer == "claude-code" else "credential=must-not-log"
+                    print(pin)
+                else:
+                    print("static contract placeholder")
             else:
                 raise SystemExit(f"unexpected fake git command: {command}")
             """

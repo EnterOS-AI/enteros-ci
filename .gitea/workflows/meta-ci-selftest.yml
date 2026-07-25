@@ -4,7 +4,8 @@ name: meta-ci-selftest
 # Consumers use the inline templates/ci-meta.yml shape; no workflow_call is
 # exposed or relied upon.
 # The artifact job separately fetches the four official consumers at immutable
-# commits, reads only .runtime-version, and runs this checkout's data-only checker.
+# commits, reads only three bounded static contract files, and runs this checkout's
+# data-only runtime-artifact and final-image-CI checkers.
 
 on:
   pull_request:
@@ -13,6 +14,9 @@ on:
       - "scripts/test_meta_ci.py"
       - "scripts/mcp_pin_lockstep.py"
       - "scripts/test_mcp_pin_lockstep.py"
+      - "scripts/official_consumer_contract.py"
+      - "scripts/test_official_consumer_contract.py"
+      - "scripts/requirements-official-consumer-contract.txt"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -23,6 +27,9 @@ on:
       - "scripts/test_meta_ci.py"
       - "scripts/mcp_pin_lockstep.py"
       - "scripts/test_mcp_pin_lockstep.py"
+      - "scripts/official_consumer_contract.py"
+      - "scripts/test_official_consumer_contract.py"
+      - "scripts/requirements-official-consumer-contract.txt"
       - "schemas/repo-meta.schema.json"
       - ".gitea/workflows/meta-ci-selftest.yml"
       - "scripts/fixtures/meta-ci/**"
@@ -65,6 +72,11 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.11"
+      - name: Install strict YAML parser
+        run: >-
+          python3 -m pip install --break-system-packages
+          --disable-pip-version-check --no-deps --only-binary=:all:
+          --require-hashes -r scripts/requirements-official-consumer-contract.txt
       - name: Validate immutable consumer artifact pins
         env:
           GIT_ASKPASS: /bin/false
@@ -135,10 +147,45 @@ jobs:
               echo "consumer ref mismatch: expected $commit, fetched $actual" >&2
               exit 1
             fi
-            mkdir "$proof_dir"
-            git -C "$fetch_dir" show "$actual:.runtime-version" \
-              > "$proof_dir/.runtime-version"
-            test "$(find "$proof_dir" -type f | wc -l | tr -d ' ')" = 1
+            mkdir -p "$proof_dir/.gitea/workflows" "$proof_dir/tests"
+            for contract_path in \
+              .runtime-version \
+              .gitea/workflows/ci.yml \
+              tests/test_ci_runtime_image_pin.py; do
+              max_size=524288
+              if [ "$contract_path" = .runtime-version ]; then
+                max_size=32
+              fi
+              mode="$(git -C "$fetch_dir" ls-tree "$actual" -- "$contract_path" \
+                | awk 'NR == 1 {print $1}')"
+              case "$mode" in
+                100644|100755) ;;
+                *)
+                  echo "official consumer contract file is missing or non-regular: $name/$contract_path" >&2
+                  exit 1
+                  ;;
+              esac
+              size="$(git -C "$fetch_dir" cat-file -s "${actual}:$contract_path")"
+              case "$size" in
+                ''|*[!0-9]*)
+                  echo "official consumer contract file has an invalid size: $name/$contract_path" >&2
+                  exit 1
+                  ;;
+              esac
+              if [ "$size" -gt "$max_size" ]; then
+                echo "official consumer contract file exceeds its size limit: $name/$contract_path" >&2
+                exit 1
+              fi
+              git -C "$fetch_dir" show "${actual}:$contract_path" \
+                > "$proof_dir/$contract_path"
+            done
+            test "$(find "$proof_dir" -type f | wc -l | tr -d ' ')" = 3
+            contract_log="$root/$name.contract.log"
+            python3 scripts/official_consumer_contract.py \
+              --consumer "$name" --repo-root "$proof_dir" \
+              | tee "$contract_log"
+            grep -qxF "official-consumer-contract:sentinel:executed $name" \
+              "$contract_log"
             attestation="$root/$name.lockstep.json"
             python3 scripts/mcp_pin_lockstep.py --repo-root "$proof_dir" --json \
               > "$attestation"
