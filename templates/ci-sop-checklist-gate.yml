@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MOLECULE_CI_REF: af7d4635b6da680fe681d8de37b1a617dae289b2
+      MOLECULE_CI_REF: 45fbe831b983a4bb48bdeb19499e9eb5e8fef3dd
     steps:
       - name: Check out BASE ref (trust boundary — never PR-head)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -92,7 +92,20 @@ jobs:
       # Infisical credentials on every repo. When Infisical IS configured it is
       # AUTHORITATIVE for this token, so a broken/empty fetch hard-fails here
       # rather than being silently absorbed by the fallback chain below.
-      - name: Fetch SOP_TIER_CHECK_TOKEN from Infisical SSOT
+      #
+      # WHICH SECRET (2026-07-25 fix): this step used to fetch
+      # SOP_TIER_CHECK_TOKEN, which is the sop-TIER-check gate's token and
+      # carries `write:issue` for labelling — NOT `write:repository`. So the
+      # checklist gate's own `POST /repos/{R}/statuses/{sha}` came back
+      #   403 required=[write:repository]
+      # the script raised, and the REQUIRED context went red on every PR in
+      # repos that had no better token in the chain (molecules-market has zero
+      # repo-level Actions secrets, so it fell all the way through to the run's
+      # auto token). SOP_CHECKLIST_GATE_TOKEN is the correctly-scoped
+      # credential and already exists at this exact Infisical path; it is now
+      # also an ORG Actions secret so every consumer resolves it from link 1 of
+      # the chain without pasting a secret into any repo.
+      - name: Fetch SOP_CHECKLIST_GATE_TOKEN from Infisical SSOT
         if: ${{ secrets.INFISICAL_CI_CLIENT_ID != '' }}
         env:
           INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
@@ -105,16 +118,16 @@ jobs:
             -H 'Content-Type: application/json' \
             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["accessToken"])')
-          VALUE=$(curl -fsS "$BASE/api/v3/secrets/raw/SOP_TIER_CHECK_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fgitea-bot-tokens" \
+          VALUE=$(curl -fsS "$BASE/api/v3/secrets/raw/SOP_CHECKLIST_GATE_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fgitea-bot-tokens" \
             -H "Authorization: Bearer $TOK" \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"]["secretValue"])')
           if [ -z "${VALUE}" ]; then
-            echo "Infisical returned empty for SOP_TIER_CHECK_TOKEN -- authoritative fetch failed" >&2
+            echo "Infisical returned empty for SOP_CHECKLIST_GATE_TOKEN -- authoritative fetch failed" >&2
             exit 1
           fi
           echo "::add-mask::$VALUE"
-          echo "SOP_TIER_CHECK_TOKEN=$VALUE" >> "$GITHUB_ENV"
-          echo "SOP_TIER_CHECK_TOKEN loaded from Infisical (non-empty, len=${#VALUE})"
+          echo "INFISICAL_SOP_CHECKLIST_GATE_TOKEN=$VALUE" >> "$GITHUB_ENV"
+          echo "SOP_CHECKLIST_GATE_TOKEN loaded from Infisical (non-empty, len=${#VALUE})"
 
       - name: Run sop-checklist-gate
         env:
@@ -140,7 +153,12 @@ jobs:
           MOLECULE_GITEA_API_HOST: ${{ vars.MOLECULE_GITEA_API_HOST }}
         run: |
           set -uo pipefail
-          GITEA_TOKEN="${SOP_CHECKLIST_GATE_TOKEN:-${SOP_TIER_CHECK_TOKEN:-${SECRET_SOP_TIER_CHECK_TOKEN:-${RFC_324_TEAM_READ_TOKEN:-${REPO_GITEA_TOKEN:-${GH_TOKEN:-}}}}}}"
+          # Precedence, most- to least-correctly-scoped. The first two links
+          # are the only ones that carry `write:repository`; the tail exists so
+          # a repo mid-migration still evaluates acks (the script tolerates a
+          # 403 on the status POST when the gate itself passed) rather than
+          # going red for a credential reason.
+          GITEA_TOKEN="${SOP_CHECKLIST_GATE_TOKEN:-${INFISICAL_SOP_CHECKLIST_GATE_TOKEN:-${SECRET_SOP_TIER_CHECK_TOKEN:-${RFC_324_TEAM_READ_TOKEN:-${REPO_GITEA_TOKEN:-${GH_TOKEN:-}}}}}}"
           export GITEA_TOKEN
           if [ -z "${GITEA_TOKEN}" ]; then
             echo "no usable gate token resolved from any link in the precedence chain" >&2
@@ -157,3 +175,14 @@ jobs:
 
       - name: Assert execution sentinel
         run: grep -qxF 'sop-checklist:sentinel:executed' /tmp/sop-checklist-gate.log
+
+      # The gate picks a CHECKLIST TIER from the paths the diff touches, and a
+      # silent downgrade is how a gate gets quietly hollowed out. So the tier
+      # disclosure is a hard assertion, not a nicety: a run that decided a tier
+      # without printing which one and why does not pass this step. The line
+      # also lands in the job log verbatim, so a reviewer can read the reason
+      # (`reserved path …`, `all N changed file(s) trivial-only`, `fail-closed:
+      # …`) without re-deriving it.
+      - name: Assert checklist-tier disclosure
+        run: |
+          grep -E '^sop-checklist:tier:(full|light):.+' /tmp/sop-checklist-gate.log
