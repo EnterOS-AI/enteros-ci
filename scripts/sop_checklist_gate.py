@@ -390,6 +390,9 @@ def compute_ack_state(
 # Transport-only: method/auth/body/semantics are unchanged.
 CANONICAL_GITEA_USER_AGENT = "curl/8.4.0"
 
+# Proof-of-execution line grepped by templates/ci-sop-checklist-gate.yml.
+SENTINEL = "sop-checklist:sentinel:executed"
+
 
 def resolve_api_base(api_base: str | None, gitea_host: str) -> str:
     """Return the `/api/v1` base URL the gate should call.
@@ -999,6 +1002,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         state = "success"
         description = f"ack advisory until agent-team — {description}"
+
+    # Execution sentinel. The consumer template greps for this exact line.
+    # Cross-repo `workflow_call` is not a valid gate on Gitea 1.26.4 (a caller
+    # can be recorded green with zero referenced steps executed), so the
+    # inline-SSOT templates prove the fetched script really ran instead of
+    # trusting the job's own conclusion. Printed after the full evaluation so
+    # a half-run cannot emit it.
+    print(SENTINEL)
 
     # Diagnostics to job log.
     print(f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} mode={mode}")

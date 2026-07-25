@@ -16,6 +16,14 @@ consumer repository:
 | `molecule-ai-org-template-*` | [`templates/ci-org-template.yml`](templates/ci-org-template.yml) |
 | satellite/channel/misc repositories | [`templates/ci-minimal.yml`](templates/ci-minimal.yml) |
 | repositories needing the canonical diff secret gate | [`templates/ci-secret-scan.yml`](templates/ci-secret-scan.yml) |
+| repositories requiring the SOP-checklist peer-ack gate | [`templates/ci-sop-checklist-gate.yml`](templates/ci-sop-checklist-gate.yml) |
+
+Installing `ci-sop-checklist-gate.yml` means **deleting** the repository's
+vendored `.gitea/scripts/sop-checklist-gate.py`. That script existed as three
+hand-maintained copies which drifted in both directions and produced an
+org-wide gate outage on 2026-07-25; the union now lives once as
+[`scripts/sop_checklist_gate.py`](scripts/sop_checklist_gate.py). Keep the
+per-repo `.gitea/sop-checklist-config.yaml` — that is legitimately per-repo.
 
 The inline templates fetch an immutable, verified `molecule-ci` commit from
 `git.moleculesai.app` and execute the canonical validators from `scripts/`.
