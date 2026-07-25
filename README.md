@@ -25,6 +25,46 @@ org-wide gate outage on 2026-07-25; the union now lives once as
 [`scripts/sop_checklist_gate.py`](scripts/sop_checklist_gate.py). Keep the
 per-repo `.gitea/sop-checklist-config.yaml` — that is legitimately per-repo.
 
+### The checklist is tiered by what the diff touches
+
+The gate used to demand all seven acks — `comprehensive-testing`,
+`local-postgres-e2e`, `staging-smoke`, … — for every PR, including one-line
+config and docs edits. A gate that asks for a staging smoke test on an Upptime
+monitor repoint does not get satisfied; it gets resented and routed around,
+which is worse than no gate. Since 2026-07-25 the item set is proportional:
+
+| tier | when | items required |
+|---|---|---|
+| `light` | **every** changed path matches `tiering.trivial_paths` (docs, `*.md`, `.upptimerc.yml`, images) | `tiering.light_items` — by default `five-axis-review` + `memory-consulted`, both satisfiable by one non-author engineer |
+| `full` | anything else — **and always** if any changed path matches `tiering.reserved_paths` | every item in the repo config |
+
+Reserved is evaluated **before** the trivial allowlist, so a reserved path can
+never be downgraded: not by an over-broad `trivial_paths` entry, not by a
+label, not by a small diff. `reserved_paths` from a repo config are **added
+to** the SSOT defaults, never substituted for them, and
+`.gitea/sop-checklist-config.yaml` is itself reserved so the tiering rules
+cannot be widened by a PR the widened rules would then wave in. An unreadable
+or truncated changed-file list fails closed to `full`.
+
+**Line count is deliberately not an input.** It is gameable by splitting a
+commit, and it is wrong — one line in a migration, a deploy workflow, or the
+auth path is not a trivial change.
+
+The tier is disclosed on the status description (`[tier:light] acked: 2/2 …`),
+in the job log with the deciding path and glob, and as a machine-greppable
+`sop-checklist:tier:<tier>:<reason>` line that the consumer template asserts is
+present — a run that picks a tier without saying so does not pass.
+
+Defaults live in the SSOT script, so a consumer repo gets tiering with **no
+config change**. `tiering:` in `.gitea/sop-checklist-config.yaml` only tunes it.
+
+The gate's credential is `SOP_CHECKLIST_GATE_TOKEN` (Infisical prod
+`/shared/gitea-bot-tokens`, mirrored as an **org** Actions secret so no repo
+needs a pasted copy). It needs `write:repository` for the status POST.
+`SOP_TIER_CHECK_TOKEN` belongs to the separate sop-tier-check gate, carries
+`write:issue` and **not** `write:repository`, and is not interchangeable —
+using it is what took the required context red across two repos on 2026-07-25.
+
 The inline templates fetch an immutable, verified `molecule-ci` commit from
 `git.moleculesai.app` and execute the canonical validators from `scripts/`.
 Validator logic remains centralized without a cross-repository action fetch,

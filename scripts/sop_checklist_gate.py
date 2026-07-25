@@ -34,17 +34,62 @@
 #   1. Load .gitea/sop-checklist-config.yaml (from BASE ref — trusted).
 #   2. GET /repos/{R}/pulls/{N}          — author, head.sha, tier label
 #   3. GET /repos/{R}/issues/{N}/comments — extract /sop-ack and /sop-revoke
-#   4. For each checklist item:
+#   3b. GET /repos/{R}/pulls/{N}/files    — classify the CHECKLIST TIER from
+#       the paths the diff actually touches (see "Checklist tiering" below).
+#   4. For each checklist item IN THE APPLIED TIER:
 #        a. Is the section marker present in PR body? (author answered)
 #        b. Is there ≥1 unrevoked /sop-ack from a non-author whose
 #           team-membership matches required_teams?
 #   5. POST /repos/{R}/statuses/{sha}    — context
 #      `sop-checklist / all-items-acked (pull_request)`,
-#      state=success | failure | pending, description=`acked: N/M …`.
+#      state=success | failure | pending, description=
+#      `[tier:full] acked: N/M …`.
 #      OPERATOR RELAX: while the org Actions var MERGE_REQUIRE_SOP_ACK
 #      != 'true', a would-be failure/pending is posted as SUCCESS with
 #      description `ack advisory until agent-team — <tally>` (full
 #      evaluation still runs; see the relax block in main()).
+#
+# ===========================================================================
+# Checklist tiering (operator decision, 2026-07-25) — PROPORTIONAL, NOT BINARY
+# ===========================================================================
+# The gate demanded all seven acks (comprehensive-testing, local-postgres-e2e,
+# staging-smoke, …) for every PR including one-line config and docs edits. A
+# gate that asks for a staging smoke test on an Upptime monitor repoint does
+# not get satisfied — it gets resented and routed around, which is strictly
+# worse than no gate. Six PRs sat blocked with zero checklists filled.
+#
+# So the item set is now chosen by WHAT THE DIFF TOUCHES:
+#
+#   tier `full`  — every item in the repo's config. The default.
+#   tier `light` — only `tiering.light_items` (default: five-axis-review +
+#                  memory-consulted): one non-author peer, still a real ack,
+#                  proportional to a docs/monitor/asset-only change.
+#
+# DECISION ORDER (classify_tier) — reserved ALWAYS wins:
+#   1. changed-path list empty, unreadable, or truncated  -> full  (fail-closed)
+#   2. ANY changed path matches a RESERVED glob           -> full
+#   3. ALL changed paths match a TRIVIAL glob             -> light
+#   4. otherwise                                          -> full
+#
+# Step 2 runs before step 3, so a reserved path can NEVER be downgraded — not
+# by adding an over-broad trivial glob, not by a label, not by a small diff.
+# `.gitea/sop-checklist-config.yaml` is itself reserved, so the tiering config
+# cannot be weakened under the light tier it would create.
+#
+# LINE COUNT IS DELIBERATELY NOT AN INPUT. It is gameable (split the commit)
+# and it is wrong: a one-line edit to a migration, a deploy workflow, or the
+# auth path is not a trivial change. Only paths decide.
+#
+# VISIBILITY: a silent downgrade is how a gate gets quietly hollowed out, so
+# the tier is surfaced three ways — the `[tier:<t>]` prefix on the posted
+# status description, a machine-greppable `sop-checklist:tier:<tier>:<reason>`
+# line the consumer template ASSERTS is present, and a per-item `[n/a]` line in
+# the job log for every item the tier skipped.
+#
+# NOTE — two unrelated things are both called "tier":
+#   * `tiering:`           (HERE) diff-derived; picks WHICH items apply.
+#   * `tier_failure_mode:` label-derived (tier:low/medium/high); picks HOW
+#                          HARD a missing ack fails. Untouched by this block.
 #
 # Transport: all API calls send CANONICAL_GITEA_USER_AGENT and target
 # `--api-base` (org var MOLECULE_GITEA_API_HOST), which is deliberately
@@ -264,6 +309,226 @@ def section_marker_present(body: str, marker: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Checklist tiering — decided by the paths the diff touches
+# ---------------------------------------------------------------------------
+#
+# Globs use PATH semantics, not fnmatch's: `*` and `?` never cross a `/`, and
+# `**` matches zero or more whole segments. fnmatch would let `*.md` match
+# `deploy/rollout.md` — permissive in exactly the direction that must never be
+# permissive — so we translate to an anchored regex ourselves.
+
+TIER_FULL = "full"
+TIER_LIGHT = "light"
+
+# Touching ANY of these forces the FULL checklist, always. Evaluated before the
+# trivial allowlist, so nothing here is downgradable.
+DEFAULT_RESERVED_PATHS = (
+    # CI / gate definitions — including this gate's own config, so the tiering
+    # rules can't be widened by a PR that the widened rules would then wave in.
+    ".gitea/workflows/**",
+    ".gitea/scripts/**",
+    ".gitea/actions/**",
+    ".gitea/sop-checklist-config.yaml",
+    ".gitea/REPO.yaml",
+    ".github/workflows/**",
+    # Schema / data migrations.
+    "**/migrations/**",
+    "**/migration/**",
+    # Deploy path.
+    "Dockerfile",
+    "**/Dockerfile",
+    "**/Dockerfile.*",
+    "**/docker-compose*.yml",
+    "**/docker-compose*.yaml",
+    "deploy/**",
+    "**/deploy/**",
+    "**/k8s/**",
+    "**/charts/**",
+    "**/*.tf",
+    "scripts/deploy*",
+    "**/*deploy*.sh",
+    # Money, identity, and tenant provisioning.
+    "**/auth/**",
+    "**/billing/**",
+    "**/payments/**",
+    "**/provisioner/**",
+    "**/provisioning/**",
+)
+
+# A PR gets the LIGHT tier only when EVERY changed path matches one of these.
+DEFAULT_TRIVIAL_PATHS = (
+    "**/*.md",
+    "**/*.mdx",
+    "docs/**",
+    "**/*.txt",
+    "LICENSE",
+    "**/LICENSE",
+    ".upptimerc.yml",
+    "**/*.png",
+    "**/*.jpg",
+    "**/*.jpeg",
+    "**/*.gif",
+    "**/*.svg",
+    "**/*.ico",
+    "**/*.webp",
+)
+
+# Items still required under the light tier. Both resolve to the `engineers`
+# team in the shipped configs, so one non-author reviewer can satisfy the whole
+# light checklist in a single pass — proportional, but still a real peer ack.
+DEFAULT_LIGHT_ITEMS = ("five-axis-review", "memory-consulted")
+
+# Hard cap on the changed-file list we will read. Above it we cannot prove no
+# reserved path was touched, so we fail closed to `full` (see classify_tier).
+DEFAULT_MAX_CHANGED_FILES = 300
+
+
+def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
+    """Translate a path glob to an anchored regex with true path semantics."""
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if pattern.startswith("**/", i):
+                # zero or more leading segments
+                out.append(r"(?:[^/]+/)*")
+                i += 3
+                continue
+            if pattern.startswith("**", i):
+                out.append(r".*")
+                i += 2
+                continue
+            out.append(r"[^/]*")
+            i += 1
+            continue
+        if c == "?":
+            out.append(r"[^/]")
+            i += 1
+            continue
+        out.append(re.escape(c))
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+_GLOB_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def path_matches(path: str, pattern: str) -> bool:
+    """True if `path` (repo-relative, forward slashes) matches the glob."""
+    p = (path or "").strip().replace("\\", "/")
+    # Strip a leading "./" — but NOT with lstrip("./"), which strips CHARACTERS
+    # and would turn ".gitea/workflows/ci.yml" into "gitea/workflows/ci.yml",
+    # silently un-reserving every dotfile directory in the reserved list.
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    if not p:
+        return False
+    rx = _GLOB_CACHE.get(pattern)
+    if rx is None:
+        rx = _glob_to_regex(pattern)
+        _GLOB_CACHE[pattern] = rx
+    return bool(rx.match(p))
+
+
+def first_match(path: str, patterns: "list[str] | tuple[str, ...]") -> str | None:
+    """Return the first glob in `patterns` that matches `path`, else None."""
+    for pat in patterns:
+        if path_matches(path, pat):
+            return pat
+    return None
+
+
+def classify_tier(
+    changed_paths: list[str] | None,
+    reserved_globs: "list[str] | tuple[str, ...]",
+    trivial_globs: "list[str] | tuple[str, ...]",
+    truncated: bool = False,
+) -> tuple[str, str]:
+    """PURE. Decide the checklist tier from the paths the diff touches.
+
+    Returns (tier, reason) where tier is TIER_FULL or TIER_LIGHT and reason is
+    a short human string that goes into the job log and the status description.
+
+    The ordering below is the whole safety property, so it is spelled out
+    rather than collapsed into a comprehension:
+
+      1. no readable file list, or a truncated one -> full  (FAIL-CLOSED: we
+         cannot prove a reserved path was not touched)
+      2. any reserved match                        -> full  (NOT downgradable)
+      3. every path trivial                        -> light
+      4. anything else                             -> full
+    """
+    if truncated:
+        return TIER_FULL, "fail-closed: changed-file list truncated"
+    if not changed_paths:
+        return TIER_FULL, "fail-closed: no changed-file list available"
+
+    # (2) Reserved wins over everything, and is checked FIRST so that no
+    # trivial glob — however over-broad — can ever downgrade a reserved path.
+    for path in changed_paths:
+        hit = first_match(path, reserved_globs)
+        if hit is not None:
+            return TIER_FULL, f"reserved path {path} (~ {hit})"
+
+    # (3) Light only when EVERY path is trivial.
+    for path in changed_paths:
+        if first_match(path, trivial_globs) is None:
+            return TIER_FULL, f"non-trivial path {path}"
+
+    return TIER_LIGHT, f"all {len(changed_paths)} changed file(s) trivial-only"
+
+
+def load_tiering(cfg: dict[str, Any]) -> tuple[list[str], list[str], list[str], int]:
+    """Read the optional `tiering:` block, falling back to the SSOT defaults.
+
+    A repo may only ADD reserved paths — a config that omits `reserved_paths`
+    inherits the defaults, and one that supplies them gets the union with the
+    defaults. Narrowing the reserved set from a consumer repo is not a thing we
+    let a consumer repo do.
+    """
+    t = cfg.get("tiering") or {}
+    if not isinstance(t, dict):
+        t = {}
+    reserved = list(DEFAULT_RESERVED_PATHS) + [
+        str(x) for x in (t.get("reserved_paths") or []) if str(x).strip()
+    ]
+    trivial = [str(x) for x in (t.get("trivial_paths") or []) if str(x).strip()] or list(
+        DEFAULT_TRIVIAL_PATHS
+    )
+    light = [str(x) for x in (t.get("light_items") or []) if str(x).strip()] or list(
+        DEFAULT_LIGHT_ITEMS
+    )
+    try:
+        max_files = int(t.get("max_changed_files") or DEFAULT_MAX_CHANGED_FILES)
+    except (TypeError, ValueError):
+        max_files = DEFAULT_MAX_CHANGED_FILES
+    return reserved, trivial, light, max_files
+
+
+def select_items(
+    items: list[dict[str, Any]], tier: str, light_slugs: "list[str] | tuple[str, ...]"
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Split the configured items into (applied, skipped) for `tier`.
+
+    Returns (applied, skipped, effective_tier). If the light tier would apply
+    ZERO items — a config whose slugs don't intersect `light_slugs` — we fall
+    back to the FULL tier rather than shipping a checklist gate that checks
+    nothing. A gate that passes vacuously is worse than a heavy one.
+    """
+    if tier != TIER_LIGHT:
+        return list(items), [], TIER_FULL
+    wanted = set(light_slugs)
+    applied = [it for it in items if it["slug"] in wanted]
+    if not applied:
+        return list(items), [], TIER_FULL
+    skipped = [it for it in items if it["slug"] not in wanted]
+    return applied, skipped, TIER_LIGHT
+
+
+# ---------------------------------------------------------------------------
 # Ack-state computation
 # ---------------------------------------------------------------------------
 
@@ -393,6 +658,11 @@ CANONICAL_GITEA_USER_AGENT = "curl/8.4.0"
 # Proof-of-execution line grepped by templates/ci-sop-checklist-gate.yml.
 SENTINEL = "sop-checklist:sentinel:executed"
 
+# Machine-greppable tier disclosure, also asserted by the consumer template so
+# that a run which somehow decided a tier without SAYING so cannot pass. Shape:
+#   sop-checklist:tier:light:all 3 changed file(s) trivial-only
+TIER_SENTINEL_PREFIX = "sop-checklist:tier:"
+
 
 def resolve_api_base(api_base: str | None, gitea_host: str) -> str:
     """Return the `/api/v1` base URL the gate should call.
@@ -516,6 +786,48 @@ class GiteaClient:
                 break
         return out
 
+    def get_pr_files(
+        self, owner: str, repo: str, pr: int, max_files: int, page_size: int = 100
+    ) -> tuple[list[str], bool]:
+        """Return (changed_paths, truncated) for the PR.
+
+        `truncated` is True when the diff has more files than `max_files`, or
+        when the API refuses to answer. Both mean the same thing to the tier
+        classifier: we cannot prove a reserved path is absent, so fail closed.
+        Renames are reported by Gitea with the NEW path in `filename` and the
+        old one in `previous_filename`; both are returned, because moving a
+        file OUT of a reserved directory is itself a reserved-path change.
+        """
+        paths: list[str] = []
+        page = 1
+        while True:
+            code, data = self._req(
+                "GET",
+                f"/repos/{owner}/{repo}/pulls/{pr}/files?limit={page_size}&page={page}",
+            )
+            if code != 200:
+                print(
+                    f"::warning::GET pulls/{pr}/files page={page} → HTTP {code}; "
+                    "tier fails closed to full",
+                    file=sys.stderr,
+                )
+                return [], True
+            if not data:
+                break
+            for f in data:
+                if not isinstance(f, dict):
+                    continue
+                for key in ("filename", "previous_filename"):
+                    val = (f.get(key) or "").strip()
+                    if val:
+                        paths.append(val)
+            if len(paths) > max_files:
+                return paths[:max_files], True
+            if len(data) < page_size:
+                break
+            page += 1
+        return paths, False
+
     def resolve_team_id(self, org: str, team_name: str) -> int | None:
         key = (org, team_name)
         if key in self._team_id_cache:
@@ -571,8 +883,20 @@ class GiteaClient:
             ok_codes=(201,),
         )
         if code not in (200, 201):
+            hint = ""
+            if code == 403 and "write:repository" in str(data):
+                # This exact 403 kept the REQUIRED context off six PRs for a
+                # day; make the next person's diagnosis a one-liner instead of
+                # a log dig. Name the credential AND where it lives.
+                hint = (
+                    " — the resolved token lacks write:repository. The gate's "
+                    "credential is SOP_CHECKLIST_GATE_TOKEN (Infisical prod "
+                    "/shared/gitea-bot-tokens, mirrored as an ORG Actions "
+                    "secret); SOP_TIER_CHECK_TOKEN is the sop-tier-check "
+                    "gate's token and is NOT interchangeable."
+                )
             raise RuntimeError(
-                f"POST statuses/{sha} → HTTP {code}: {data!r}"
+                f"POST statuses/{sha} → HTTP {code}: {data!r}{hint}"
             )
 
 
@@ -863,10 +1187,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cfg = load_config(args.config)
-    items: list[dict[str, Any]] = cfg["items"]
-    items_by_slug = {it["slug"]: it for it in items}
+    all_items: list[dict[str, Any]] = cfg["items"]
+    reserved_globs, trivial_globs, light_slugs, max_changed_files = load_tiering(cfg)
+    # Numeric aliases are resolved against the FULL item set: a reviewer typing
+    # `/sop-ack 3` on a light-tier PR should get "that item does not apply
+    # here", never a silent mis-resolution to a different item.
     numeric_aliases = {
-        int(it["numeric_alias"]): it["slug"] for it in items if it.get("numeric_alias")
+        int(it["numeric_alias"]): it["slug"]
+        for it in all_items
+        if it.get("numeric_alias")
     }
 
     client = (
@@ -890,6 +1219,23 @@ def main(argv: list[str] | None = None) -> int:
     if not author or not head_sha:
         print("::error::PR payload missing user.login or head.sha", file=sys.stderr)
         return 1
+
+    # --- CHECKLIST TIER: decided by the paths this diff touches -------------
+    changed_paths, truncated = client.get_pr_files(
+        args.owner, args.repo, args.pr, max_changed_files
+    )
+    tier, tier_reason = classify_tier(
+        changed_paths, reserved_globs, trivial_globs, truncated=truncated
+    )
+    items, skipped_items, effective_tier = select_items(all_items, tier, light_slugs)
+    if effective_tier != tier:
+        # select_items only ever escalates light -> full (empty light item set).
+        tier_reason = (
+            f"{tier_reason}; escalated to full — config has no item matching "
+            f"light_items {sorted(light_slugs)}"
+        )
+        tier = effective_tier
+    items_by_slug = {it["slug"]: it for it in items}
 
     max_comments_cap = args.max_comments if args.max_comments and args.max_comments > 0 else None
     comments = client.get_issue_comments(
@@ -964,6 +1310,9 @@ def main(argv: list[str] | None = None) -> int:
     body_state = {it["slug"]: section_marker_present(body, it["pr_section_marker"]) for it in items}
 
     state, description = render_status(items, ack_state, body_state)
+    # Tier disclosure rides on the description so it is visible on the PR
+    # status row itself, not only to whoever opens the job log.
+    description = f"[tier:{tier}] {description}"
     mode = get_tier_mode(pr, cfg)
     if state == "failure" and mode == "soft":
         state = "pending"
@@ -1011,8 +1360,19 @@ def main(argv: list[str] | None = None) -> int:
     # a half-run cannot emit it.
     print(SENTINEL)
 
+    # Tier disclosure. Printed unconditionally and asserted by the consumer
+    # template: a run that decided a tier without disclosing it must not pass.
+    print(f"{TIER_SENTINEL_PREFIX}{tier}:{tier_reason}")
+
     # Diagnostics to job log.
     print(f"::notice::PR #{args.pr} author={author} head={head_sha[:7]} mode={mode}")
+    print(
+        f"::notice::checklist tier={tier} ({tier_reason}) — "
+        f"{len(changed_paths)} changed path(s), "
+        f"{len(items)}/{len(all_items)} item(s) required"
+    )
+    for it in skipped_items:
+        print(f"::notice::  [n/a] {it['slug']} — not required at tier:{tier}")
     for it in items:
         slug = it["slug"]
         ackers = ack_state[slug]["ackers"]
