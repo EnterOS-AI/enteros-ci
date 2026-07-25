@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      MOLECULE_CI_REF: 9a2fd33e4ece9e54a3e1364c74daa59336ed151b
+      MOLECULE_CI_REF: af7d4635b6da680fe681d8de37b1a617dae289b2
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
       # Fetch the canonical validator from the public molecule-ci SSOT. A

@@ -12,8 +12,9 @@ WORKSPACE_TEMPLATE = REPO_ROOT / "templates" / "ci-workspace-template.yml"
 MINIMAL_TEMPLATE = REPO_ROOT / "templates" / "ci-minimal.yml"
 DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
 CONFORMANCE_TEMPLATE = REPO_ROOT / "templates" / "ci-conformance-gate.yml"
+SOP_GATE_TEMPLATE = REPO_ROOT / "templates" / "ci-sop-checklist-gate.yml"
 PINNED_MOLECULE_CI_REF = (
-    "9a2fd33e4ece9e54a3e" + "1364c74daa59336ed151b"
+    "af7d4635b6da680fe681d" + "8de37b1a617dae289b2"
 )
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SCRIPT_FETCH_TEMPLATES = tuple(
@@ -88,6 +89,7 @@ def test_inline_ssot_templates_pin_and_verify_an_immutable_ref(path: Path) -> No
 def test_inline_ssot_templates_assert_execution_sentinels() -> None:
     assert "minimal-validate:sentinel:executed" in MINIMAL_TEMPLATE.read_text()
     assert "secret-scan:sentinel:executed" in DIFF_SECRET_TEMPLATE.read_text()
+    assert "sop-checklist:sentinel:executed" in SOP_GATE_TEMPLATE.read_text()
 
 
 @pytest.mark.parametrize("path", SCRIPT_FETCH_TEMPLATES)
