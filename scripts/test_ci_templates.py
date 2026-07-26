@@ -92,6 +92,133 @@ def test_inline_ssot_templates_assert_execution_sentinels() -> None:
     assert "sop-checklist:sentinel:executed" in SOP_GATE_TEMPLATE.read_text()
 
 
+def test_minimal_template_has_a_credential_free_hash_locked_bootstrap() -> None:
+    workflow = yaml.safe_load(MINIMAL_TEMPLATE.read_text())
+    steps = workflow["jobs"]["minimal-validate"]["steps"]
+    checkout = next(step for step in steps if str(step.get("uses", "")).startswith(
+        "actions/checkout@"
+    ))
+    setup_python = next(
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    )
+    commands = "\n".join(_all_run_steps(MINIMAL_TEMPLATE))
+
+    assert checkout["uses"] == (
+        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    )
+    assert checkout["with"] == {"persist-credentials": False}
+    assert setup_python["uses"] == (
+        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
+    )
+    assert setup_python["with"] == {"python-version": "3.11.15"}
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in commands
+    assert "GIT_CONFIG_NOSYSTEM=1" in commands
+    assert "GIT_TERMINAL_PROMPT=0" in commands
+    assert "GIT_ASKPASS=/bin/false" in commands
+    assert "http.userAgent=curl/8.4.0" in commands
+    assert "PyYAML==6.0.3" in commands
+    assert (
+        "--hash=sha256:"
+        "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d"
+        in commands
+    )
+    assert "--require-hashes" in commands
+    assert "--only-binary=:all:" in commands
+    assert "pip install --break-system-packages pyyaml -q" not in commands
+
+
+def test_sop_template_contains_secrets_to_one_hardened_gate_step() -> None:
+    workflow = yaml.safe_load(SOP_GATE_TEMPLATE.read_text())
+    steps = workflow["jobs"]["gate"]["steps"]
+    checkout = next(
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    setup_python = next(
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    )
+    commands = "\n".join(_all_run_steps(SOP_GATE_TEMPLATE))
+
+    assert checkout["uses"] == (
+        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    )
+    assert checkout["with"] == {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "persist-credentials": False,
+    }
+    assert setup_python["uses"] == (
+        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
+    )
+    assert setup_python["with"] == {"python-version": "3.11.15"}
+    for required in (
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_ASKPASS=/bin/false",
+        "http.userAgent=curl/8.4.0",
+        "PyYAML==6.0.3",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--data-binary @-",
+        "-H @-",
+        "-A curl/8.4.0",
+        "--connect-timeout",
+        "--max-time",
+        "--proto '=https'",
+        'GITEA_TOKEN="$resolved_token"',
+        "python3 -I",
+    ):
+        assert required in commands
+    for forbidden in (
+        'clientSecret\\":\\"$INFISICAL_CI_CLIENT_SECRET',
+        '-H "Authorization: Bearer $TOK"',
+        "::add-mask::",
+        "GITHUB_ENV",
+        "len=${#VALUE}",
+        "pip install --break-system-packages pyyaml -q",
+        "export GITEA_TOKEN",
+    ):
+        assert forbidden not in commands
+
+    secret_steps = [
+        step
+        for step in steps
+        if any(
+            name in step.get("env", {})
+            for name in (
+                "INFISICAL_CI_CLIENT_SECRET",
+                "SOP_CHECKLIST_GATE_TOKEN",
+                "SOP_TIER_CHECK_TOKEN",
+                "RFC_324_TEAM_READ_TOKEN",
+                "GITEA_TOKEN",
+                "GITHUB_TOKEN",
+            )
+        )
+    ]
+    assert len(secret_steps) == 1
+    assert "Run sop-checklist-gate" in secret_steps[0]["name"]
+    gate_run = secret_steps[0]["run"]
+    assert (
+        gate_run.index(
+            "unset INFISICAL_CI_CLIENT_ID INFISICAL_CI_CLIENT_SECRET"
+        )
+        < gate_run.index("TOK=$(")
+        < gate_run.index('GITEA_TOKEN="$resolved_token"')
+    )
+    assert gate_run.count('GITEA_TOKEN="$resolved_token"') == 1
+    assert not {
+        "SECRET_SOP_TIER_CHECK_TOKEN",
+        "RFC_324_TEAM_READ_TOKEN",
+        "REPO_GITEA_TOKEN",
+        "GH_TOKEN",
+    } & set(secret_steps[0]["env"])
+
+
 @pytest.mark.parametrize("path", SCRIPT_FETCH_TEMPLATES)
 def test_script_templates_fetch_outside_the_consumer_checkout(path: Path) -> None:
     commands = "\n".join(_all_run_steps(path))
