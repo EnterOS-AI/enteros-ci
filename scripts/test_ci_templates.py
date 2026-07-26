@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,113 @@ def test_minimal_template_has_a_credential_free_hash_locked_bootstrap() -> None:
     assert "--require-hashes" in commands
     assert "--only-binary=:all:" in commands
     assert "pip install --break-system-packages pyyaml -q" not in commands
+
+
+@pytest.mark.parametrize(
+    ("path", "job_name"),
+    (
+        (MINIMAL_TEMPLATE, "minimal-validate"),
+        (SOP_GATE_TEMPLATE, "gate"),
+    ),
+)
+def test_hash_locked_bootstrap_keeps_setup_python_runtime_linkable(
+    path: Path,
+    job_name: str,
+) -> None:
+    """A cold setup-python install must survive the otherwise empty env."""
+    workflow = yaml.safe_load(path.read_text())
+    install_step = next(
+        step
+        for step in workflow["jobs"][job_name]["steps"]
+        if str(step.get("name", "")).startswith("Install exact hash-locked")
+    )
+    command = install_step["run"]
+
+    assert (
+        'PYTHON_ROOT="${pythonLocation:?setup-python did not export pythonLocation}"'
+    ) in command
+    assert 'test -x "$PYTHON_ROOT/bin/python3"' in command
+    assert 'test -d "$PYTHON_ROOT/lib"' in command
+    isolated = command.split("env -i", 1)[1]
+    assert 'PATH="$PYTHON_ROOT/bin:/usr/bin:/bin"' in isolated
+    assert 'LD_LIBRARY_PATH="$PYTHON_ROOT/lib"' in isolated
+    assert '"$PYTHON_ROOT/bin/python3" -m pip install' in isolated
+    assert "\n            python3 -m pip install" not in isolated
+
+
+@pytest.mark.parametrize(
+    ("path", "job_name"),
+    (
+        (MINIMAL_TEMPLATE, "minimal-validate"),
+        (SOP_GATE_TEMPLATE, "gate"),
+    ),
+)
+def test_hash_locked_bootstrap_runs_in_a_cold_scrubbed_runtime(
+    path: Path,
+    job_name: str,
+    tmp_path: Path,
+) -> None:
+    """Execute the shipped block against a probe that needs its private lib."""
+    workflow = yaml.safe_load(path.read_text())
+    command = next(
+        step["run"]
+        for step in workflow["jobs"][job_name]["steps"]
+        if str(step.get("name", "")).startswith("Install exact hash-locked")
+    )
+    tool_cache = tmp_path / "tool-cache"
+    python_root = tool_cache / "Python" / "3.11.15" / "x64"
+    python_bin = python_root / "bin"
+    python_lib = python_root / "lib"
+    runner_temp = tmp_path / "runner-temp"
+    probe = tmp_path / "probe"
+    python_bin.mkdir(parents=True)
+    python_lib.mkdir()
+    runner_temp.mkdir()
+
+    expected_path = f"{python_bin}:/usr/bin:/bin"
+    fake_python = python_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        f'test "${{LD_LIBRARY_PATH:-}}" = {shlex.quote(str(python_lib))}\n'
+        f'test "$PATH" = {shlex.quote(expected_path)}\n'
+        f'test "$HOME" = {shlex.quote(str(runner_temp))}\n'
+        'test -z "${UNTRUSTED_MARKER+x}"\n'
+        f"printf '%s\\n' \"$@\" > {shlex.quote(str(probe))}\n"
+    )
+    fake_python.chmod(0o755)
+
+    result = subprocess.run(
+        ["/bin/bash", "-euo", "pipefail", "-c", command],
+        env={
+            "HOME": str(tmp_path / "untrusted-home"),
+            "PATH": "/untrusted/bin:/usr/bin:/bin",
+            "RUNNER_TEMP": str(runner_temp),
+            "RUNNER_TOOL_CACHE": str(tool_cache),
+            "UNTRUSTED_MARKER": "must-not-cross-env-i",
+            "pythonLocation": str(python_root),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert probe.read_text().splitlines() == [
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--break-system-packages",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "-r",
+        str(
+            runner_temp
+            / f"molecule-ci-{'minimal' if path == MINIMAL_TEMPLATE else 'sop'}.lock"
+        ),
+    ]
 
 
 def test_sop_template_contains_secrets_to_one_hardened_gate_step() -> None:
