@@ -17,21 +17,58 @@ jobs:
       MOLECULE_CI_REF: 45fbe831b983a4bb48bdeb19499e9eb5e8fef3dd
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.11"
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11.15"
       - name: Fetch immutable molecule-ci validator
         run: |
+          set -euo pipefail
           test -n "${RUNNER_TEMP:-}"
           CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
-          mkdir "$CI_ROOT"
-          git init -q "$CI_ROOT"
-          git -C "$CI_ROOT" remote add origin \
+          GIT_HOME="$RUNNER_TEMP/molecule-ci-git-home"
+          mkdir "$CI_ROOT" "$GIT_HOME"
+          chmod 700 "$CI_ROOT" "$GIT_HOME"
+          safe_git() {
+            env -i \
+              PATH="$PATH" \
+              HOME="$GIT_HOME" \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_TERMINAL_PROMPT=0 \
+              GIT_ASKPASS=/bin/false \
+              GIT_ALLOW_PROTOCOL=https \
+              git -c http.userAgent=curl/8.4.0 "$@"
+          }
+          safe_git init -q "$CI_ROOT"
+          safe_git -C "$CI_ROOT" remote add origin \
             https://git.moleculesai.app/molecule-ai/molecule-ci.git
-          git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF"
-          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
-          test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
-      - run: pip install --break-system-packages pyyaml -q
+          safe_git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          safe_git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          test "$(safe_git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
+      - name: Install exact hash-locked validator dependency
+        run: |
+          set -euo pipefail
+          test -n "${RUNNER_TEMP:-}"
+          lock="$RUNNER_TEMP/molecule-ci-minimal.lock"
+          printf '%s\n' \
+            'PyYAML==6.0.3 --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d' \
+            > "$lock"
+          env -i \
+            PATH="$PATH" \
+            HOME="$RUNNER_TEMP" \
+            PIP_CONFIG_FILE=/dev/null \
+            PIP_INDEX_URL=https://pypi.org/simple/ \
+            PIP_NO_INPUT=1 \
+            PYTHONNOUSERSITE=1 \
+            python3 -m pip install \
+              --disable-pip-version-check \
+              --break-system-packages \
+              --no-deps \
+              --only-binary=:all: \
+              --require-hashes \
+              -r "$lock"
       - name: Execute canonical baseline validator
         run: |
           set -o pipefail

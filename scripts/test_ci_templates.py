@@ -92,6 +92,43 @@ def test_inline_ssot_templates_assert_execution_sentinels() -> None:
     assert "sop-checklist:sentinel:executed" in SOP_GATE_TEMPLATE.read_text()
 
 
+def test_minimal_template_has_a_credential_free_hash_locked_bootstrap() -> None:
+    workflow = yaml.safe_load(MINIMAL_TEMPLATE.read_text())
+    steps = workflow["jobs"]["minimal-validate"]["steps"]
+    checkout = next(step for step in steps if str(step.get("uses", "")).startswith(
+        "actions/checkout@"
+    ))
+    setup_python = next(
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+    )
+    commands = "\n".join(_all_run_steps(MINIMAL_TEMPLATE))
+
+    assert checkout["uses"] == (
+        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    )
+    assert checkout["with"] == {"persist-credentials": False}
+    assert setup_python["uses"] == (
+        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
+    )
+    assert setup_python["with"] == {"python-version": "3.11.15"}
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in commands
+    assert "GIT_CONFIG_NOSYSTEM=1" in commands
+    assert "GIT_TERMINAL_PROMPT=0" in commands
+    assert "GIT_ASKPASS=/bin/false" in commands
+    assert "http.userAgent=curl/8.4.0" in commands
+    assert "PyYAML==6.0.3" in commands
+    assert (
+        "--hash=sha256:"
+        "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d"
+        in commands
+    )
+    assert "--require-hashes" in commands
+    assert "--only-binary=:all:" in commands
+    assert "pip install --break-system-packages pyyaml -q" not in commands
+
+
 @pytest.mark.parametrize("path", SCRIPT_FETCH_TEMPLATES)
 def test_script_templates_fetch_outside_the_consumer_checkout(path: Path) -> None:
     commands = "\n".join(_all_run_steps(path))
