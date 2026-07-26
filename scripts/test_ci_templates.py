@@ -151,15 +151,18 @@ def test_hash_locked_bootstrap_keeps_setup_python_runtime_linkable(
     )
     command = install_step["run"]
 
-    assert (
-        'PYTHON_ROOT="${pythonLocation:?setup-python did not export pythonLocation}"'
-    ) in command
-    assert 'test -x "$PYTHON_ROOT/bin/python3"' in command
-    assert 'test -d "$PYTHON_ROOT/lib"' in command
+    assert command.count("CDPATH='' cd -P --") == 2
+    assert "${RUNNER_TOOL_CACHE:?runner did not export RUNNER_TOOL_CACHE}" in command
+    assert "${pythonLocation:?setup-python did not export pythonLocation}" in command
+    assert '"$TOOL_CACHE_ROOT"/Python/3.11.15/*' in command
+    assert 'PYTHON_BIN="$PYTHON_ROOT/bin/python3"' in command
+    assert 'PYTHON_LIB="$PYTHON_ROOT/lib"' in command
+    assert 'test -x "$PYTHON_BIN"' in command
+    assert 'test -d "$PYTHON_LIB"' in command
     isolated = command.split("env -i", 1)[1]
     assert 'PATH="$PYTHON_ROOT/bin:/usr/bin:/bin"' in isolated
-    assert 'LD_LIBRARY_PATH="$PYTHON_ROOT/lib"' in isolated
-    assert '"$PYTHON_ROOT/bin/python3" -m pip install' in isolated
+    assert 'LD_LIBRARY_PATH="$PYTHON_LIB"' in isolated
+    assert '"$PYTHON_BIN" -m pip install' in isolated
     assert "\n            python3 -m pip install" not in isolated
 
 
@@ -236,6 +239,68 @@ def test_hash_locked_bootstrap_runs_in_a_cold_scrubbed_runtime(
             / f"molecule-ci-{'minimal' if path == MINIMAL_TEMPLATE else 'sop'}.lock"
         ),
     ]
+
+
+@pytest.mark.parametrize("escape_kind", ("outside", "traversal", "symlink"))
+@pytest.mark.parametrize(
+    ("path", "job_name"),
+    (
+        (MINIMAL_TEMPLATE, "minimal-validate"),
+        (SOP_GATE_TEMPLATE, "gate"),
+    ),
+)
+def test_hash_locked_bootstrap_rejects_runtime_path_escape(
+    path: Path,
+    job_name: str,
+    escape_kind: str,
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load(path.read_text())
+    command = next(
+        step["run"]
+        for step in workflow["jobs"][job_name]["steps"]
+        if str(step.get("name", "")).startswith("Install exact hash-locked")
+    )
+    tool_cache = tmp_path / "tool-cache"
+    outside_root = tmp_path / "outside"
+    (outside_root / "bin").mkdir(parents=True)
+    (outside_root / "lib").mkdir()
+    probe = tmp_path / "invoked"
+    fake_python = outside_root / "bin" / "python3"
+    fake_python.write_text(
+        f"#!/bin/sh\n: > {shlex.quote(str(probe))}\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    expected_parent = tool_cache / "Python" / "3.11.15"
+    expected_parent.mkdir(parents=True)
+    if escape_kind == "outside":
+        python_location = outside_root
+    elif escape_kind == "traversal":
+        python_location = expected_parent / ".." / ".." / ".." / "outside"
+    else:
+        python_location = expected_parent / "x64"
+        python_location.symlink_to(outside_root, target_is_directory=True)
+
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    result = subprocess.run(
+        ["/bin/bash", "-euo", "pipefail", "-c", command],
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": "/usr/bin:/bin",
+            "RUNNER_TEMP": str(runner_temp),
+            "RUNNER_TOOL_CACHE": str(tool_cache),
+            "pythonLocation": str(python_location),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert not probe.exists()
 
 
 def test_sop_template_contains_secrets_to_one_hardened_gate_step() -> None:
