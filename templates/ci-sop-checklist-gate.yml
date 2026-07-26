@@ -107,14 +107,25 @@ jobs:
           printf '%s\n' \
             'PyYAML==6.0.3 --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d' \
             > "$lock"
+          PYTHON_ROOT="${pythonLocation:?setup-python did not export pythonLocation}"
+          case "$PYTHON_ROOT" in
+            "$RUNNER_TOOL_CACHE"/Python/3.11.15/*) ;;
+            *)
+              echo "setup-python returned an unexpected runtime path" >&2
+              exit 1
+              ;;
+          esac
+          test -x "$PYTHON_ROOT/bin/python3"
+          test -d "$PYTHON_ROOT/lib"
           env -i \
-            PATH="$PATH" \
+            PATH="$PYTHON_ROOT/bin:/usr/bin:/bin" \
+            LD_LIBRARY_PATH="$PYTHON_ROOT/lib" \
             HOME="$RUNNER_TEMP" \
             PIP_CONFIG_FILE=/dev/null \
             PIP_INDEX_URL=https://pypi.org/simple/ \
             PIP_NO_INPUT=1 \
             PYTHONNOUSERSITE=1 \
-            python3 -m pip install \
+            "$PYTHON_ROOT/bin/python3" -m pip install \
               --disable-pip-version-check \
               --break-system-packages \
               --no-deps \
