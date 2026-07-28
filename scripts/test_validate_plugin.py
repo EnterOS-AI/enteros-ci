@@ -215,3 +215,137 @@ def test_mcp_server_unknown_audience_fails(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 1
     assert "contributes/mcpServers/0/audience" in r.stdout
+
+
+# --- daemon-class plugins (kind: trigger — molecule-scheduler) -----------
+#
+# These cover the false positive that made this gate dead for two shipping
+# first-party plugins: the content rule treated EVERY non-skill kind as Go and
+# demanded go.mod + entrypoint. molecule-scheduler is a Python daemon and
+# molecule-platform is an npx launcher; neither has a go.mod, and neither ships
+# skill markers. Every existing mcp-server test above writes a SKILL.md into the
+# fixture, which short-circuits the content check — which is exactly why the bug
+# survived. None of the fixtures below ship one.
+
+def _daemon_manifest(**overrides):
+    return _base_manifest(
+        kind="trigger",
+        contributes={
+            "daemons": [{"name": "scheduler", "command": "python", "args": ["scheduler.py"]}]
+        },
+        **overrides,
+    )
+
+
+def test_trigger_plugin_with_daemon_entry_file_passes(tmp_path):
+    """The molecule-scheduler shape: a Python daemon, no go.mod, no SKILL.md."""
+    _write_plugin_yaml(tmp_path, _daemon_manifest())
+    (tmp_path / "scheduler.py").write_text("# the daemon\n")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "daemon entry scheduler.py" in r.stdout
+
+
+def test_trigger_plugin_whose_daemon_file_is_absent_fails(tmp_path):
+    """Tolerating kind:trigger must not become a rubber stamp — the declared
+    entry file has to actually be in the repo."""
+    _write_plugin_yaml(tmp_path, _daemon_manifest())
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+def test_daemon_flags_and_absolute_paths_do_not_count_as_content(tmp_path):
+    """`python -m mod` or an absolute path is not this repo's content."""
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="trigger",
+            contributes={
+                "daemons": [
+                    {"name": "d", "command": "python", "args": ["-m", "somemod"]},
+                    {"name": "e", "command": "/usr/bin/true", "args": []},
+                ]
+            },
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+def test_daemon_entry_may_not_escape_the_repo(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("# not ours\n")
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="trigger",
+            contributes={"daemons": [{"name": "d", "command": "python",
+                                      "args": ["../outside.py"]}]},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+# --- launcher-class plugins (kind: mcp-server — molecule-platform) -------
+
+def test_mcp_server_launcher_without_skill_md_passes(tmp_path):
+    """The molecule-platform shape: the server is fetched by npx at run time,
+    so there is deliberately no local file to check."""
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="mcp-server",
+            contributes={
+                "mcpServers": [
+                    {"name": "molecule-platform", "command": "npx",
+                     "args": ["@molecule-ai/mcp-server"]}
+                ]
+            },
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "mcpServers launcher (molecule-platform)" in r.stdout
+
+
+def test_mcp_server_entry_without_a_command_is_not_content(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="mcp-server",
+            contributes={"mcpServers": [{"name": "molecule-platform"}]},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+# --- the Go diagnostic must stay precise --------------------------------
+
+def test_half_a_go_plugin_still_reports_the_missing_half(tmp_path):
+    """A plugin that clearly MEANT to be Go gets the specific message, not the
+    generic four-shapes one."""
+    _write_plugin_yaml(tmp_path, _base_manifest(kind="env-mutator", entrypoint="x.Build"))
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "missing: go.mod" in r.stdout
+    assert "no recognisable content" not in r.stdout
+
+
+def test_a_configuration_block_alone_is_not_content(tmp_path):
+    """contributes.configuration DECLARES settings; it ships nothing runnable."""
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="trigger",
+            contributes={"configuration": {"properties": {"timezone": {"type": "string"}}}},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
