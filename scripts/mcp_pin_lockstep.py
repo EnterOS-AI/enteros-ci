@@ -302,9 +302,49 @@ def _runtime_wheel_reference(index: bytes, runtime_version: str) -> tuple[str, s
         matches.append((clean, digest))
     if len(matches) != 1:
         raise MCPPinLockstepError(
-            f"expected exactly one immutable runtime wheel; found {len(matches)}"
+            _wheel_absent_detail(parser.hrefs, len(matches))
         )
     return matches[0]
+
+
+def _wheel_absent_detail(hrefs: list[str], found: int) -> str:
+    """Explain a zero-match as EVICTION when the index is otherwise populated.
+
+    The bare "found 0" is a trap. This registry keeps a bounded number of files
+    per package, so a pin that was immutable and resolvable when it was made
+    becomes unresolvable once enough newer runtimes are published — the wheel is
+    garbage-collected out from under it. The check then fails for a reason that
+    has nothing to do with lockstep, and the message sends the reader hunting for
+    a malformed pin or a broken index instead of a retention window.
+
+    The canonical phrase stays the PREFIX of every arm: callers and tests key on
+    it, and the diagnosis is additive rather than a replacement. The pin itself is
+    deliberately NOT echoed — see test_missing_runtime_wheel_error_does_not_echo_valid_pin.
+    The reader already has it; the window is what they are missing.
+    """
+    base = f"expected exactly one immutable runtime wheel; found {found}"
+    if found:
+        return base
+    published = sorted(
+        {
+            m.group(1)
+            for h in hrefs
+            if (m := re.search(r"runtime-([0-9]+(?:\.[0-9]+)*)-py3-none-any\.whl", h))
+        },
+        key=lambda v: tuple(int(part) for part in v.split(".")),
+    )
+    if not published:
+        return (
+            base + " — and the package index lists NO runtime wheels at all: "
+            "the index is empty or unreadable, not stale"
+        )
+    return (
+        base + " — the pinned version is absent from a POPULATED index: its wheel "
+        f"has been EVICTED by the registry's retention window, which now retains "
+        f"{len(published)} versions, {published[0]}..{published[-1]}. The pin is "
+        "not malformed, it is older than the window; re-pin to a retained version. "
+        "(An immutable pin still rots against a pruned registry.)"
+    )
 
 
 def _declared_runtime_metadata(source: str) -> dict[str, str]:
