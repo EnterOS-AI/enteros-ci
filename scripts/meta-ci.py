@@ -275,13 +275,43 @@ def derive_bundles(manifest: dict, today: _dt.date | None = None) -> dict[str, A
 
 # ---------------------------------------------------------------------------
 # Bundle runners (Phase 1: only the cheap, universally-safe ones execute)
+#
+# A runner returns (outcome, detail) where outcome is True (passed), False
+# (failed), or SKIP (did not execute).
 # ---------------------------------------------------------------------------
-def _run_secret_scan(repo_root: Path) -> tuple[bool, str]:
+class _Skip:
+    """Sentinel for 'this bundle did not execute'.
+
+    Returning plain `True` for a skip is what #108 is about: the bundle then
+    rendered as `PASS  <bundle> — skipped (...)` and counted toward a green gate.
+    The detail string was honest; the status token was not, and the token is what
+    a human scanning a log — or any future machine check — keys on.
+
+    `__bool__` deliberately raises. A skip has no truth value, so any code that
+    tries to fold one into a pass/fail aggregate fails loudly instead of silently
+    counting it as coverage. That is the whole defect this sentinel exists to make
+    impossible, and it is the direction that was never tested.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "SKIP"
+
+    def __bool__(self):
+        raise TypeError(
+            "a SKIP outcome has no truth value — a bundle that did not execute is "
+            "neither a pass nor a failure; branch on it explicitly (see meta-ci#108)"
+        )
+
+
+SKIP = _Skip()
+def _run_secret_scan(repo_root: Path) -> tuple[bool | _Skip, str]:
     """Run the canonical secret-scan over the repo. Executes when check-secrets.py is
     co-located with this script (i.e. run from a molecule-ci checkout)."""
     scanner = Path(__file__).resolve().parent / "check-secrets.py"
     if not scanner.exists():
-        return True, "skipped (check-secrets.py not co-located)"
+        return SKIP, "check-secrets.py not co-located"
     proc = subprocess.run(
         [sys.executable, str(scanner)],
         cwd=str(repo_root),
@@ -292,7 +322,7 @@ def _run_secret_scan(repo_root: Path) -> tuple[bool, str]:
     return proc.returncode == 0, " | ".join(tail)
 
 
-def _run_plugin_manifest_validate(repo_root: Path) -> tuple[bool, str]:
+def _run_plugin_manifest_validate(repo_root: Path) -> tuple[bool | _Skip, str]:
     """Run the canonical plugin-manifest validator over the repo.
 
     PHASE 2 FOR THIS BUNDLE. Until now `plugin-manifest-validate` had no runner,
@@ -318,7 +348,7 @@ def _run_plugin_manifest_validate(repo_root: Path) -> tuple[bool, str]:
     """
     validator = Path(__file__).resolve().parent / "validate-plugin.py"
     if not validator.exists():
-        return True, "skipped (validate-plugin.py not co-located)"
+        return SKIP, "validate-plugin.py not co-located"
     if not (repo_root / "plugin.yaml").exists():
         # The bundle is routed from the `plugin` capability, so a repo reaching
         # here without a manifest is mis-declared. Say so rather than passing:
@@ -411,7 +441,7 @@ def node_bundle_steps(repo_root: Path) -> list[tuple[str, list[str]]] | None:
     return steps
 
 
-def _run_node_package(repo_root: Path) -> tuple[bool, str]:
+def _run_node_package(repo_root: Path) -> tuple[bool | _Skip, str]:
     """Execute the node bundle: frozen install + the repo's declared lint /
     typecheck / build. No-ops to a clean PASS only when there is no package.json
     (the repo has no node bundle to run). If the repo DECLARES node-package but the
@@ -420,7 +450,7 @@ def _run_node_package(repo_root: Path) -> tuple[bool, str]:
     'every executed runner green' aggregate (that was a silent false-green)."""
     steps = node_bundle_steps(repo_root)
     if steps is None:
-        return True, "skipped (no package.json)"
+        return SKIP, "no package.json — repo has no node bundle to run"
     manager = steps[0][1][0]
     if shutil.which(manager) is None:
         # Fail closed, not a green skip: this repo declares node-package, so a
@@ -482,20 +512,39 @@ EXECUTABLE_RUNNERS = {
 }
 
 
-def run_bundles(plan: dict, repo_root: Path) -> tuple[bool, list[str]]:
+def run_bundles(plan: dict, repo_root: Path) -> tuple[bool, list[str], list[str]]:
     """Execute the effective bundles that have a wired runner; report the rest as
-    'planned'. Returns (aggregate_ok, per-bundle report lines)."""
+    'planned'.
+
+    Returns (aggregate_ok, per-bundle report lines, skipped bundle names).
+
+    A SKIP is neither a pass nor a failure: it renders under its own token and is
+    excluded from the pass tally, but does not red the gate — a runner that cannot
+    execute (script not co-located, no package.json) is a legitimate degrade, not a
+    defect in the repo under test. The skipped list is returned so a caller that
+    demands real coverage — a required gate — can assert it is empty, which is the
+    check #108 exists to make possible. Before this, a skip was indistinguishable
+    from coverage in both the log and the return value.
+    """
     ok = True
     lines: list[str] = []
+    skipped: list[str] = []
     for bundle in plan["bundles_effective"]:
         runner = EXECUTABLE_RUNNERS.get(bundle)
         if runner is None:
             lines.append(f"  planned  {bundle} (execution wired in Phase 2)")
             continue
-        passed, detail = runner(repo_root)
-        lines.append(f"  {'PASS' if passed else 'FAIL':7} {bundle} — {detail}")
-        ok = ok and passed
-    return ok, lines
+        outcome, detail = runner(repo_root)
+        if isinstance(outcome, _Skip):
+            token = "SKIP"
+            skipped.append(bundle)
+        elif outcome:
+            token = "PASS"
+        else:
+            token = "FAIL"
+            ok = False
+        lines.append(f"  {token:7} {bundle} — {detail}")
+    return ok, lines, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -546,13 +595,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.plan_only:
         return 0
 
-    ok, lines = run_bundles(plan, repo_root)
+    ok, lines, skipped = run_bundles(plan, repo_root)
     print("meta-ci bundle results:")
     for ln in lines:
         print(ln)
     if not ok:
         print("::error::meta-ci: one or more EXECUTED bundles failed.")
         return 1
+    if skipped:
+        # Say the quiet part out loud. A skipped bundle is coverage this run did
+        # NOT provide, and the summary line must not imply otherwise — that
+        # conflation is #108. Still exit 0: a skip is a degrade, not a defect.
+        print(f"::notice::meta-ci: {len(skipped)} bundle(s) SKIPPED (did not execute): {', '.join(skipped)}")
+        print(
+            f"meta-ci: PASS (manifest valid; all EXECUTED bundles green; "
+            f"{len(skipped)} bundle(s) skipped, NOT verified)."
+        )
+        return 0
     print("meta-ci: PASS (manifest valid; all executed bundles green).")
     return 0
 

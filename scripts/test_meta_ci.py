@@ -234,8 +234,11 @@ def test_node_steps_skip_absent_scripts(tmp_path):
 
 
 def test_run_node_package_noop_without_package_json(tmp_path):
-    ok, detail = meta._run_node_package(tmp_path)
-    assert ok and "no package.json" in detail  # self-guards to a clean PASS
+    # A repo with no package.json has no node bundle to run. That is a SKIP, not a
+    # pass (#108): nothing was verified, so nothing may be reported as verified.
+    outcome, detail = meta._run_node_package(tmp_path)
+    assert isinstance(outcome, meta._Skip)
+    assert "no package.json" in detail
 
 
 def test_run_node_package_fails_closed_when_manager_absent(tmp_path, monkeypatch):
@@ -264,7 +267,7 @@ def test_absent_manager_reds_the_aggregate(tmp_path, monkeypatch):
     (tmp_path / "yarn.lock").write_text("")
     monkeypatch.setattr(meta.shutil, "which", lambda _cmd: None)
     plan = {"bundles_effective": ["node-install-lint-typecheck-build"]}
-    aggregate_ok, lines = meta.run_bundles(plan, tmp_path)
+    aggregate_ok, lines, _skipped = meta.run_bundles(plan, tmp_path)
     assert aggregate_ok is False
     assert any("FAIL" in ln for ln in lines)
 
@@ -451,3 +454,76 @@ def test_cli_plugin_manifest_validate_actually_executes(tmp_path):
     out = _run_cli(tmp_path).stdout
     assert "planned  plugin-manifest-validate" not in out, out
     assert "plugin-manifest-validate" in out and "PASS" in out, out
+
+
+# ---------------------------------------------------------------------------
+# #108 — a skipped bundle must never render as PASS or count as coverage.
+# ---------------------------------------------------------------------------
+def test_skipped_bundle_renders_as_SKIP_not_PASS(tmp_path, monkeypatch):
+    # The exact defect: three runners returned True for a skip, so the bundle
+    # printed "PASS  <bundle> — skipped (...)" and counted toward a green gate.
+    monkeypatch.setitem(
+        meta.EXECUTABLE_RUNNERS, "secret-scan",
+        lambda _root: (meta.SKIP, "check-secrets.py not co-located"),
+    )
+    plan = {"bundles_effective": ["secret-scan"]}
+    ok, lines, skipped = meta.run_bundles(plan, tmp_path)
+
+    assert len(lines) == 1
+    assert lines[0].strip().startswith("SKIP"), lines[0]
+    assert "PASS" not in lines[0], f"a skipped bundle still claims PASS: {lines[0]}"
+    # A skip is a degrade, not a defect — it must not red the gate...
+    assert ok is True
+    # ...but it must be reported as uncovered, machine-readably.
+    assert skipped == ["secret-scan"]
+
+
+def test_skip_is_excluded_from_coverage_while_pass_and_fail_are_not(tmp_path, monkeypatch):
+    # All three outcomes in one plan, so the tri-state is proven end to end rather
+    # than one branch at a time.
+    monkeypatch.setitem(meta.EXECUTABLE_RUNNERS, "secret-scan", lambda _r: (True, "clean"))
+    monkeypatch.setitem(meta.EXECUTABLE_RUNNERS, "plugin-manifest-validate", lambda _r: (meta.SKIP, "not co-located"))
+    monkeypatch.setitem(meta.EXECUTABLE_RUNNERS, "node-install-lint-typecheck-build", lambda _r: (False, "lint failed"))
+    plan = {"bundles_effective": [
+        "secret-scan", "plugin-manifest-validate", "node-install-lint-typecheck-build",
+    ]}
+    ok, lines, skipped = meta.run_bundles(plan, tmp_path)
+
+    tokens = [ln.strip().split()[0] for ln in lines]
+    assert tokens == ["PASS", "SKIP", "FAIL"], tokens
+    assert ok is False                       # a real FAIL still reds the aggregate
+    assert skipped == ["plugin-manifest-validate"]  # and only the skip is uncovered
+
+
+def test_SKIP_has_no_truth_value(tmp_path):
+    # The structural guard. The original defect was possible because a skip was
+    # literally True, so every `if passed:` silently counted it as coverage.
+    # Folding a SKIP into a boolean must now fail loudly instead.
+    with pytest.raises(TypeError, match="no truth value"):
+        bool(meta.SKIP)
+    with pytest.raises(TypeError):
+        _ = True and meta.SKIP and True
+
+
+def test_cli_reports_skipped_bundles_in_its_summary(tmp_path, monkeypatch, capsys):
+    # The summary line is what a human reads. It must not say "all executed bundles
+    # green" in a way that implies the skipped ones were checked.
+    monkeypatch.setitem(
+        meta.EXECUTABLE_RUNNERS, "secret-scan",
+        lambda _root: (meta.SKIP, "check-secrets.py not co-located"),
+    )
+    (tmp_path / "repo-meta.yaml").write_text(
+        "schema_version: 1\nlayer: plugin\ncapabilities: []\n"
+    )
+    # Only secret-scan and plugin-manifest-validate route from layer: plugin; make
+    # both skip so the summary has to describe a run that verified nothing.
+    monkeypatch.setattr(meta, "EXECUTABLE_RUNNERS", {
+        "secret-scan": lambda _root: (meta.SKIP, "check-secrets.py not co-located"),
+        "plugin-manifest-validate": lambda _root: (meta.SKIP, "validate-plugin.py not co-located"),
+    })
+    rc = meta.main(["--repo-root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert "SKIPPED (did not execute)" in out, out
+    assert "NOT verified" in out, out
