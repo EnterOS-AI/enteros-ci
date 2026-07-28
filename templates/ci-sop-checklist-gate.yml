@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MOLECULE_CI_REF: 45fbe831b983a4bb48bdeb19499e9eb5e8fef3dd
+      MOLECULE_CI_REF: 38121bd4c7c0f3fe059c624274867d1da1fbe260
     steps:
       - name: Check out BASE ref (trust boundary — never PR-head)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
