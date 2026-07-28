@@ -16,7 +16,7 @@ DIFF_SECRET_TEMPLATE = REPO_ROOT / "templates" / "ci-secret-scan.yml"
 CONFORMANCE_TEMPLATE = REPO_ROOT / "templates" / "ci-conformance-gate.yml"
 SOP_GATE_TEMPLATE = REPO_ROOT / "templates" / "ci-sop-checklist-gate.yml"
 PINNED_MOLECULE_CI_REF = (
-    "45fbe831b983a4bb48bdeb" + "19499e9eb5e8fef3dd"
+    "38121bd4c7c0f3fe059c62" + "4274867d1da1fbe260"
 )
 CONSUMER_TEMPLATES = tuple(sorted((REPO_ROOT / "templates").glob("ci-*.yml")))
 SCRIPT_FETCH_TEMPLATES = tuple(
