@@ -22,10 +22,9 @@ gate that only understands one location would go green through the migration.
 
 WHAT IT REFUSES
 ---------------
-E1  schedules declared, no scheduler plugin installed
-    The runtime materializes the grid from the kind:trigger scheduler plugin.
-    No scheduler in the node's effective `plugins:` => nothing fires. This is
-    the 35-of-37 failure.
+(There is no E1 — see the long note in check_node. The scheduler is declared
+on every workspace at provision, so "template does not name the scheduler" has
+no reachable true positive and was removed rather than left as noise.)
 
 E2  plugins[].config.schedules on a plugin that is NOT the scheduler
     Per-install config is delivered to `<install-name>.json` and read by that
@@ -222,36 +221,25 @@ def check_node(
             )
         )
 
-    # E1 applies to the NEW shape ONLY. This is the single most important
-    # distinction in this file, and the first cut got it backwards.
+    # THERE IS NO E1. Deliberately, after chasing it to the bottom.
     #
-    # For LEGACY node-level `schedules:`, core auto-attaches the daemon: when
-    # renderTemplateSchedulesYAML renders any entry, org_import.go calls
-    # ensureSchedulerPluginDeclared (and schedules.go Create does the same on
-    # the API path). So a legacy template that never names the scheduler is
-    # CORRECT, and flagging it would have failed all three real fleet repos —
-    # 12 findings, every one a false positive. Verified in
-    # molecule-core/workspace-server/internal/handlers/org_import.go:569.
+    # A template never has to declare the scheduler, in EITHER shape:
+    # workspace_provision_shared.go declares it on EVERY workspace at provision
+    # ("the SCHEDULER is a BASE per-workspace ability"), behind a DEFAULT-ON
+    # kill switch (declareSchedulerPluginEnabled: true unless explicitly set to
+    # 0/false/no). Additional on-demand declares exist in org_import.go,
+    # schedules.go Create and schedules_inheritance.go.
     #
-    # For `plugins[].config.schedules` there is NO such auto-attach, and M3
-    # DELETES renderTemplateSchedulesYAML — which is precisely the trigger the
-    # legacy auto-declare hangs off. So the moment a repo moves to the new
-    # shape, the safety net disappears and the scheduler must be declared
-    # explicitly or the whole grid goes silent. That is the flag-day landmine
-    # this gate exists to catch, and it is only reachable in the new shape.
-    if has_plugin_scheds and not declares_scheduler(plugins):
-        out.append(
-            Finding(
-                "E1",
-                path,
-                node_name,
-                "uses `plugins[].config.schedules` but installs NO scheduler plugin. "
-                "Unlike the legacy node-level `schedules:` block — which core "
-                "auto-attaches the daemon for via ensureSchedulerPluginDeclared — the "
-                "new shape has no auto-attach, and M3 deletes the render path that "
-                "triggers it. Declare the scheduler in `plugins:` or nothing fires.",
-            )
-        )
+    # Two earlier cuts of this file were wrong about that, in opposite
+    # directions, and both LOOKED right against fixtures:
+    #   * fire on both shapes  -> 12 findings on the real fleet, all false
+    #   * fire on the new shape only, justified by "M3 deletes the auto-attach
+    #     trigger" -> also false: the provision-time declare is not the
+    #     render-time one, and M3 does not touch it.
+    #
+    # A check with no reachable true positive is not a safety net, it is future
+    # noise that trains people to skip the gate. E2-E5 below are the checks
+    # that survive scrutiny.
 
     for src, scheds in plugin_scheds:
         if not is_scheduler(src):
