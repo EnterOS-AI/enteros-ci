@@ -33,4 +33,5 @@ check-secrets.py
 lint_bp_context_emit_match.py
 requirements.txt
 validate-org-template.py
+validate_schedule_wiring.py
 validate-plugin.py
