@@ -368,6 +368,18 @@ def test_cli_valid_repo_meta_passes(tmp_path):
         "schema_version: 1\nlayer: plugin\ncapabilities: [skills]\n"
     )
     (tmp_path / "README.md").write_text("ok")  # secret-scan needs a real dir; README is harmless
+    # layer: plugin routes plugin-manifest-validate, which EXECUTES since the
+    # Phase-2 wiring. The fixture previously shipped no plugin.yaml — a state no
+    # real repo is in (all 31 molecule-ai-plugin-* repos carry one, verified by
+    # cloning every one). A plugin-layer repo without a manifest is mis-declared
+    # and is now failed deliberately; see the dedicated test below. Give the
+    # happy-path fixture the manifest it should always have had, so it tests the
+    # CLI rather than asserting that a manifest-less plugin repo is fine.
+    (tmp_path / "plugin.yaml").write_text(
+        "name: fixture\nversion: 0.1.0\ndescription: cli happy path\n"
+        "author: molecule-ai\n"
+    )
+    (tmp_path / "SKILL.md").write_text("# fixture skill\n")  # skill content satisfies the content rule
     proc = _run_cli(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert meta.SENTINEL in proc.stdout            # sentinel proves the script executed
@@ -400,3 +412,42 @@ def test_cli_plan_json(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_cli_plugin_layer_without_manifest_fails_closed(tmp_path):
+    """A repo routed to plugin-manifest-validate that ships NO plugin.yaml FAILS.
+
+    Deliberate asymmetry with _run_secret_scan's skip-if-absent. The bundle is
+    routed from layer/capability `plugin`, so arriving here without a manifest is
+    a MIS-DECLARATION, and silence is exactly what this bundle exists to prevent —
+    the gate spent its whole life reported as `planned` and never executed, which
+    is the same failure in a different costume.
+    """
+    (tmp_path / "repo-meta.yaml").write_text(
+        "schema_version: 1\nlayer: plugin\ncapabilities: [skills]\n"
+    )
+    (tmp_path / "README.md").write_text("ok")
+    proc = _run_cli(tmp_path)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "ships no plugin.yaml" in (proc.stdout + proc.stderr)
+
+
+def test_cli_plugin_manifest_validate_actually_executes(tmp_path):
+    """Non-vacuity: the bundle must report PASS/FAIL, never `planned`.
+
+    Pins the Phase-2 wiring itself. If the runner is ever unregistered from
+    EXECUTABLE_RUNNERS the bundle silently reverts to `planned` — reported as
+    coverage while executing nothing — and every other assertion here would still
+    pass. This is the guard for that regression.
+    """
+    (tmp_path / "repo-meta.yaml").write_text(
+        "schema_version: 1\nlayer: plugin\ncapabilities: []\n"
+    )
+    (tmp_path / "README.md").write_text("ok")
+    (tmp_path / "plugin.yaml").write_text(
+        "name: fixture\nversion: 0.1.0\ndescription: d\nauthor: molecule-ai\n"
+    )
+    (tmp_path / "SKILL.md").write_text("# s\n")
+    out = _run_cli(tmp_path).stdout
+    assert "planned  plugin-manifest-validate" not in out, out
+    assert "plugin-manifest-validate" in out and "PASS" in out, out

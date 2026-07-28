@@ -5,50 +5,99 @@
   "description": "SSOT JSON-Schema (draft 2020-12) for the Molecule marketplace workspace-template artifact — the publishable shape of a workspace-template `config.yaml`. RuntimeId is an open bounded/path-safe slug; official first-party support is discovered separately. The schema is deliberately tolerant of the real configs' different model/provider locations while retaining their typed shapes.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["name", "runtime", "template_schema_version"],
+  "required": [
+    "name",
+    "runtime",
+    "template_schema_version"
+  ],
   "properties": {
-    "name": { "type": "string", "minLength": 1, "description": "Template display name (required by validate-workspace-template.py). E.g. `Claude Code Agent`, `SEO Agent`." },
-    "runtime": { "$ref": "#/$defs/runtimeId", "description": "Open RuntimeId this template targets (required)." },
-    "template_schema_version": { "type": "integer", "description": "Template schema version (required; validate-workspace-template.py errors if missing — `template_schema_version: 1`)." },
-    "description": { "type": "string", "description": "Optional human-readable description." },
-    "version": { "type": "string", "description": "Optional template version (e.g. `1.0.0`, `0.2.1`)." },
-    "tier": { "type": "integer", "minimum": 1, "maximum": 4, "description": "Optional capability/cost tier 1-4 (seen: 2 and 4)." },
-    "model": { "type": "string", "description": "Optional default model id (top-level form, e.g. `moonshot/kimi-k2.6`). One of several model locations — see schema description." },
-    "provider": { "type": "string", "description": "Optional default provider name (top-level form, e.g. `platform` — platform-agent)." },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Template display name (required by validate-workspace-template.py). E.g. `Claude Code Agent`, `SEO Agent`."
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtimeId",
+      "description": "Open RuntimeId this template targets (required)."
+    },
+    "template_schema_version": {
+      "type": "integer",
+      "description": "Template schema version (required; validate-workspace-template.py errors if missing — `template_schema_version: 1`)."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional human-readable description."
+    },
+    "version": {
+      "type": "string",
+      "description": "Optional template version (e.g. `1.0.0`, `0.2.1`)."
+    },
+    "tier": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4,
+      "description": "Optional capability/cost tier 1-4 (seen: 2 and 4)."
+    },
+    "model": {
+      "type": "string",
+      "description": "Optional default model id (top-level form, e.g. `moonshot/kimi-k2.6`). One of several model locations — see schema description."
+    },
+    "provider": {
+      "type": "string",
+      "description": "Optional default provider name (top-level form, e.g. `platform` — platform-agent)."
+    },
     "providers": {
       "type": "array",
       "description": "Top-level provider registry: a list of provider OBJECTS (claude-code adapter provider contract). NOTE: distinct from `runtime_config.providers`, which is a list of provider-name strings.",
-      "items": { "$ref": "#/$defs/provider" }
+      "items": {
+        "$ref": "#/$defs/provider"
+      }
     },
     "models": {
       "type": "array",
       "description": "Top-level `models[]` — the authoritative servability list for templates that publish model choices outside `runtime_config.models`. The registry projection is a subset of this.",
-      "items": { "$ref": "#/$defs/model" }
+      "items": {
+        "$ref": "#/$defs/model"
+      }
     },
     "prompt_files": {
       "type": "array",
       "description": "Prompt files delivered to the workspace (e.g. `system-prompt.md`, `prompts/seo-agent.md`).",
-      "items": { "type": "string", "description": "A prompt file path within the template repo." }
+      "items": {
+        "type": "string",
+        "description": "A prompt file path within the template repo."
+      }
     },
     "plugins": {
       "type": "array",
       "description": "Declared plugins as source-contract strings the workspace-server gitea resolver understands: `gitea://<owner>/<repo>[/<subpath>]#<ref>`. Installed dynamically post-boot by the reconcile (RFC#2843 #32), NOT via the provisioning channel.",
-      "items": { "type": "string", "description": "A plugin source-contract string." }
+      "items": {
+        "type": "string",
+        "description": "A plugin source-contract string."
+      }
     },
     "skills": {
       "type": "array",
       "description": "Bare skill names enabled for the template (e.g. `seo`, `research`).",
-      "items": { "type": "string", "description": "A skill name." }
+      "items": {
+        "type": "string",
+        "description": "A skill name."
+      }
     },
     "tools": {
       "type": "array",
       "description": "Bare tool names enabled for the template (optional).",
-      "items": { "type": "string", "description": "A tool name." }
+      "items": {
+        "type": "string",
+        "description": "A tool name."
+      }
     },
     "schedules": {
       "type": "array",
-      "description": "Default schedule grid seeded into workspace_schedules with source='template' at provision time (mirrors org_import.go). Runtime-added schedules are preserved across re-provisions; only source='template' rows are refreshed.",
-      "items": { "$ref": "#/$defs/schedule" }
+      "description": "Default schedule grid for a workspace created FROM THIS TEMPLATE. On the direct-create path core reads this block (parseTemplateSchedules) and renders it into the delivered config.yaml; the runtime's seed_schedules_from_workspace_config then materializes it into the volume-backed grid, which is the source of truth and what the kind:trigger scheduler plugin fires from. A SECOND reader exists on self-host only: the concierge graft passes the platform-agent template's block through VERBATIM, with no render step, so that block is authored in the runtime-native shape rather than this one. NOTE org-import reads neither: an org.yaml node supplies its own schedules: and core renders those instead, so unlike plugins there is no template->node schedule inheritance. Schedules a workspace adds at runtime only need carrying when a re-provision allocates a FRESH volume — on an ordinary teardown the volume persists and the grid survives untouched. When it is needed the carry is BEST-EFFORT: captured at teardown into the predecessor's carryover_runtime_schedules and replayed by RestoreInheritedRuntimeSchedules, but only source='runtime' rows, only when both workspaces advertise a native scheduler, and skipped on an unreachable or malformed grid or once a 10s budget is exhausted. This does NOT seed the workspace_schedules table: the legacy dual-path core-DB backend was retired in P4b and no core code reads or writes that table.",
+      "items": {
+        "$ref": "#/$defs/schedule"
+      }
     },
     "env": {
       "$ref": "#/$defs/env",
@@ -80,7 +129,11 @@
     "sub_workspaces": {
       "type": "array",
       "description": "Optional sub-workspace declarations. Modelled permissively (items are open objects).",
-      "items": { "type": "object", "additionalProperties": true, "description": "A sub-workspace declaration (open shape)." }
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "A sub-workspace declaration (open shape)."
+      }
     }
   },
   "$defs": {
@@ -97,59 +150,134 @@
     "provider": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["name"],
+      "required": [
+        "name"
+      ],
       "description": "A provider entry in the top-level `providers[]` registry (claude-code adapter provider contract).",
       "properties": {
-        "name": { "type": "string", "minLength": 1, "description": "Provider name (e.g. `platform`, `anthropic-oauth`)." },
-        "auth_mode": { "type": "string", "description": "Auth mode (e.g. `third_party_anthropic_compat`, `anthropic_api`, `oauth`)." },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Provider name (e.g. `platform`, `anthropic-oauth`)."
+        },
+        "auth_mode": {
+          "type": "string",
+          "description": "Auth mode (e.g. `third_party_anthropic_compat`, `anthropic_api`, `oauth`)."
+        },
         "model_prefixes": {
           "type": "array",
           "description": "Model id prefixes routed to this provider (e.g. `kimi-`, `claude-`).",
-          "items": { "type": "string", "description": "A model id prefix." }
+          "items": {
+            "type": "string",
+            "description": "A model id prefix."
+          }
         },
         "model_aliases": {
           "type": "array",
           "description": "Model aliases routed to this provider (e.g. `sonnet`, `opus`, `haiku`).",
-          "items": { "type": "string", "description": "A model alias." }
+          "items": {
+            "type": "string",
+            "description": "A model alias."
+          }
         },
-        "base_url": { "description": "Provider base URL. Loosely typed: a string OR null (seo-agent uses `base_url: null` for key-only providers)." },
+        "base_url": {
+          "description": "Provider base URL. Loosely typed: a string OR null (seo-agent uses `base_url: null` for key-only providers)."
+        },
         "auth_env": {
           "type": "array",
           "description": "Environment variables consulted for auth.",
-          "items": { "type": "string", "description": "An auth env var name." }
+          "items": {
+            "type": "string",
+            "description": "An auth env var name."
+          }
         },
-        "auth_token_env": { "type": "string", "description": "The single env var holding the bearer token for this provider." }
+        "auth_token_env": {
+          "type": "string",
+          "description": "The single env var holding the bearer token for this provider."
+        }
       }
     },
     "model": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "description": "A servable model entry (used in both top-level `models[]` and `runtime_config.models[]`).",
       "properties": {
-        "id": { "type": "string", "minLength": 1, "description": "Model id (e.g. `platform:gemini-2.5-pro`, `moonshot/kimi-k2.6`, `sonnet`)." },
-        "name": { "type": "string", "description": "Human-readable display name shown in the model dropdown." },
-        "provider": { "type": "string", "description": "Provider name backing this model (e.g. `platform`)." },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model id (e.g. `platform:gemini-2.5-pro`, `moonshot/kimi-k2.6`, `sonnet`)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable display name shown in the model dropdown."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Provider name backing this model (e.g. `platform`)."
+        },
         "required_env": {
           "type": "array",
           "description": "Env vars the user must supply for this model (empty for platform-managed/keyless).",
-          "items": { "type": "string", "description": "A required env var name." }
+          "items": {
+            "type": "string",
+            "description": "A required env var name."
+          }
         }
       }
     },
     "schedule": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["name", "cron_expr"],
-      "description": "A default schedule entry.",
+      "required": [
+        "name"
+      ],
+      "description": "A default schedule entry. The cron field has TWO accepted spellings and exactly one must be present: `cron_expr`, which core parses on the direct-create path (OrgSchedule's yaml tag), and `cron`, the runtime-native spelling used by templates whose block core passes through VERBATIM — the self-host concierge graft. The runtime accepts `cron` natively and aliases `cron_expr`, so both reach the same grid.",
       "properties": {
-        "name": { "type": "string", "minLength": 1, "description": "Schedule name." },
-        "cron_expr": { "type": "string", "description": "Cron expression (5-field), in tenant-local clock time." },
-        "timezone": { "type": "string", "description": "IANA timezone string (literal; the seeder does not expand env vars here)." },
-        "prompt": { "type": "string", "description": "Inline prompt run on the cron tick." },
-        "prompt_file": { "type": "string", "description": "Path to a prompt file run on the cron tick (alternative to inline `prompt`)." },
-        "enabled": { "type": "boolean", "description": "Whether the schedule is enabled." }
-      }
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Schedule name."
+        },
+        "cron_expr": {
+          "type": "string",
+          "description": "Cron expression (5-field), in tenant-local clock time."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone string (literal; the seeder does not expand env vars here)."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Inline prompt run on the cron tick."
+        },
+        "prompt_file": {
+          "type": "string",
+          "description": "Path to a prompt file run on the cron tick (alternative to inline `prompt`)."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the schedule is enabled."
+        },
+        "cron": {
+          "type": "string",
+          "description": "Cron expression (5-field), runtime-native spelling. Used by templates delivered through the verbatim passthrough path (e.g. platform-agent, via the self-host concierge graft) where core never parses the block."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "cron_expr"
+          ]
+        },
+        {
+          "required": [
+            "cron"
+          ]
+        }
+      ]
     },
     "env": {
       "type": "object",
@@ -159,12 +287,18 @@
         "required": {
           "type": "array",
           "description": "Env vars required at provision time.",
-          "items": { "type": "string", "description": "A required env var name." }
+          "items": {
+            "type": "string",
+            "description": "A required env var name."
+          }
         },
         "optional": {
           "type": "array",
           "description": "Optional env vars.",
-          "items": { "type": "string", "description": "An optional env var name." }
+          "items": {
+            "type": "string",
+            "description": "An optional env var name."
+          }
         }
       }
     },
@@ -173,28 +307,48 @@
       "additionalProperties": true,
       "description": "Runtime-specific configuration. Tolerant (open) because the model/provider surface varies across runtimes.",
       "properties": {
-        "model": { "type": "string", "description": "Default model id for the runtime." },
-        "provider": { "type": "string", "description": "Default provider name for the runtime." },
+        "model": {
+          "type": "string",
+          "description": "Default model id for the runtime."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Default provider name for the runtime."
+        },
         "providers": {
           "type": "array",
           "description": "Provider NAMES enabled for the runtime (list of STRINGS — distinct from the top-level `providers[]` object list).",
-          "items": { "type": "string", "description": "A provider name." }
+          "items": {
+            "type": "string",
+            "description": "A provider name."
+          }
         },
         "models": {
           "type": "array",
           "description": "Servable models for the runtime (same model entry shape as top-level `models[]`).",
-          "items": { "$ref": "#/$defs/model" }
+          "items": {
+            "$ref": "#/$defs/model"
+          }
         },
-        "timeout": { "type": "integer", "description": "Optional timeout (0 = no timeout)." },
+        "timeout": {
+          "type": "integer",
+          "description": "Optional timeout (0 = no timeout)."
+        },
         "required_env": {
           "type": "array",
           "description": "Env vars required by the runtime.",
-          "items": { "type": "string", "description": "A required env var name." }
+          "items": {
+            "type": "string",
+            "description": "A required env var name."
+          }
         },
         "recommended_env": {
           "type": "array",
           "description": "Env vars recommended (not required) by the runtime.",
-          "items": { "type": "string", "description": "A recommended env var name." }
+          "items": {
+            "type": "string",
+            "description": "A recommended env var name."
+          }
         }
       }
     },
@@ -203,8 +357,14 @@
       "additionalProperties": true,
       "description": "Inbound A2A surface configuration.",
       "properties": {
-        "port": { "type": "integer", "description": "A2A server port (e.g. 8000)." },
-        "streaming": { "type": "boolean", "description": "Whether streaming is enabled." }
+        "port": {
+          "type": "integer",
+          "description": "A2A server port (e.g. 8000)."
+        },
+        "streaming": {
+          "type": "boolean",
+          "description": "Whether streaming is enabled."
+        }
       }
     }
   }

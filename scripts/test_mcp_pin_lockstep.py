@@ -964,3 +964,42 @@ def test_json_cli_does_not_echo_unexpected_exception_text(
     assert captured.out == ""
     assert captured.err.strip() == "unexpected MCP lockstep checker failure"
     assert marker not in captured.err
+
+
+def test_wheel_absent_detail_names_eviction_not_a_bad_pin():
+    """A zero-match against a POPULATED index must be reported as eviction.
+
+    Regression guard for a real wedge: the selftest fixture and all four official
+    consumers pinned runtime 0.4.35, the registry's retention window advanced past
+    it, and every affected job began failing with "expected exactly one immutable
+    runtime wheel; found 0". That message describes a malformed pin or a broken
+    index — neither of which was true — so the failure read as unrelated to the
+    pin's age. The window is the whole explanation and belongs in the message.
+    """
+    hrefs = [
+        f"https://h/molecules_workspace_runtime-0.4.{n}-py3-none-any.whl#sha256=" + "a" * 64
+        for n in (38, 40, 55)
+    ]
+    msg = lockstep._wheel_absent_detail(hrefs, 0)
+    assert "expected exactly one immutable runtime wheel" in msg  # canonical prefix kept
+    assert "EVICTED" in msg
+    assert "0.4.38..0.4.55" in msg, msg          # the window, concretely
+    assert "not malformed" in msg
+
+
+def test_wheel_absent_detail_distinguishes_an_empty_index():
+    """An index with NO runtime wheels is a different fault and must not read as eviction.
+
+    Without this the empty-index arm could collapse into the eviction wording and
+    send an operator hunting for a stale pin while the registry is simply down.
+    """
+    msg = lockstep._wheel_absent_detail([], 0)
+    assert "NO runtime wheels" in msg
+    assert "EVICTED" not in msg
+
+
+def test_wheel_absent_detail_leaves_the_multi_match_case_alone():
+    """found>0 is an ambiguity fault, not a retention fault — wording must not drift."""
+    assert lockstep._wheel_absent_detail(["whatever"], 2) == (
+        "expected exactly one immutable runtime wheel; found 2"
+    )
