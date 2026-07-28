@@ -292,6 +292,48 @@ def _run_secret_scan(repo_root: Path) -> tuple[bool, str]:
     return proc.returncode == 0, " | ".join(tail)
 
 
+def _run_plugin_manifest_validate(repo_root: Path) -> tuple[bool, str]:
+    """Run the canonical plugin-manifest validator over the repo.
+
+    PHASE 2 FOR THIS BUNDLE. Until now `plugin-manifest-validate` had no runner,
+    so run_bundles() fell through to `planned  plugin-manifest-validate
+    (execution wired in Phase 2)` and NEVER EXECUTED — on any of the 31
+    molecule-ai-plugin-* repos. The gate was believed to be "advisory, erroring
+    on every run with nobody paged"; it was not erroring, it was not running.
+    A gate that has never executed is indistinguishable from one that does not
+    exist, except that it is reported as coverage.
+
+    Wired here rather than left planned because it now satisfies the same bar
+    the secret-scan / node / mcp runners are held to: bounded (a pure-Python
+    check over the checked-out tree, no toolchain, no registry, no network) and
+    FAIL-CLOSED. It was NOT safe to wire before #102 — the content rule then
+    rejected 6 of the 31 shipping plugins (molecule-platform-mcp, image-gen and
+    the four kind: digest-provider plugins), so executing it would have redded
+    them on contact. Post-#102 the fleet is 31/0, which is what makes this
+    promotion survivable.
+
+    Mirrors _run_secret_scan exactly: skip-if-not-co-located so a consumer that
+    vendors only part of the script tree degrades to a neutral pass rather than
+    a spurious failure.
+    """
+    validator = Path(__file__).resolve().parent / "validate-plugin.py"
+    if not validator.exists():
+        return True, "skipped (validate-plugin.py not co-located)"
+    if not (repo_root / "plugin.yaml").exists():
+        # The bundle is routed from the `plugin` capability, so a repo reaching
+        # here without a manifest is mis-declared. Say so rather than passing:
+        # silence here is what the whole bundle exists to prevent.
+        return False, "repo declares the `plugin` capability but ships no plugin.yaml"
+    proc = subprocess.run(
+        [sys.executable, str(validator)],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-3:]
+    return proc.returncode == 0, " | ".join(tail)
+
+
 # ---------------------------------------------------------------------------
 # node-package runner. UNLIKE the go / python / docker language bundles (still
 # 'planned' — they need heavyweight toolchains / registries wired in Phase 2),
@@ -434,6 +476,7 @@ def _run_mcp_pin_lockstep(repo_root: Path) -> tuple[bool, str]:
 # fail closed. The MCP checker is isolated in scripts/mcp_pin_lockstep.py.
 EXECUTABLE_RUNNERS = {
     "secret-scan": _run_secret_scan,
+    "plugin-manifest-validate": _run_plugin_manifest_validate,
     "node-install-lint-typecheck-build": _run_node_package,
     "mcp-pin-lockstep": _run_mcp_pin_lockstep,
 }
