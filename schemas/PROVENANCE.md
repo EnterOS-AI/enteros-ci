@@ -8,13 +8,13 @@ repository (the marketplace-catalog contract family, RFC
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
 | `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
-| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `fe144816d187a97368b1f33eba1c7c9849e3cee9` (SDK PR #177 merge — `schedules` description corrected) |
-| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `d5046dbb872142dfd1d292827ade9a4bf33ca19d` (SDK PR #120 merge) |
+| `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #180 merge — schedule accepts `cron` or `cron_expr`) |
+| `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #179 merge — empty-declaration `anyOf` constraint) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
-currently SDK PR #177 merge commit
-`fe144816d187a97368b1f33eba1c7c9849e3cee9`; every row is fetched from that
+currently SDK PR #180 merge commit
+`2c4457da12b9978b7343da684ffe901d94ee3eac`; every row is fetched from that
 same immutable commit even when the table records an older, last
 contract-changing commit for the individual file.
 
