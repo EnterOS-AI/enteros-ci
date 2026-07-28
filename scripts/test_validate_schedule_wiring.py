@@ -46,57 +46,8 @@ def codes(findings) -> list[str]:
 
 # --- E1: schedules with no scheduler installed (the 35-of-37 failure) --------
 
-def test_E1_node_schedules_without_scheduler_plugin_is_refused(tmp_path):
-    f = scan(write(tmp_path, f"""
-        workspaces:
-          - name: Coordinator
-            plugins:
-              - gitea://molecule-ai/molecule-ai-plugin-seo
-            schedules:
-              - name: Heartbeat
-                cron_expr: "*/30 * * * *"
-                prompt: do the thing
-    """))
-    assert "E1" not in codes(f), "legacy shape: core auto-attaches the daemon"
 
 
-def test_E1_clears_when_the_scheduler_is_installed(tmp_path):
-    f = scan(write(tmp_path, f"""
-        workspaces:
-          - name: Coordinator
-            plugins:
-              - {SCHED}
-            schedules:
-              - name: Heartbeat
-                cron_expr: "*/30 * * * *"
-                prompt: do the thing
-    """))
-    assert "E1" not in codes(f)
-
-
-def test_E1_an_opted_out_scheduler_does_not_count_as_installed(tmp_path):
-    """`!plugin` DECLINES it. Counting the opt-out as an install would bless
-    exactly the config that cannot fire.
-
-    Uses the NEW shape: E1 is unreachable in the legacy shape because core
-    auto-attaches the daemon there.
-    """
-    f = scan(write(tmp_path, """
-        workspaces:
-          - name: Coordinator
-            plugins:
-              - "!molecule-ai-plugin-scheduler"
-              - source: some-other-plugin
-                config:
-                  schedules:
-                    - name: Heartbeat
-                      cron_expr: "*/30 * * * *"
-                      prompt: x
-    """))
-    assert "E1" in codes(f)
-
-
-# --- E2: schedules hung off a non-scheduler plugin ---------------------------
 
 def test_E2_config_schedules_on_unrelated_plugin_is_refused(tmp_path):
     f = scan(write(tmp_path, f"""
@@ -240,7 +191,7 @@ def test_teams_nested_workspaces_are_scanned(tmp_path):
                           cron_expr: "0 * * * *"
                           prompt: x
     """))
-    assert "E1" in codes(f)
+    assert "E2" in codes(f)
 
 
 def test_workspace_template_document_is_treated_as_the_node(tmp_path):
@@ -254,7 +205,7 @@ def test_workspace_template_document_is_treated_as_the_node(tmp_path):
                   cron_expr: "0 * * * *"
                   prompt: x
     """, name="workspace.yaml"))
-    assert "E1" in codes(f)
+    assert "E2" in codes(f)
 
 
 def test_object_form_plugin_source_is_read(tmp_path):
@@ -279,88 +230,7 @@ def test_scheduler_matched_by_either_identity(tmp_path):
 # is a false-positive storm, and a noisy gate gets muted — at which point it is
 # not there for the genuinely dead schedules it exists to catch.
 
-def test_org_defaults_plugins_satisfy_the_scheduler_requirement(tmp_path):
-    f = scan(write(tmp_path, f"""
-        defaults:
-          plugins:
-            - {SCHED}
-        workspaces:
-          - name: Inheritor
-            plugins: []
-            schedules:
-              - name: H
-                cron_expr: "0 * * * *"
-                prompt: x
-    """))
-    assert codes(f) == [], "org defaults must count as installing the scheduler"
 
-
-def test_removing_the_inherited_scheduler_reinstates_E1(tmp_path):
-    """Negative control for the check above — without it, the suppression
-    could be unconditional and prove nothing."""
-    f = scan(write(tmp_path, """
-        defaults:
-          plugins:
-            - gitea://molecule-ai/molecule-ai-plugin-seo
-        workspaces:
-          - name: Inheritor
-            plugins:
-              - source: gitea://molecule-ai/molecule-ai-plugin-seo
-                config:
-                  schedules:
-                    - name: H
-                      cron_expr: "0 * * * *"
-                      prompt: x
-    """))
-    assert "E1" in codes(f)
-
-
-def test_defaults_are_collected_repo_wide_across_files(tmp_path):
-    """molecule-dev keeps the scheduler in org.yaml while schedules live in
-    separate workspace.yaml files. Per-file isolation would flag all of them."""
-    (tmp_path / "org.yaml").write_text(textwrap.dedent(f"""
-        defaults:
-          plugins:
-            - {SCHED}
-    """).lstrip(), encoding="utf-8")
-    (tmp_path / "workspace.yaml").write_text(textwrap.dedent("""
-        name: Community Manager
-        plugins: []
-        schedules:
-          - name: Hourly sweep
-            cron_expr: "0 * * * *"
-            prompt_file: schedules/x.md
-    """).lstrip(), encoding="utf-8")
-    f = scan(sorted(tmp_path.glob("*.yaml")))
-    assert codes(f) == [], "repo-wide defaults must reach nodes in sibling files"
-
-
-def test_node_opt_out_defeats_an_inherited_scheduler(tmp_path):
-    f = scan(write(tmp_path, f"""
-        defaults:
-          plugins:
-            - {SCHED}
-        workspaces:
-          - name: Decliner
-            plugins:
-              - "!molecule-ai-plugin-scheduler"
-              - source: some-other-plugin
-                config:
-                  schedules:
-                    - name: H
-                      cron_expr: "0 * * * *"
-                      prompt: x
-    """))
-    assert "E1" in codes(f), "a node that declines the scheduler has no scheduler"
-
-
-# --- nested nodes: the FALSE-NEGATIVE guard ---------------------------------
-#
-# Every test above used a FLAT `workspaces:` list, and all 20 passed while the
-# gate was completely blind to reno-stars — which nests its five scheduled
-# agents under one root's `children:`. A gate that reports "clean" on the
-# production template it was built for is worse than no gate. Fixtures agreed
-# with each other; only the real fleet disagreed.
 
 def test_children_are_walked(tmp_path):
     f = scan(write(tmp_path, """
@@ -379,7 +249,7 @@ def test_children_are_walked(tmp_path):
                           cron_expr: "*/30 * * * *"
                           prompt: x
     """))
-    assert "E1" in codes(f), "a scheduled node nested under children: must be seen"
+    assert "E2" in codes(f), "a scheduled node nested under children: must be seen"
 
 
 def test_children_nest_arbitrarily_deep(tmp_path):
@@ -398,7 +268,7 @@ def test_children_nest_arbitrarily_deep(tmp_path):
                               cron_expr: "0 * * * *"
                               prompt: x
     """))
-    assert "E1" in codes(f)
+    assert "E2" in codes(f)
 
 
 def test_a_clean_nested_tree_stays_silent(tmp_path):
@@ -431,36 +301,6 @@ def test_a_clean_nested_tree_stays_silent(tmp_path):
 # which is the trigger the legacy auto-declare hangs off. So the new shape has
 # no safety net and must declare the scheduler explicitly.
 
-def test_legacy_shape_without_a_scheduler_is_ACCEPTED(tmp_path):
-    """core's ensureSchedulerPluginDeclared covers this path."""
-    f = scan(write(tmp_path, """
-        workspaces:
-          - name: Coordinator
-            plugins: []
-            schedules:
-              - name: Heartbeat
-                cron_expr: "*/30 * * * *"
-                prompt: x
-    """))
-    assert "E1" not in codes(f)
-
-
-def test_new_shape_without_a_scheduler_is_REFUSED(tmp_path):
-    """No auto-attach exists here, and M3 removes the trigger that powers the
-    legacy one."""
-    f = scan(write(tmp_path, """
-        workspaces:
-          - name: Coordinator
-            plugins:
-              - source: molecule-ai-plugin-seo
-                config:
-                  schedules:
-                    - name: Heartbeat
-                      cron_expr: "*/30 * * * *"
-                      prompt: x
-    """))
-    assert "E1" in codes(f)
-
 
 def test_the_three_real_fleet_repos_stay_clean_on_the_legacy_shape(tmp_path):
     """Regression guard for the false-positive storm. Mirrors the real shapes:
@@ -479,3 +319,60 @@ def test_the_three_real_fleet_repos_stay_clean_on_the_legacy_shape(tmp_path):
                     prompt: Read /configs/skills/heartbeat.md
     """, name="reno.yaml"))
     assert codes(reno) == [], f"legacy fleet shape must pass, got {codes(reno)}"
+
+
+# --- the check that was REMOVED, and why it must not come back --------------
+#
+# Two cuts of this gate shipped a "template does not declare the scheduler"
+# check. Both were wrong, in opposite directions, and both looked right against
+# fixtures. The scheduler is declared on EVERY workspace at provision
+# (workspace_provision_shared.go, "a BASE per-workspace ability", behind a
+# DEFAULT-ON kill switch), so that condition has no reachable true positive in
+# either shape. These tests pin the absence.
+
+def test_no_finding_for_a_template_that_never_names_the_scheduler_legacy(tmp_path):
+    f = scan(write(tmp_path, """
+        workspaces:
+          - name: Coordinator
+            plugins: []
+            schedules:
+              - name: Heartbeat
+                cron_expr: "*/30 * * * *"
+                prompt: x
+    """))
+    assert codes(f) == [], "core declares the scheduler at provision; this is valid"
+
+
+def test_no_finding_for_a_template_that_never_names_the_scheduler_new_shape(tmp_path):
+    """Same for plugins[].config.schedules ON the scheduler — the node does not
+    have to ALSO list it elsewhere."""
+    f = scan(write(tmp_path, f"""
+        workspaces:
+          - name: Coordinator
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Heartbeat
+                      cron_expr: "*/30 * * * *"
+                      prompt: x
+    """))
+    assert codes(f) == []
+
+
+def test_the_real_fleet_shapes_stay_clean(tmp_path):
+    """reno-stars (children-nested, defaults lack a scheduler) and molecule-dev
+    (plugins: [] per node). Both are CORRECT and must never be flagged."""
+    reno = scan(write(tmp_path, """
+        defaults:
+          plugins: [browser-automation]
+        workspaces:
+          - name: Business Intelligence
+            children:
+              - name: Coordinator
+                schedules:
+                  - name: Heartbeat (every 30m)
+                    cron_expr: "*/30 * * * *"
+                    prompt: Read /configs/skills/heartbeat.md
+    """, name="reno.yaml"))
+    assert codes(reno) == [], f"got {codes(reno)}"
