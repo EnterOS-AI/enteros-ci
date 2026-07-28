@@ -90,7 +90,7 @@ for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: 
 # 5. Content presence — kind-aware. FILESYSTEM check (out-of-band; the schema
 #    governs the manifest, not what files the repo ships).
 #
-#    A plugin ships its content in one of four shapes. Content is proven if ANY
+#    A plugin ships its content in one of six shapes. Content is proven if ANY
 #    holds — a plugin is free to combine them:
 #
 #      * SKILL-class — declarative: SKILL.md / hooks/ / skills/ / rules/.
@@ -101,6 +101,15 @@ for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: 
 #        The server is fetched at run time (e.g. molecule-platform's
 #        `npx @molecule-ai/mcp-server`), so there is deliberately NO local file
 #        to check; the declaration is the content.
+#      * FRAGMENT-class — a `settings-fragment.json` whose `mcpServers` object
+#        has an entry with a command. This — NOT `contributes.mcpServers` — is
+#        how the shipping MCP-server plugins actually deliver
+#        (molecule-ai-plugin-molecule-platform-mcp, molecule-ai-plugin-image-gen);
+#        it is a first-class capability in this repo's own meta-CI router
+#        (`settings-fragment` -> settings-fragment-validate bundle).
+#      * DIGEST-PROVIDER-class — a `contributes.digestProviders` entry whose
+#        `entrypoint` (`module:attr`, e.g. `prov:get_provider`) names a Python
+#        module that actually exists in the repo (RFC molecule-core#4413).
 #      * GO code-class — a Go module (go.mod) wired through a declared
 #        `entrypoint` (e.g. molecule-gh-identity's env-mutator).
 #
@@ -111,6 +120,14 @@ for e in sorted(Draft202012Validator(schema).iter_errors(plugin), key=lambda e: 
 #    (kind: mcp-server, npx). Both failed on every run; because this gate is
 #    wired advisory in those repos, the error was never surfaced and the
 #    plugin-manifest check was effectively dead for them.
+#
+#    The FRAGMENT and DIGEST-PROVIDER shapes were added after running this
+#    validator against all 31 molecule-ai-plugin-* repos: the daemon/launcher
+#    fix cleared molecule-scheduler but SIX repos still failed — the four
+#    kind: digest-provider plugins (RFC molecule-core#4413) and the two that
+#    deliver via settings-fragment.json (molecule-platform-mcp, image-gen).
+#    Neither shape is a rubber stamp: as with the daemon rule, the named file
+#    must ACTUALLY EXIST, and absolute / `../`-escaping paths do not count.
 SKILL_KINDS = {"", "skill", "agent-skill", "claude-skill"}
 SKILL_CONTENT_PATHS = ["SKILL.md", "hooks", "skills", "rules"]
 
@@ -119,11 +136,23 @@ if not isinstance(contributes, dict):
     contributes = {}
 
 
+def _repo_relative_file(candidate: str) -> bool:
+    """True iff `candidate` names an existing file INSIDE this repo.
+
+    An absolute path or a `../` traversal is not this repo's content — the
+    bound that keeps every file-backed content shape from being a rubber stamp.
+    """
+    if not candidate or os.path.isabs(candidate):
+        return False
+    if ".." in candidate.split(os.sep):
+        return False
+    return os.path.isfile(candidate)
+
+
 def _daemon_entry_files():
     """Repo files a declared daemon actually executes.
 
-    Only repo-relative, non-flag, non-escaping paths count — an absolute path
-    or a `../` traversal is not this repo's content.
+    Only repo-relative, non-flag, non-escaping paths count.
     """
     hits = []
     daemons = contributes.get("daemons")
@@ -140,13 +169,72 @@ def _daemon_entry_files():
         if isinstance(args, list):
             candidates.extend(a for a in args if isinstance(a, str))
         for candidate in candidates:
-            if not candidate or candidate.startswith("-") or os.path.isabs(candidate):
+            if not candidate or candidate.startswith("-"):
                 continue
-            if ".." in candidate.split(os.sep):
-                continue
-            if os.path.isfile(candidate):
+            if _repo_relative_file(candidate):
                 hits.append(candidate)
     return hits
+
+
+def _digest_provider_modules():
+    """Repo modules a declared digest provider actually imports.
+
+    `entrypoint` is `module:attr` (e.g. `prov:get_provider`); the module half is
+    a dotted Python path resolved against the repo root, so `pkg.prov` ->
+    pkg/prov.py. Same bound as the daemon rule: the module file must EXIST, and
+    an absolute or `../`-escaping path is not this repo's content.
+    """
+    hits = []
+    providers = contributes.get("digestProviders")
+    if not isinstance(providers, list):
+        return hits
+    for entry in providers:
+        if not isinstance(entry, dict):
+            continue
+        entrypoint = entry.get("entrypoint")
+        if not isinstance(entrypoint, str) or not entrypoint.strip():
+            continue
+        module = entrypoint.split(":", 1)[0].strip()
+        if not module:
+            continue
+        # A path-ish entrypoint is taken as written so traversal is still
+        # caught; a plain dotted module maps onto the filesystem.
+        if os.sep in module or module.startswith("."):
+            rel = module
+        else:
+            rel = module.replace(".", os.sep)
+        for path in (rel + ".py", os.path.join(rel, "__init__.py")):
+            if _repo_relative_file(path):
+                hits.append(path)
+                break
+    return hits
+
+
+def _settings_fragment_servers():
+    """Named MCP servers a settings-fragment.json actually launches.
+
+    The shipping mcp-server plugin shape in this org: an `mcpServers` OBJECT
+    keyed by server name, each with a command. Unparseable JSON is not a
+    delivery and must not be waved through.
+    """
+    path = "settings-fragment.json"
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path) as fh:
+            fragment = json.load(fh)
+    except (ValueError, OSError):
+        return []
+    if not isinstance(fragment, dict):
+        return []
+    servers = fragment.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    return [
+        name
+        for name, server in servers.items()
+        if isinstance(server, dict) and str(server.get("command", "") or "").strip()
+    ]
 
 
 def _launcher_servers():
@@ -166,10 +254,14 @@ kind = str(plugin.get("kind", "") or "").strip().lower()
 found = [p for p in SKILL_CONTENT_PATHS if os.path.exists(p)]
 daemon_files = _daemon_entry_files()
 launchers = _launcher_servers()
+fragment_servers = _settings_fragment_servers()
+digest_modules = _digest_provider_modules()
 has_go = os.path.isfile("go.mod")
 has_entrypoint = bool(str(plugin.get("entrypoint", "") or "").strip())
 
-if found or daemon_files or launchers or (has_go and has_entrypoint):
+if found or daemon_files or launchers or fragment_servers or digest_modules or (
+    has_go and has_entrypoint
+):
     # Content proven by at least one of the four shapes.
     pass
 elif kind not in SKILL_KINDS:
@@ -190,7 +282,9 @@ elif kind not in SKILL_KINDS:
             f"Plugin (kind: {kind}) ships no recognisable content. Provide one of: "
             f"skill content (SKILL.md, hooks/, skills/, rules/); a contributes.daemons "
             f"entry whose command/args name a file in this repo; a contributes.mcpServers "
-            f"entry with name + command; or go.mod + a declared entrypoint."
+            f"entry with name + command; a settings-fragment.json whose mcpServers has an "
+            f"entry with a command; a contributes.digestProviders entry whose entrypoint "
+            f"names a module in this repo; or go.mod + a declared entrypoint."
         )
 else:
     errors.append("Plugin must contain at least one of: SKILL.md, hooks/, skills/, rules/")
@@ -215,6 +309,16 @@ elif daemon_files:
 elif launchers:
     names = ', '.join(str(s.get('name')) for s in launchers)
     print(f"  Content: mcpServers launcher ({names}) [kind: {kind}]")
+elif fragment_servers:
+    print(
+        f"  Content: settings-fragment launcher ({', '.join(fragment_servers)}) "
+        f"[kind: {kind or 'unset'}]"
+    )
+elif digest_modules:
+    print(
+        f"  Content: digest provider {', '.join(sorted(set(digest_modules)))} "
+        f"[kind: {kind}]"
+    )
 elif kind not in SKILL_KINDS:
     print(f"  Content: go.mod + entrypoint ({plugin.get('entrypoint')}) [kind: {kind}]")
 runtimes = plugin.get("runtimes")

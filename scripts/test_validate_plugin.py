@@ -349,3 +349,150 @@ def test_a_configuration_block_alone_is_not_content(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 1
     assert "no recognisable content" in r.stdout
+
+
+# --- settings-fragment-class plugins -------------------------------------
+#
+# The SHIPPING mcp-server plugin shape in this org is NOT
+# `contributes.mcpServers` in plugin.yaml — it is a `settings-fragment.json`
+# with an `mcpServers` OBJECT, declared as the `settings-fragment` capability
+# in repo-meta.yaml. molecule-ai-plugin-molecule-platform-mcp and
+# molecule-ai-plugin-image-gen both ship exactly this and nothing else.
+
+def _fragment(servers: dict) -> str:
+    import json
+    return json.dumps({"mcpServers": servers})
+
+
+def test_settings_fragment_mcp_servers_is_content(tmp_path):
+    """The real molecule-platform-mcp shape: no kind, no contributes, the
+    server delivered by settings-fragment.json."""
+    _write_plugin_yaml(tmp_path, _base_manifest(runtimes=["claude_code"]))
+    (tmp_path / "settings-fragment.json").write_text(
+        _fragment({"molecule-platform": {"command": "sh", "args": ["-c", "npx -y pkg"]}})
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "settings-fragment" in r.stdout
+
+
+def test_settings_fragment_without_a_command_is_not_content(tmp_path):
+    """A named server with nothing to launch ships nothing."""
+    _write_plugin_yaml(tmp_path, _base_manifest())
+    (tmp_path / "settings-fragment.json").write_text(_fragment({"nothing": {}}))
+    r = _run(tmp_path)
+    assert r.returncode == 1
+
+
+def test_settings_fragment_with_empty_mcp_servers_is_not_content(tmp_path):
+    _write_plugin_yaml(tmp_path, _base_manifest())
+    (tmp_path / "settings-fragment.json").write_text(_fragment({}))
+    r = _run(tmp_path)
+    assert r.returncode == 1
+
+
+def test_malformed_settings_fragment_is_not_content(tmp_path):
+    """Unparseable JSON is not a delivery — it must not be waved through."""
+    _write_plugin_yaml(tmp_path, _base_manifest())
+    (tmp_path / "settings-fragment.json").write_text("{not json")
+    r = _run(tmp_path)
+    assert r.returncode == 1
+
+
+# --- digest-provider-class plugins ---------------------------------------
+#
+# RFC molecule-core#4413 shipped four `kind: digest-provider` plugins whose
+# content is a `contributes.digestProviders[].entrypoint` of the form
+# `module:attr` naming a Python module IN THE REPO (e.g. `prov:get_provider`
+# -> prov.py). Same rule as the daemon shape: the named file must exist.
+
+def test_digest_provider_entrypoint_module_is_content(tmp_path):
+    """The real molecule-ai-plugin-digest-goal shape."""
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={
+                "digestProviders": [
+                    {"provider_id": "goal-state", "entrypoint": "prov:get_provider", "base_tier": 7}
+                ]
+            },
+        ),
+    )
+    (tmp_path / "prov.py").write_text("def get_provider():\n    return None\n")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "digest provider" in r.stdout
+
+
+def test_digest_provider_dotted_module_path_is_content(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={"digestProviders": [{"entrypoint": "pkg.prov:get_provider"}]},
+        ),
+    )
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "prov.py").write_text("")
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_digest_provider_whose_module_is_absent_fails(tmp_path):
+    """Declaring a provider is not shipping one — the module must exist."""
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={"digestProviders": [{"entrypoint": "ghost:get_provider"}]},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+def test_digest_provider_entrypoint_may_not_escape_the_repo(tmp_path):
+    """`../` cannot reach a sibling checkout and call it this repo's content."""
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "prov.py").write_text("")
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    _write_plugin_yaml(
+        plugin,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={"digestProviders": [{"entrypoint": "../outside/prov:get_provider"}]},
+        ),
+    )
+    r = _run(plugin)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+def test_digest_provider_absolute_entrypoint_is_not_content(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={"digestProviders": [{"entrypoint": "/etc/prov:get_provider"}]},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
+
+
+def test_digest_provider_without_an_entrypoint_is_not_content(tmp_path):
+    _write_plugin_yaml(
+        tmp_path,
+        _base_manifest(
+            kind="digest-provider",
+            contributes={"digestProviders": [{"provider_id": "goal-state", "base_tier": 7}]},
+        ),
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "no recognisable content" in r.stdout
