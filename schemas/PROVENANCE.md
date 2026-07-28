@@ -7,16 +7,26 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `fb83b093b742724ae7b3714927522583b2bf983c` (SDK PR #121 merge) |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `dea2155364272605fceab5247c1e71b4ba444b2d` (SDK PR #182 merge — `contributes.state`, contract-version 0.6.0) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #180 merge — schedule accepts `cron` or `cron_expr`) |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #179 merge — empty-declaration `anyOf` constraint) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
-currently SDK PR #180 merge commit
-`2c4457da12b9978b7343da684ffe901d94ee3eac`; every row is fetched from that
+currently SDK PR #182 merge commit
+`dea2155364272605fceab5247c1e71b4ba444b2d`; every row is fetched from that
 same immutable commit even when the table records an older, last
 contract-changing commit for the individual file.
+
+> **`plugin-state` is NOT vendored here, deliberately.** SDK PR #182 also added
+> `contracts/plugin-state/`, but that is a *delivery* contract — reserved daemon
+> env vars, the per-plugin directory template and the degradation policy — whose
+> consumers are the controlplane provisioner and the workspace runtime. Nothing
+> in molecule-ci reads it: the validators here validate published *artifacts*
+> (`plugin.yaml`), and the artifact-side surface of #182 is entirely
+> `contributes.state` inside `plugin-manifest.schema.json`, which IS vendored.
+> Vendoring an unused contract would add a drift-gate row with no consumer to
+> keep it honest.
 
 Note the sync gate enforces THREE things, not two: vendored == source pin,
 AND source pin == molecule-ai-sdk `main`. So a merge to the SDK reds this repo
