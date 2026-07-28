@@ -72,8 +72,32 @@
       "type": "array",
       "description": "Declared plugins as source-contract strings the workspace-server gitea resolver understands: `gitea://<owner>/<repo>[/<subpath>]#<ref>`. Installed dynamically post-boot by the reconcile (RFC#2843 #32), NOT via the provisioning channel.",
       "items": {
-        "type": "string",
-        "description": "A plugin source-contract string."
+        "description": "A plugin entry. EITHER a bare name / source-contract string (optionally `!`/`-` prefixed to opt a default OUT), OR an object carrying per-install `config` for that plugin. The object form is what makes `plugins[].config` expressible at all — per-install settings are delivered to `plugin-settings/<install-name>.json` and read back by that plugin alone, so a block like `config.schedules` MUST hang off its own plugin's entry to be read. Before this, both template schemas accepted strings ONLY, which made the settings-delivery contract (sdk#176) unexpressible in the very templates that are supposed to author it.",
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "A plugin source-contract string."
+          },
+          {
+            "type": "object",
+            "description": "Source-plus-config form.",
+            "required": [
+              "source"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "source": {
+                "type": "string",
+                "description": "Plugin name or source-contract string (e.g. `gitea://owner/repo#ref`)."
+              },
+              "config": {
+                "type": "object",
+                "description": "Per-install configuration for THIS plugin, delivered to `plugin-settings/<install-name>.json`. Free-form by design: each plugin declares its own keys via `contributes.configuration`.",
+                "additionalProperties": true
+              }
+            }
+          }
+        ]
       }
     },
     "skills": {
