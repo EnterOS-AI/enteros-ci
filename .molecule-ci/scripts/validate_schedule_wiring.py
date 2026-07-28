@@ -222,15 +222,34 @@ def check_node(
             )
         )
 
-    if (has_legacy or has_plugin_scheds) and not declares_scheduler(plugins):
+    # E1 applies to the NEW shape ONLY. This is the single most important
+    # distinction in this file, and the first cut got it backwards.
+    #
+    # For LEGACY node-level `schedules:`, core auto-attaches the daemon: when
+    # renderTemplateSchedulesYAML renders any entry, org_import.go calls
+    # ensureSchedulerPluginDeclared (and schedules.go Create does the same on
+    # the API path). So a legacy template that never names the scheduler is
+    # CORRECT, and flagging it would have failed all three real fleet repos —
+    # 12 findings, every one a false positive. Verified in
+    # molecule-core/workspace-server/internal/handlers/org_import.go:569.
+    #
+    # For `plugins[].config.schedules` there is NO such auto-attach, and M3
+    # DELETES renderTemplateSchedulesYAML — which is precisely the trigger the
+    # legacy auto-declare hangs off. So the moment a repo moves to the new
+    # shape, the safety net disappears and the scheduler must be declared
+    # explicitly or the whole grid goes silent. That is the flag-day landmine
+    # this gate exists to catch, and it is only reachable in the new shape.
+    if has_plugin_scheds and not declares_scheduler(plugins):
         out.append(
             Finding(
                 "E1",
                 path,
                 node_name,
-                "declares schedules but installs NO scheduler plugin. The grid is "
-                "materialized by the kind:trigger scheduler; with none installed "
-                "nothing fires and nothing errors. Add the scheduler to `plugins:`.",
+                "uses `plugins[].config.schedules` but installs NO scheduler plugin. "
+                "Unlike the legacy node-level `schedules:` block — which core "
+                "auto-attaches the daemon for via ensureSchedulerPluginDeclared — the "
+                "new shape has no auto-attach, and M3 deletes the render path that "
+                "triggers it. Declare the scheduler in `plugins:` or nothing fires.",
             )
         )
 
@@ -276,11 +295,24 @@ def check_document(doc: Any, path: str, out: list[Finding],
     nodes: list[tuple[str, dict]] = []
 
     def collect(container: Any) -> None:
+        """Walk the node tree, INCLUDING `children:`.
+
+        Org templates nest. reno-stars declares exactly ONE top-level
+        workspace ("Business Intelligence") and hangs the five agents that
+        actually carry schedules off its `children:`. A flat collector sees
+        the root, finds no schedules on it, and reports the whole repo clean —
+        a FALSE NEGATIVE on the one production template whose schedules matter
+        most. Found by running this gate against the real fleet rather than
+        against fixtures; every test here used a flat shape and all 20 passed
+        while the gate was blind to reno-stars entirely.
+        """
         if not isinstance(container, list):
             return
         for w in container:
-            if isinstance(w, dict):
-                nodes.append((str(w.get("name", "<unnamed>")), w))
+            if not isinstance(w, dict):
+                continue
+            nodes.append((str(w.get("name", "<unnamed>")), w))
+            collect(w.get("children"))
 
     collect(doc.get("workspaces"))
     teams = doc.get("teams")
