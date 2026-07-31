@@ -1,0 +1,79 @@
+name: crlf-guard-selftest
+
+# Direct, read-only proof that the canonical CRLF guard actually ran and that its
+# REJECT arm still bites. No workflow_call is used because Gitea 1.26.4 can report
+# cross-repository consumers green with zero steps.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/check_crlf_in_index.py"
+      - "scripts/test_check_crlf_in_index.py"
+      - "templates/ci-crlf-guard.yml"
+      - ".gitea/workflows/crlf-guard-selftest.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/check_crlf_in_index.py"
+      - "scripts/test_check_crlf_in_index.py"
+      - "templates/ci-crlf-guard.yml"
+      - ".gitea/workflows/crlf-guard-selftest.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  crlf-guard:
+    name: crlf-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: Unit tests (accept AND reject arms)
+        run: python3 -m unittest scripts.test_check_crlf_in_index -v
+
+      - name: Execute canonical guard on this repository
+        run: |
+          set -o pipefail
+          python3 scripts/check_crlf_in_index.py "$GITHUB_WORKSPACE" \
+            | tee /tmp/crlf-guard.log
+
+      - name: Assert execution sentinel
+        run: |
+          grep -qxF 'crlf-guard:sentinel:executed' /tmp/crlf-guard.log
+
+      - name: Prove the guard REJECTS a CRLF blob
+        # Without this, a guard that silently degraded to `exit 0` would still
+        # look green above. Build a throwaway repo containing a CRLF blob and
+        # require a non-zero exit; then require the clean twin to pass, so the
+        # proof is a discriminating test rather than a blanket failure.
+        run: |
+          set -eu
+          tmp="$(mktemp -d)"
+          for variant in dirty clean; do
+            repo="$tmp/$variant"
+            mkdir -p "$repo"
+            git init -q -b main "$repo"
+            git -C "$repo" config user.email t@example.invalid
+            git -C "$repo" config user.name t
+            git -C "$repo" config core.autocrlf false
+            if [ "$variant" = dirty ]; then
+              printf 'x = 1\r\ny = 2\r\n' > "$repo/sample.py"
+            else
+              printf 'x = 1\ny = 2\n' > "$repo/sample.py"
+            fi
+            git -C "$repo" add sample.py
+            git -C "$repo" commit -qm "sample"
+          done
+
+          if python3 scripts/check_crlf_in_index.py "$tmp/dirty"; then
+            echo "::error::guard ACCEPTED a CRLF blob — its reject arm is dead"
+            exit 1
+          fi
+          python3 scripts/check_crlf_in_index.py "$tmp/clean" >/dev/null
+          echo "reject arm verified: CRLF rejected, LF accepted"

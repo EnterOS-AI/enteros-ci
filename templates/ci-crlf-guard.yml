@@ -1,0 +1,77 @@
+# Canonical CRLF-in-index gate. Install this into a consuming repository's
+# .gitea/workflows/ and keep MOLECULE_CI_REF pinned, exactly like
+# ci-secret-scan.yml.
+#
+# WHAT IT ENFORCES: no tracked blob may contain CRLF in the INDEX. Byte-exact
+# drift gates (plugin scaffold re-render, vendored channel_sdk.py `cmp`, atlas.sum
+# hashing) compare COMMITTED BYTES, so one CRLF commit from a machine with
+# core.autocrlf=true breaks them in every consumer — or, worse, gets "fixed"
+# downstream by committing CRLF there too.
+#
+# .gitattributes is the per-repo fix, but it only covers paths someone remembered
+# to pin, and a HALF-pinned byte comparison is worse than none (molecule-ai-sdk
+# pinned gen/** but not the file compared against it, so its contract test failed
+# deterministically on a clean checkout). This gate needs no such list.
+#
+# INTENTIONAL CRLF is opted out in .gitattributes (`eol=crlf` / `-text`), so the
+# exemption lives in the same file that governs the bytes and stays reviewable.
+
+name: CRLF guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+
+jobs:
+  crlf-guard:
+    name: No CRLF in tracked blobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      # Pin to an immutable molecule-ci commit that CONTAINS
+      # scripts/check_crlf_in_index.py. Bump this when adopting; the guard step
+      # below fails loudly rather than silently skipping if the pinned ref
+      # predates the script.
+      MOLECULE_CI_REF: 38121bd4c7c0f3fe059c624274867d1da1fbe260
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Fetch immutable molecule-ci guard
+        run: |
+          set -eu
+          test -n "${RUNNER_TEMP:-}"
+          CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
+          mkdir "$CI_ROOT"
+          git init -q "$CI_ROOT"
+          git -C "$CI_ROOT" remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF"
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
+          # Fail CLOSED if the pinned ref predates the guard: a missing script
+          # must never look like a clean repo.
+          if [ ! -f "$CI_ROOT/scripts/check_crlf_in_index.py" ]; then
+            echo "::error::pinned molecule-ci ref $MOLECULE_CI_REF has no scripts/check_crlf_in_index.py — bump MOLECULE_CI_REF."
+            exit 1
+          fi
+
+      - name: Assert no tracked blob carries CRLF
+        run: |
+          set -o pipefail
+          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+          python3 "$RUNNER_TEMP/molecule-ci-ssot/scripts/check_crlf_in_index.py" \
+            "$GITHUB_WORKSPACE" | tee /tmp/crlf-guard.log
+
+      - name: Assert execution sentinel
+        # Gitea can report a job green with zero steps executed, so "did not
+        # fail" is not evidence the gate ran. Require its proof-of-execution line.
+        if: always()
+        run: |
+          grep -qxF 'crlf-guard:sentinel:executed' /tmp/crlf-guard.log
