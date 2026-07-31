@@ -45,7 +45,7 @@ jobs:
 
       - name: Assert execution sentinel
         run: |
-          grep -q "crlf-guard: executed" /tmp/crlf-guard.log
+          grep -qxF 'crlf-guard:sentinel:executed' /tmp/crlf-guard.log
 
       - name: Prove the guard REJECTS a CRLF blob
         # Without this, a guard that silently degraded to `exit 0` would still

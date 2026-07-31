@@ -82,9 +82,48 @@ class CrlfGuardTest(unittest.TestCase):
         self.assertEqual(guard.find_offenders(str(self.repo)), ["a.py", "b.py"])
 
     # ---- declared intent: must PASS ---------------------------------------
-    def test_declared_eol_crlf_is_exempt(self) -> None:
+    def test_eol_crlf_declaration_renormalizes_the_blob_to_lf(self) -> None:
+        """`eol=crlf` is a TRAP, and this pins why it is not an opt-out.
+
+        It implies `text`, so git's clean filter rewrites the blob to LF on add.
+        The guard then sees a clean file — not because the file was exempted,
+        but because the CRLF bytes it was meant to declare were destroyed. An
+        earlier version of this suite asserted "exempt" here and passed for
+        exactly that wrong reason, hiding that the exemption never executed.
+        """
         commit(self.repo, ".gitattributes", b"win.bat eol=crlf\n")
         commit(self.repo, "win.bat", b"@echo off\r\n")
+        blob = subprocess.run(
+            ["git", "-C", str(self.repo), "cat-file", "blob", ":win.bat"],
+            capture_output=True, check=True,
+        ).stdout
+        self.assertNotIn(b"\r\n", blob, "eol=crlf should have renormalized to LF")
+        self.assertEqual(guard.find_offenders(str(self.repo)), [])
+
+    def test_minus_text_is_the_only_exemption(self) -> None:
+        """`-text` must be load-bearing, and nothing else may be.
+
+        Guards the defect a reviewer found: `eol=crlf` and `binary` were listed
+        as exemptions but were dead code, because `git ls-files --eol` renders
+        them as `attr/text eol=crlf` / `attr/-text` and the parser kept only the
+        first whitespace token.
+        """
+        self.assertEqual(guard.EXEMPTING_ATTRS, ("-text",))
+        self.assertTrue(guard.is_exempt("-text"))
+        self.assertTrue(guard.is_exempt("text -text"))
+        self.assertFalse(guard.is_exempt("text eol=crlf"))
+        self.assertFalse(guard.is_exempt("text=auto eol=lf"))
+        # whole-token matching: a substring test would wrongly exempt these
+        self.assertFalse(guard.is_exempt("-textconv"))
+        self.assertFalse(guard.is_exempt("filter=my-text-filter"))
+
+    def test_multi_attribute_field_is_parsed_whole(self) -> None:
+        """`attr/` may contain spaces; the parser must keep the whole field."""
+        commit(self.repo, ".gitattributes", b"keep.bin -text -diff\n")
+        commit(self.repo, "keep.bin", b"a\r\nb\r\n")
+        rows = {path: attrs for _eol, attrs, path in
+                guard.git_ls_files_eol(str(self.repo))}
+        self.assertIn("-text", rows["keep.bin"].split())
         self.assertEqual(guard.find_offenders(str(self.repo)), [])
 
     def test_declared_minus_text_is_exempt(self) -> None:
@@ -122,6 +161,15 @@ class CrlfGuardTest(unittest.TestCase):
         # A failing run must NOT emit the success sentinel, or a workflow that
         # greps for it would treat a red run as proof of a green one.
         self.assertNotIn(guard.SENTINEL, proc.stdout)
+
+    def test_subdirectory_argument_still_scans_the_whole_repo(self) -> None:
+        """`git ls-files` is path-scoped, so running from a subdirectory must
+        not report a contaminated repo clean while printing the sentinel."""
+        commit(self.repo, "bad.py", b"x\r\n")
+        sub = self.repo / "sub"
+        sub.mkdir()
+        commit(self.repo, "sub/ok.py", b"ok\n")
+        self.assertEqual(guard.find_offenders(str(sub)), ["bad.py"])
 
     def test_non_repo_fails_closed(self) -> None:
         """An unreadable index must never be reported as clean."""

@@ -37,20 +37,16 @@ jobs:
       # scripts/check_crlf_in_index.py. Bump this when adopting; the guard step
       # below fails loudly rather than silently skipping if the pinned ref
       # predates the script.
-      MOLECULE_CI_REF: REPLACE_WITH_MOLECULE_CI_COMMIT_SHA
+      MOLECULE_CI_REF: 38121bd4c7c0f3fe059c624274867d1da1fbe260
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
 
       - name: Fetch immutable molecule-ci guard
         run: |
           set -eu
           test -n "${RUNNER_TEMP:-}"
-          case "$MOLECULE_CI_REF" in
-            REPLACE_WITH_*)
-              echo "::error::MOLECULE_CI_REF is still the placeholder. Pin it to a molecule-ci commit containing scripts/check_crlf_in_index.py."
-              exit 1
-              ;;
-          esac
           CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
           mkdir "$CI_ROOT"
           git init -q "$CI_ROOT"
@@ -69,11 +65,13 @@ jobs:
       - name: Assert no tracked blob carries CRLF
         run: |
           set -o pipefail
+          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
           python3 "$RUNNER_TEMP/molecule-ci-ssot/scripts/check_crlf_in_index.py" \
             "$GITHUB_WORKSPACE" | tee /tmp/crlf-guard.log
 
       - name: Assert execution sentinel
         # Gitea can report a job green with zero steps executed, so "did not
         # fail" is not evidence the gate ran. Require its proof-of-execution line.
+        if: always()
         run: |
-          grep -q "crlf-guard: executed" /tmp/crlf-guard.log
+          grep -qxF 'crlf-guard:sentinel:executed' /tmp/crlf-guard.log
