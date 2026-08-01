@@ -134,25 +134,31 @@ counts:
 python3 .molecule-ci-canonical/.molecule-ci/scripts/validate_schedule_wiring.py \
   --root . \
   --expect-parsed-files 16 \
-  --expect-schedule-blocks 9
+  --expect-schedule-blocks 9 \
+  --expect-schedule-entries 9
 ```
 
 Default discovery excludes `.git`, `node_modules`, `.molecule-ci-canonical`,
 and `.molecule-ci-ssot`, so a validator checkout nested in the consumer does
 not change its file count. The example is the current molecule-dev contract:
-16 consumer-owned YAML files (including `channel-dependency-lock.yaml`) and 9
-schedule blocks. Change either exact number in the same reviewed consumer diff
-that intentionally changes that inventory. `--exclude-dir NAME` adds another
-generated/tool directory exclusion. Passing YAML paths positionally is the
-explicit allowlist form; duplicate paths collapse, and every target must be a
-regular, bounded, non-symlink file inside `--root`. Unknown local `!`
+16 consumer-owned YAML files (including `channel-dependency-lock.yaml`), 9
+schedule blocks, and 9 mapping entries actually checked. A block expectation
+requires the positive exact entry expectation so `schedules: []` cannot make
+the gate vacuously green. Change any exact number in the same reviewed
+consumer diff that intentionally changes that inventory. `--exclude-dir NAME`
+adds another generated/tool directory exclusion. Passing YAML paths
+positionally is the explicit allowlist form; duplicate paths collapse, and
+every target must be a regular, bounded, non-symlink file inside `--root`.
+Unknown local `!`
 composition tags are loaded as safe data, while duplicate keys, malformed YAML,
 non-string mapping keys, unsafe reads, excessive aliases/depth/nodes, and cyclic
 workspace aliases fail closed with E0. Conservative scan-wide limits also bound
 discovery entries, target files, YAML bytes/documents/nodes, workspace nodes,
-and defaults-to-workspace plugin composition. Findings never echo source lines,
-and control characters in paths or other rendered fields are escaped so one
-finding cannot forge additional CI log commands.
+defaults-to-workspace plugin composition, schedule visits, finding count, and
+finding detail bytes. Reusing one aliased schedule list across blocks fails
+closed. Findings never echo source lines; attacker-controlled fields are
+truncated before retention, and control characters are escaped so one finding
+cannot forge additional CI log commands.
 
 ## Composite actions
 

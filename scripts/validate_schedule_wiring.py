@@ -23,7 +23,8 @@ gate that only understands one location would go green through the migration.
 WHAT IT REFUSES
 ---------------
 E0  A target file that this gate could not read or parse, or an explicit
-    expected file/schedule-block count that was not reached. Molecule
+    expected file/schedule-block/schedule-entry count that was not reached.
+    Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
     are loaded safely as their underlying scalar/list/mapping so they cannot
     make the whole document disappear from this gate. Duplicate or non-string
@@ -102,6 +103,13 @@ MAX_TOTAL_YAML_DOCUMENTS = 2_048
 MAX_TOTAL_YAML_NODES = 500_000
 MAX_TOTAL_WORKSPACE_NODES = 50_000
 MAX_PLUGIN_COMPOSITION_WORK = 1_000_000
+MAX_TOTAL_SCHEDULE_VISITS = 100_000
+MAX_TOTAL_FINDINGS = 4_096
+MAX_TOTAL_FINDING_DETAIL_BYTES = 4 * 1024 * 1024
+MAX_FINDING_FIELD_CHARS = 512
+MAX_FINDING_DETAIL_CHARS = 2_048
+MAX_PLUGIN_SOURCE_CHARS = 4_096
+MAX_SCHEDULE_FIELD_CHARS = 4_096
 
 # Tool checkouts live inside consumer worktrees but are not consumer input.
 # Counting their YAML makes exact anti-vacuity assertions depend on whichever
@@ -154,6 +162,10 @@ class ScanBudget:
         "yaml_nodes",
         "workspace_nodes",
         "plugin_composition_work",
+        "schedule_visits",
+        "findings",
+        "finding_detail_bytes",
+        "schedule_containers",
         "exhausted",
     )
 
@@ -163,6 +175,10 @@ class ScanBudget:
         self.yaml_nodes = 0
         self.workspace_nodes = 0
         self.plugin_composition_work = 0
+        self.schedule_visits = 0
+        self.findings = 0
+        self.finding_detail_bytes = 0
+        self.schedule_containers: dict[int, int] = {}
         self.exhausted = False
 
     def consume_yaml_bytes(self, amount: int) -> None:
@@ -199,6 +215,33 @@ class ScanBudget:
             self.exhausted = True
             raise ScanInputError("scan exceeds the plugin composition work limit")
         self.plugin_composition_work += amount
+
+    def consume_schedule_block(self, schedules: list[Any], owner_id: int) -> None:
+        object_id = id(schedules)
+        previous_owner = self.schedule_containers.get(object_id)
+        if previous_owner is not None and previous_owner != owner_id:
+            self.exhausted = True
+            raise ScanInputError(
+                "target contains a repeated YAML alias across schedule blocks"
+            )
+        self.schedule_containers[object_id] = owner_id
+
+    def consume_schedule_visit(self) -> None:
+        if self.schedule_visits >= MAX_TOTAL_SCHEDULE_VISITS:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the aggregate schedule visit limit")
+        self.schedule_visits += 1
+
+    def consume_finding(self, finding: Finding) -> None:
+        if self.findings >= MAX_TOTAL_FINDINGS:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the aggregate finding limit")
+        detail_bytes = len(finding.detail.encode("utf-8"))
+        if detail_bytes > MAX_TOTAL_FINDING_DETAIL_BYTES - self.finding_detail_bytes:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the aggregate finding detail byte limit")
+        self.findings += 1
+        self.finding_detail_bytes += detail_bytes
 
 
 class PermissiveLoader(yaml.SafeLoader):
@@ -340,7 +383,10 @@ class Finding:
     __slots__ = ("code", "path", "node", "detail")
 
     def __init__(self, code: str, path: str, node: str, detail: str) -> None:
-        self.code, self.path, self.node, self.detail = code, path, node, detail
+        self.code = code
+        self.path = _truncate_finding_text(path, MAX_FINDING_FIELD_CHARS)
+        self.node = _truncate_finding_text(node, MAX_FINDING_FIELD_CHARS)
+        self.detail = _truncate_finding_text(detail, MAX_FINDING_DETAIL_CHARS)
 
     def __str__(self) -> str:
         path = _sanitize_log_text(self.path)
@@ -348,6 +394,16 @@ class Finding:
         detail = _sanitize_log_text(self.detail)
         where = path + (f" :: node {node!r}" if node else "")
         return f"::error::[{self.code}] {where} — {detail}"
+
+
+def _truncate_finding_text(value: object, maximum: int) -> str:
+    """Bound attacker-controlled fields before they are retained per finding."""
+
+    rendered = str(value)
+    if len(rendered) <= maximum:
+        return rendered
+    suffix = "...<truncated>"
+    return rendered[: maximum - len(suffix)] + suffix
 
 
 def _sanitize_log_text(value: object) -> str:
@@ -376,13 +432,16 @@ def plugin_source(entry: Any) -> str:
     is neither contributes no source rather than raising — a malformed entry
     is the schema's problem, not this gate's.
     """
+    source = ""
     if isinstance(entry, str):
-        return entry
+        source = entry
     if isinstance(entry, dict):
         src = entry.get("source")
         if isinstance(src, str):
-            return src
-    return ""
+            source = src
+    if len(source) > MAX_PLUGIN_SOURCE_CHARS:
+        raise ScanInputError("target exceeds the plugin source length limit")
+    return source
 
 
 def is_scheduler(source: str) -> bool:
@@ -400,27 +459,81 @@ def declares_scheduler(plugins: Any) -> bool:
     return any(is_scheduler(plugin_source(p)) for p in plugins)
 
 
+def _append_finding(
+    out: list[Finding],
+    finding: Finding,
+    budget: ScanBudget | None,
+) -> None:
+    if budget is not None:
+        budget.consume_finding(finding)
+    out.append(finding)
+
+
 def check_schedule_entries(
-    schedules: Any, path: str, node: str, origin: str, out: list[Finding]
+    schedules: Any,
+    path: str,
+    node: str,
+    origin: str,
+    out: list[Finding],
+    budget: ScanBudget | None = None,
+    owner_id: int | None = None,
 ) -> int:
     if not isinstance(schedules, list):
+        _append_finding(
+            out,
+            Finding(
+                "E0",
+                path,
+                node,
+                f"schedule block ({origin}) must be a list",
+            ),
+            budget,
+        )
         return 0
+    if budget is not None:
+        budget.consume_schedule_block(
+            schedules,
+            id(schedules) if owner_id is None else owner_id,
+        )
     seen_entries: set[int] = set()
+    checked_entries = 0
     for sched in schedules:
+        if budget is not None:
+            budget.consume_schedule_visit()
         if not isinstance(sched, dict):
+            _append_finding(
+                out,
+                Finding(
+                    "E0",
+                    path,
+                    node,
+                    f"schedule block ({origin}) contains a non-mapping entry",
+                ),
+                budget,
+            )
             continue
+        checked_entries += 1
         object_id = id(sched)
         if object_id in seen_entries:
             raise ScanInputError(
                 "target contains a cyclic or repeated YAML alias in schedules"
             )
         seen_entries.add(object_id)
-        name = str(sched.get("name", "<unnamed>"))
+        raw_name = sched.get("name")
+        if isinstance(raw_name, str):
+            if len(raw_name) > MAX_SCHEDULE_FIELD_CHARS:
+                raise ScanInputError("target exceeds the schedule field length limit")
+            name = raw_name
+        else:
+            name = "<unnamed>"
         cron = sched.get("cron_expr")
-        if isinstance(cron, str) and cron.strip():
+        if isinstance(cron, str):
+            if len(cron) > MAX_SCHEDULE_FIELD_CHARS:
+                raise ScanInputError("target exceeds the schedule field length limit")
             fields = cron.split()
-            if len(fields) != 5:
-                out.append(
+            if fields and len(fields) != 5:
+                _append_finding(
+                    out,
                     Finding(
                         "E4",
                         path,
@@ -428,19 +541,22 @@ def check_schedule_entries(
                         f"schedule {name!r} ({origin}) has a {len(fields)}-field cron_expr "
                         f"{cron!r}; this system takes 5-field cron (min hour dom mon dow). "
                         f"A 6-field seconds-first expression parses fine and never matches.",
-                    )
+                    ),
+                    budget,
                 )
         if not (sched.get("prompt") or sched.get("prompt_file")):
-            out.append(
+            _append_finding(
+                out,
                 Finding(
                     "E5",
                     path,
                     node,
                     f"schedule {name!r} ({origin}) declares neither `prompt` nor "
                     f"`prompt_file`; it would tick forever and run nothing.",
-                )
+                ),
+                budget,
             )
-    return len(schedules)
+    return checked_entries
 
 
 def effective_plugins(
@@ -501,7 +617,7 @@ def check_node(
     legacy = node_obj.get("schedules")
     plugins = effective_plugins(node_obj, inherited_plugins or [], budget)
 
-    plugin_scheds: list[tuple[str, Any]] = []
+    plugin_scheds: list[tuple[str, Any, int]] = []
     seen_plugin_objects: set[int] = set()
     if isinstance(plugins, list):
         for p in plugins:
@@ -515,15 +631,16 @@ def check_node(
             seen_plugin_objects.add(object_id)
             cfg = p.get("config")
             if isinstance(cfg, dict) and "schedules" in cfg:
-                plugin_scheds.append((plugin_source(p), cfg["schedules"]))
+                plugin_scheds.append((plugin_source(p), cfg["schedules"], object_id))
 
-    has_legacy = isinstance(legacy, list) and len(legacy) > 0
+    has_legacy = "schedules" in node_obj
     has_plugin_scheds = len(plugin_scheds) > 0
-    schedule_blocks = len(plugin_scheds) + (1 if "schedules" in node_obj else 0)
+    schedule_blocks = len(plugin_scheds) + (1 if has_legacy else 0)
     schedule_entries = 0
 
     if has_legacy and has_plugin_scheds:
-        out.append(
+        _append_finding(
+            out,
             Finding(
                 "E3",
                 path,
@@ -531,7 +648,8 @@ def check_node(
                 "declares BOTH a node-level `schedules:` block and "
                 "`plugins[].config.schedules`. Ownership is ambiguous — the M3 move "
                 "has no alias window, so pick ONE location.",
-            )
+            ),
+            budget,
         )
 
     # THERE IS NO E1. Deliberately, after chasing it to the bottom.
@@ -554,9 +672,10 @@ def check_node(
     # noise that trains people to skip the gate. E2-E5 below are the checks
     # that survive scrutiny.
 
-    for src, scheds in plugin_scheds:
+    for src, scheds, owner_id in plugin_scheds:
         if not is_scheduler(src):
-            out.append(
+            _append_finding(
+                out,
                 Finding(
                     "E2",
                     path,
@@ -565,7 +684,8 @@ def check_node(
                     f"is delivered only to THAT plugin's settings file. A non-scheduler "
                     f"plugin never reads it — and a missing settings key is a clean "
                     f"no-op, so this fails silently.",
-                )
+                ),
+                budget,
             )
         schedule_entries += check_schedule_entries(
             scheds,
@@ -573,6 +693,8 @@ def check_node(
             node_name,
             f"via plugin {src}",
             out,
+            budget,
+            owner_id,
         )
 
     if has_legacy:
@@ -582,6 +704,8 @@ def check_node(
             node_name,
             "node-level",
             out,
+            budget,
+            id(node_obj),
         )
     return schedule_blocks, schedule_entries
 
@@ -974,7 +1098,7 @@ def discover_yaml_targets(root: Path, excluded_dirs: set[str]) -> list[Path]:
             discovered_entries += 1
             if discovered_entries > MAX_DISCOVERY_ENTRIES:
                 raise ScanInputError("scan exceeds the discovery entry limit")
-            if not Path(name).match("*.y*ml"):
+            if Path(name).suffix not in {".yaml", ".yml"}:
                 continue
             if len(targets) >= MAX_TARGET_FILES:
                 raise ScanInputError("scan exceeds the aggregate target file limit")
@@ -1022,7 +1146,20 @@ def main() -> int:
             "blocks are reached."
         ),
     )
+    ap.add_argument(
+        "--expect-schedule-entries",
+        type=_positive_int,
+        help=(
+            "Fail unless exactly this positive number of mapping schedule "
+            "entries are checked. Required with --expect-schedule-blocks."
+        ),
+    )
     args = ap.parse_args()
+    if args.expect_schedule_blocks is not None and args.expect_schedule_entries is None:
+        ap.error(
+            "--expect-schedule-blocks requires --expect-schedule-entries "
+            "so an empty block cannot satisfy the non-vacuity gate"
+        )
 
     root = Path(args.root)
     discovery_error: ScanInputError | None = None
@@ -1066,6 +1203,19 @@ def main() -> int:
                 "",
                 f"expected {args.expect_schedule_blocks} schedule block(s), "
                 f"reached {stats.schedule_blocks}",
+            )
+        )
+    if (
+        args.expect_schedule_entries is not None
+        and stats.schedule_entries != args.expect_schedule_entries
+    ):
+        findings.append(
+            Finding(
+                "E0",
+                "<scan>",
+                "",
+                f"expected {args.expect_schedule_entries} schedule entry/entries, "
+                f"reached {stats.schedule_entries}",
             )
         )
     if not findings:

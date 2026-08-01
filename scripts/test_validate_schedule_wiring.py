@@ -48,10 +48,11 @@ def codes(findings) -> list[str]:
 # --- E1: schedules with no scheduler installed (the 35-of-37 failure) --------
 
 
-
-
 def test_E2_config_schedules_on_unrelated_plugin_is_refused(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: Marketing
             plugins:
@@ -62,12 +63,17 @@ def test_E2_config_schedules_on_unrelated_plugin_is_refused(tmp_path):
                     - name: SEO Builder
                       cron_expr: "17 6 * * *"
                       prompt: run seo
-    """))
+    """,
+        )
+    )
     assert "E2" in codes(f)
 
 
 def test_E2_config_schedules_on_the_scheduler_is_fine(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: Marketing
             plugins:
@@ -77,14 +83,20 @@ def test_E2_config_schedules_on_the_scheduler_is_fine(tmp_path):
                     - name: SEO Builder
                       cron_expr: "17 6 * * *"
                       prompt: run seo
-    """))
+    """,
+        )
+    )
     assert codes(f) == []
 
 
 # --- E3: both locations at once (the flag-day hazard) ------------------------
 
+
 def test_E3_both_locations_is_refused(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: Coordinator
             plugins:
@@ -98,14 +110,20 @@ def test_E3_both_locations_is_refused(tmp_path):
               - name: Old
                 cron_expr: "0 * * * *"
                 prompt: old
-    """))
+    """,
+        )
+    )
     assert "E3" in codes(f)
 
 
 # --- E4: cron arity ----------------------------------------------------------
 
+
 def test_E4_six_field_cron_is_refused(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: C
             plugins: [{SCHED}]
@@ -113,12 +131,17 @@ def test_E4_six_field_cron_is_refused(tmp_path):
               - name: Secondsy
                 cron_expr: "0 */30 * * * *"
                 prompt: x
-    """))
+    """,
+        )
+    )
     assert "E4" in codes(f)
 
 
 def test_E4_five_field_cron_passes(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: C
             plugins: [{SCHED}]
@@ -126,26 +149,37 @@ def test_E4_five_field_cron_passes(tmp_path):
               - name: Fine
                 cron_expr: "*/30 * * * *"
                 prompt: x
-    """))
+    """,
+        )
+    )
     assert "E4" not in codes(f)
 
 
 # --- E5: no body -------------------------------------------------------------
 
+
 def test_E5_schedule_without_prompt_or_prompt_file_is_refused(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: C
             plugins: [{SCHED}]
             schedules:
               - name: Empty
                 cron_expr: "0 * * * *"
-    """))
+    """,
+        )
+    )
     assert "E5" in codes(f)
 
 
 def test_E5_prompt_file_satisfies_the_body_requirement(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: C
             plugins: [{SCHED}]
@@ -153,19 +187,27 @@ def test_E5_prompt_file_satisfies_the_body_requirement(tmp_path):
               - name: Filed
                 cron_expr: "0 * * * *"
                 prompt_file: /configs/skills/x.md
-    """))
+    """,
+        )
+    )
     assert "E5" not in codes(f)
 
 
 # --- inertness: must not fire on templates that declare no schedules ---------
 
+
 def test_a_template_with_no_schedules_is_silent(tmp_path):
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - name: Plain
             plugins:
               - gitea://molecule-ai/molecule-ai-plugin-seo
-    """))
+    """,
+        )
+    )
     assert f == []
 
 
@@ -185,7 +227,10 @@ def test_custom_composition_tags_do_not_skip_the_rest_of_a_document(
     tmp_path: Path,
     tagged_entry: str,
 ) -> None:
-    findings = scan(write(tmp_path, f"""
+    findings = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - {tagged_entry}
           - name: Scheduled
@@ -196,15 +241,15 @@ def test_custom_composition_tags_do_not_skip_the_rest_of_a_document(
                     - name: Must be reached
                       cron_expr: "0 * * * *"
                       prompt: run
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E2"]
 
 
 def test_python_object_tags_remain_rejected_by_safe_loader(tmp_path: Path) -> None:
-    findings = scan(
-        write(tmp_path, "value: !!python/object/new:builtins.str []\n")
-    )
+    findings = scan(write(tmp_path, "value: !!python/object/new:builtins.str []\n"))
 
     assert codes(findings) == ["E0"]
 
@@ -212,7 +257,9 @@ def test_python_object_tags_remain_rejected_by_safe_loader(tmp_path: Path) -> No
 def test_scan_stats_prove_custom_tagged_files_and_schedule_blocks_were_reached(
     tmp_path: Path,
 ) -> None:
-    paths = write(tmp_path, f"""
+    paths = write(
+        tmp_path,
+        f"""
         workspaces:
           - !include ./agent/workspace.yaml
           - name: Scheduled
@@ -223,7 +270,8 @@ def test_scan_stats_prove_custom_tagged_files_and_schedule_blocks_were_reached(
                     - name: Counted
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)
+    """,
+    )
 
     findings, stats = scan_with_stats(paths)
 
@@ -252,6 +300,8 @@ def test_main_rejects_vacuous_expected_scan_counts(
             "2",
             "--expect-schedule-blocks",
             "9",
+            "--expect-schedule-entries",
+            "9",
             str(path),
         ],
     )
@@ -260,12 +310,65 @@ def test_main_rejects_vacuous_expected_scan_counts(
     captured = capsys.readouterr()
     assert "expected 2 parsed file(s), reached 1" in captured.err
     assert "expected 9 schedule block(s), reached 0" in captured.err
+    assert "expected 9 schedule entry/entries, reached 0" in captured.err
+
+
+def test_expected_schedule_blocks_require_an_exact_positive_entry_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(tmp_path, "workspaces: []\n")
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--expect-schedule-blocks",
+            "1",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.main()
+
+    assert exc_info.value.code == 2
+
+
+def test_empty_schedule_block_cannot_satisfy_exact_non_vacuity_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write(tmp_path, "workspaces:\n  - name: Empty\n    schedules: []\n")
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--expect-parsed-files",
+            "1",
+            "--expect-schedule-blocks",
+            "1",
+            "--expect-schedule-entries",
+            "1",
+        ],
+    )
+
+    assert _mod.main() == 1
+    captured = capsys.readouterr()
+    assert "expected 1 schedule entry/entries, reached 0" in captured.err
 
 
 def test_duplicate_mapping_keys_fail_closed_instead_of_shadowing_schedules(
     tmp_path: Path,
 ) -> None:
-    paths = write(tmp_path, f"""
+    paths = write(
+        tmp_path,
+        f"""
         workspaces:
           - name: Duplicate
             plugins:
@@ -281,7 +384,8 @@ def test_duplicate_mapping_keys_fail_closed_instead_of_shadowing_schedules(
                     - name: Visible benign schedule
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)
+    """,
+    )
 
     findings, stats = scan_with_stats(paths)
 
@@ -291,12 +395,17 @@ def test_duplicate_mapping_keys_fail_closed_instead_of_shadowing_schedules(
 
 
 def test_custom_tag_cannot_disguise_a_duplicate_mapping_key(tmp_path: Path) -> None:
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - ? !local plugins
             : [hidden]
             plugins: [visible]
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
 
@@ -343,11 +452,17 @@ def test_non_string_mapping_key_fails_closed(tmp_path: Path) -> None:
 def test_yaml_12_on_key_remains_a_string_for_actions_workflows(
     tmp_path: Path,
 ) -> None:
-    findings, stats = scan_with_stats(write(tmp_path, """
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            """
         name: CI
         on: [push, pull_request]
         jobs: {}
-    """, name="workflow.yml"))
+    """,
+            name="workflow.yml",
+        )
+    )
 
     assert findings == []
     assert stats.parsed_files == 1
@@ -376,7 +491,10 @@ def test_plain_and_binary_structural_keys_cannot_evade_duplicate_checks(
 
 
 def test_standard_yaml_merge_override_remains_supported(tmp_path: Path) -> None:
-    findings, stats = scan_with_stats(write(tmp_path, f"""
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
         base: &base
           name: Scheduled
           plugins: []
@@ -389,7 +507,9 @@ def test_standard_yaml_merge_override_remains_supported(tmp_path: Path) -> None:
                     - name: Merged
                       cron_expr: "0 * * * *"
                       prompt: run
-    """))
+    """,
+        )
+    )
 
     assert findings == []
     assert stats.schedule_blocks == 1
@@ -465,11 +585,16 @@ def test_yaml_parse_error_does_not_echo_the_source_line(tmp_path: Path) -> None:
 
 
 def test_recursive_workspace_alias_fails_closed(tmp_path: Path) -> None:
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         workspaces: &nodes
           - name: Loop
             children: *nodes
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
     assert "cyclic or repeated YAML alias" in str(findings[0])
@@ -478,7 +603,10 @@ def test_recursive_workspace_alias_fails_closed(tmp_path: Path) -> None:
 def test_repeated_workspace_alias_fails_before_exponential_walk(
     tmp_path: Path,
 ) -> None:
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         definitions:
           - &leaf
             name: Leaf
@@ -486,7 +614,9 @@ def test_repeated_workspace_alias_fails_before_exponential_walk(
             name: Branch
             children: [*leaf, *leaf]
         workspaces: [*branch, *branch]
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
     assert "cyclic or repeated YAML alias" in str(findings[0])
@@ -497,13 +627,18 @@ def test_yaml_alias_budget_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_mod, "MAX_YAML_ALIASES", 1, raising=False)
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         definitions:
           value: &shared {name: shared}
           first: *shared
           second: *shared
         workspaces: []
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
     assert "alias limit" in str(findings[0])
@@ -607,12 +742,17 @@ def test_workspace_depth_budget_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_mod, "MAX_WORKSPACE_DEPTH", 1, raising=False)
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - name: Root
             children:
               - name: Too deep
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
     assert "workspace depth limit" in str(findings[0])
@@ -623,11 +763,16 @@ def test_workspace_node_budget_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_mod, "MAX_WORKSPACE_NODES", 1, raising=False)
-    findings = scan(write(tmp_path, """
+    findings = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - name: One
           - name: Two
-    """))
+    """,
+        )
+    )
 
     assert codes(findings) == ["E0"]
     assert "workspace node limit" in str(findings[0])
@@ -678,6 +823,207 @@ def test_repo_default_composition_work_is_bounded(
     assert "plugin composition work limit" in str(findings[0])
 
 
+def test_repeated_schedule_list_alias_across_plugin_blocks_fails_closed(
+    tmp_path: Path,
+) -> None:
+    findings = scan(
+        write(
+            tmp_path,
+            f"""
+        shared: &shared
+          - name: Shared
+            cron_expr: "0 * * * *"
+            prompt: run
+        workspaces:
+          - name: Aliased
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules: *shared
+              - source: {SCHED}
+                config:
+                  schedules: *shared
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert "repeated YAML alias across schedule blocks" in str(findings[0])
+
+
+def test_aggregate_schedule_visit_budget_passes_at_limit_and_refuses_over_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = write(
+        tmp_path,
+        f"""
+        workspaces:
+          - name: Bounded
+            plugins: [{SCHED}]
+            schedules:
+              - name: One
+                cron_expr: "0 * * * *"
+                prompt: run
+              - name: Two
+                cron_expr: "5 * * * *"
+                prompt: run
+    """,
+    )
+    monkeypatch.setattr(_mod, "MAX_TOTAL_SCHEDULE_VISITS", 2, raising=False)
+
+    findings, stats = scan_with_stats(paths)
+
+    assert findings == []
+    assert stats.schedule_entries == 2
+
+    monkeypatch.setattr(_mod, "MAX_TOTAL_SCHEDULE_VISITS", 1, raising=False)
+    findings, stats = scan_with_stats(paths)
+
+    assert codes(findings) == ["E0"]
+    assert stats.schedule_entries == 0
+    assert "aggregate schedule visit limit" in str(findings[0])
+
+
+def test_aggregate_finding_budget_passes_at_limit_and_refuses_over_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = write(
+        tmp_path,
+        f"""
+        workspaces:
+          - name: Bounded
+            plugins: [{SCHED}]
+            schedules:
+              - name: One
+                cron_expr: "0 0 0 * * *"
+              - name: Two
+                cron_expr: "0 0 0 * * *"
+    """,
+    )
+    monkeypatch.setattr(_mod, "MAX_TOTAL_FINDINGS", 4, raising=False)
+
+    findings, _stats = scan_with_stats(paths)
+
+    assert codes(findings) == ["E4", "E5", "E4", "E5"]
+
+    monkeypatch.setattr(_mod, "MAX_TOTAL_FINDINGS", 3, raising=False)
+    findings, _stats = scan_with_stats(paths)
+
+    assert codes(findings) == ["E4", "E5", "E4", "E0"]
+    assert "aggregate finding limit" in str(findings[-1])
+
+
+def test_finding_detail_budget_and_rendered_fields_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = _mod.Finding("E4", "p" * 10_000, "n" * 10_000, "d" * 10_000)
+
+    assert len(finding.path) <= _mod.MAX_FINDING_FIELD_CHARS
+    assert len(finding.node) <= _mod.MAX_FINDING_FIELD_CHARS
+    assert len(finding.detail) <= _mod.MAX_FINDING_DETAIL_CHARS
+    assert "<truncated>" in finding.path
+    assert "<truncated>" in finding.node
+    assert "<truncated>" in finding.detail
+
+    exact_bytes = len(finding.detail.encode("utf-8"))
+    monkeypatch.setattr(
+        _mod,
+        "MAX_TOTAL_FINDING_DETAIL_BYTES",
+        exact_bytes,
+        raising=False,
+    )
+    budget = _mod.ScanBudget()
+    budget.consume_finding(finding)
+
+    monkeypatch.setattr(
+        _mod,
+        "MAX_TOTAL_FINDING_DETAIL_BYTES",
+        exact_bytes - 1,
+        raising=False,
+    )
+    with pytest.raises(_mod.ScanInputError, match="finding detail byte limit"):
+        _mod.ScanBudget().consume_finding(finding)
+
+
+def test_oversized_schedule_fields_fail_closed_without_echoing_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "PRIVATE_SCHEDULE_FIELD_MARKER"
+    monkeypatch.setattr(_mod, "MAX_SCHEDULE_FIELD_CHARS", 8, raising=False)
+
+    findings = scan(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Bounded
+            schedules:
+              - name: {marker}
+                cron_expr: "0 * * * *"
+                prompt: run
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert "schedule field length limit" in str(findings[0])
+    assert marker not in str(findings[0])
+
+
+def test_oversized_plugin_source_fails_closed_without_repeated_string_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "PRIVATE_PLUGIN_SOURCE_MARKER"
+    monkeypatch.setattr(_mod, "MAX_PLUGIN_SOURCE_CHARS", 8, raising=False)
+
+    findings = scan(
+        write(
+            tmp_path,
+            f"""
+        defaults:
+          plugins: [{marker}]
+        workspaces:
+          - name: One
+          - name: Two
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert "plugin source length limit" in str(findings[0])
+    assert marker not in str(findings[0])
+
+
+@pytest.mark.parametrize(
+    "schedules",
+    (
+        "not-a-list",
+        "[not-a-mapping]",
+    ),
+)
+def test_malformed_schedule_blocks_fail_closed_and_do_not_count_entries(
+    tmp_path: Path,
+    schedules: str,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Malformed
+            schedules: {schedules}
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.schedule_entries == 0
+
+
 def test_many_plugin_opt_outs_are_processed_in_linear_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -716,7 +1062,10 @@ def test_plugin_opt_out_matching_uses_cores_exact_source_identity() -> None:
 def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
     tmp_path: Path,
 ) -> None:
-    findings, stats = scan_with_stats(write(tmp_path, f"""
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
         defaults:
           plugins:
             - source: {SCHED}
@@ -727,11 +1076,14 @@ def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
                     prompt: run
         workspaces:
           - name: A
-    """))
+          - name: B
+    """,
+        )
+    )
 
     assert findings == []
-    assert stats.schedule_blocks == 1
-    assert stats.schedule_entries == 1
+    assert stats.schedule_blocks == 2
+    assert stats.schedule_entries == 2
 
 
 @pytest.mark.parametrize(
@@ -741,6 +1093,8 @@ def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
         ("--expect-parsed-files", "-1"),
         ("--expect-schedule-blocks", "0"),
         ("--expect-schedule-blocks", "-1"),
+        ("--expect-schedule-entries", "0"),
+        ("--expect-schedule-entries", "-1"),
     ),
 )
 def test_expectations_must_be_positive_nonzero(
@@ -768,7 +1122,9 @@ def test_expectations_must_be_positive_nonzero(
 
 
 def test_explicit_target_paths_are_deduplicated(tmp_path: Path) -> None:
-    path = write(tmp_path, f"""
+    path = write(
+        tmp_path,
+        f"""
         workspaces:
           - name: One
             plugins:
@@ -778,7 +1134,8 @@ def test_explicit_target_paths_are_deduplicated(tmp_path: Path) -> None:
                     - name: Once
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)[0]
+    """,
+    )[0]
 
     findings, stats = scan_with_stats([path, path, Path(str(path))])
 
@@ -793,7 +1150,9 @@ def test_duplicate_explicit_targets_cannot_satisfy_exact_cli_counts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    path = write(tmp_path, f"""
+    path = write(
+        tmp_path,
+        f"""
         workspaces:
           - name: One
             plugins:
@@ -803,7 +1162,8 @@ def test_duplicate_explicit_targets_cannot_satisfy_exact_cli_counts(
                     - name: Once
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)[0]
+    """,
+    )[0]
     monkeypatch.setattr(
         _mod.sys,
         "argv",
@@ -814,6 +1174,8 @@ def test_duplicate_explicit_targets_cannot_satisfy_exact_cli_counts(
             "--expect-parsed-files",
             "2",
             "--expect-schedule-blocks",
+            "2",
+            "--expect-schedule-entries",
             "2",
             str(path),
             str(path),
@@ -830,7 +1192,9 @@ def test_default_discovery_excludes_nested_molecule_ci_checkout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    write(tmp_path, f"""
+    write(
+        tmp_path,
+        f"""
         workspaces:
           - name: One
             plugins:
@@ -840,7 +1204,8 @@ def test_default_discovery_excludes_nested_molecule_ci_checkout(
                     - name: Once
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)
+    """,
+    )
     tool_checkout = tmp_path / ".molecule-ci-canonical"
     tool_checkout.mkdir()
     (tool_checkout / "tool.yaml").write_text("workspaces: []\n", encoding="utf-8")
@@ -854,6 +1219,8 @@ def test_default_discovery_excludes_nested_molecule_ci_checkout(
             "--expect-parsed-files",
             "1",
             "--expect-schedule-blocks",
+            "1",
+            "--expect-schedule-entries",
             "1",
         ],
     )
@@ -871,6 +1238,15 @@ def test_default_discovery_has_an_aggregate_entry_budget(
 
     with pytest.raises(_mod.ScanInputError, match="discovery entry limit"):
         _mod.discover_yaml_targets(tmp_path, set())
+
+
+def test_default_discovery_matches_only_literal_yaml_suffixes(tmp_path: Path) -> None:
+    for name in ("one.yaml", "two.yml", "three.yoml", "four.yml.bak", "five.yxml"):
+        (tmp_path / name).write_text("workspaces: []\n", encoding="utf-8")
+
+    targets = _mod.discover_yaml_targets(tmp_path, set())
+
+    assert [path.name for path in targets] == ["one.yaml", "two.yml"]
 
 
 def test_finding_paths_escape_newlines_and_terminal_controls() -> None:
@@ -894,7 +1270,9 @@ def test_repeatable_exclude_dir_is_safe_consumer_surface(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    write(tmp_path, f"""
+    write(
+        tmp_path,
+        f"""
         workspaces:
           - name: One
             plugins:
@@ -904,7 +1282,8 @@ def test_repeatable_exclude_dir_is_safe_consumer_surface(
                     - name: Once
                       cron_expr: "0 * * * *"
                       prompt: run
-    """)
+    """,
+    )
     generated = tmp_path / "generated"
     generated.mkdir()
     (generated / "copy.yaml").write_text("workspaces: []\n", encoding="utf-8")
@@ -920,6 +1299,8 @@ def test_repeatable_exclude_dir_is_safe_consumer_surface(
             "--expect-parsed-files",
             "1",
             "--expect-schedule-blocks",
+            "1",
+            "--expect-schedule-entries",
             "1",
         ],
     )
@@ -953,10 +1334,14 @@ def test_exclude_dir_accepts_only_one_directory_name(
 
 # --- shapes that must be understood -----------------------------------------
 
+
 def test_teams_nested_workspaces_are_scanned(tmp_path):
     """molecule-dev keeps nodes under teams[].workspaces[] — missing this shape
     would silently skip 9 of the fleet's files."""
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         teams:
           - name: marketing
             workspaces:
@@ -968,12 +1353,17 @@ def test_teams_nested_workspaces_are_scanned(tmp_path):
                         - name: H
                           cron_expr: "0 * * * *"
                           prompt: x
-    """))
+    """,
+        )
+    )
     assert "E2" in codes(f)
 
 
 def test_workspace_template_document_is_treated_as_the_node(tmp_path):
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         name: seo-agent
         plugins:
           - source: some-plugin
@@ -982,7 +1372,10 @@ def test_workspace_template_document_is_treated_as_the_node(tmp_path):
                 - name: H
                   cron_expr: "0 * * * *"
                   prompt: x
-    """, name="workspace.yaml"))
+    """,
+            name="workspace.yaml",
+        )
+    )
     assert "E2" in codes(f)
 
 
@@ -1009,9 +1402,11 @@ def test_scheduler_matched_by_either_identity(tmp_path):
 # not there for the genuinely dead schedules it exists to catch.
 
 
-
 def test_children_are_walked(tmp_path):
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         defaults:
           plugins:
             - browser-automation
@@ -1026,12 +1421,17 @@ def test_children_are_walked(tmp_path):
                         - name: Heartbeat
                           cron_expr: "*/30 * * * *"
                           prompt: x
-    """))
+    """,
+        )
+    )
     assert "E2" in codes(f), "a scheduled node nested under children: must be seen"
 
 
 def test_children_nest_arbitrarily_deep(tmp_path):
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - name: A
             children:
@@ -1045,12 +1445,17 @@ def test_children_nest_arbitrarily_deep(tmp_path):
                             - name: Deep
                               cron_expr: "0 * * * *"
                               prompt: x
-    """))
+    """,
+        )
+    )
     assert "E2" in codes(f)
 
 
 def test_a_clean_nested_tree_stays_silent(tmp_path):
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         defaults:
           plugins:
             - {SCHED}
@@ -1062,7 +1467,9 @@ def test_a_clean_nested_tree_stays_silent(tmp_path):
                   - name: Heartbeat
                     cron_expr: "*/30 * * * *"
                     prompt: x
-    """))
+    """,
+        )
+    )
     assert codes(f) == []
 
 
@@ -1084,7 +1491,10 @@ def test_the_three_real_fleet_repos_stay_clean_on_the_legacy_shape(tmp_path):
     """Regression guard for the false-positive storm. Mirrors the real shapes:
     reno-stars (children-nested, no scheduler named), molecule-dev (plugins: []
     with repo-wide defaults that lack a scheduler)."""
-    reno = scan(write(tmp_path, """
+    reno = scan(
+        write(
+            tmp_path,
+            """
         defaults:
           plugins: [browser-automation]
         workspaces:
@@ -1095,7 +1505,10 @@ def test_the_three_real_fleet_repos_stay_clean_on_the_legacy_shape(tmp_path):
                   - name: Heartbeat (every 30m)
                     cron_expr: "*/30 * * * *"
                     prompt: Read /configs/skills/heartbeat.md
-    """, name="reno.yaml"))
+    """,
+            name="reno.yaml",
+        )
+    )
     assert codes(reno) == [], f"legacy fleet shape must pass, got {codes(reno)}"
 
 
@@ -1108,8 +1521,12 @@ def test_the_three_real_fleet_repos_stay_clean_on_the_legacy_shape(tmp_path):
 # DEFAULT-ON kill switch), so that condition has no reachable true positive in
 # either shape. These tests pin the absence.
 
+
 def test_no_finding_for_a_template_that_never_names_the_scheduler_legacy(tmp_path):
-    f = scan(write(tmp_path, """
+    f = scan(
+        write(
+            tmp_path,
+            """
         workspaces:
           - name: Coordinator
             plugins: []
@@ -1117,14 +1534,19 @@ def test_no_finding_for_a_template_that_never_names_the_scheduler_legacy(tmp_pat
               - name: Heartbeat
                 cron_expr: "*/30 * * * *"
                 prompt: x
-    """))
+    """,
+        )
+    )
     assert codes(f) == [], "core declares the scheduler at provision; this is valid"
 
 
 def test_no_finding_for_a_template_that_never_names_the_scheduler_new_shape(tmp_path):
     """Same for plugins[].config.schedules ON the scheduler — the node does not
     have to ALSO list it elsewhere."""
-    f = scan(write(tmp_path, f"""
+    f = scan(
+        write(
+            tmp_path,
+            f"""
         workspaces:
           - name: Coordinator
             plugins:
@@ -1134,14 +1556,19 @@ def test_no_finding_for_a_template_that_never_names_the_scheduler_new_shape(tmp_
                     - name: Heartbeat
                       cron_expr: "*/30 * * * *"
                       prompt: x
-    """))
+    """,
+        )
+    )
     assert codes(f) == []
 
 
 def test_the_real_fleet_shapes_stay_clean(tmp_path):
     """reno-stars (children-nested, defaults lack a scheduler) and molecule-dev
     (plugins: [] per node). Both are CORRECT and must never be flagged."""
-    reno = scan(write(tmp_path, """
+    reno = scan(
+        write(
+            tmp_path,
+            """
         defaults:
           plugins: [browser-automation]
         workspaces:
@@ -1152,5 +1579,8 @@ def test_the_real_fleet_shapes_stay_clean(tmp_path):
                   - name: Heartbeat (every 30m)
                     cron_expr: "*/30 * * * *"
                     prompt: Read /configs/skills/heartbeat.md
-    """, name="reno.yaml"))
+    """,
+            name="reno.yaml",
+        )
+    )
     assert codes(reno) == [], f"got {codes(reno)}"
