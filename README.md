@@ -147,8 +147,12 @@ generated/tool directory exclusion. Passing YAML paths positionally is the
 explicit allowlist form; duplicate paths collapse, and every target must be a
 regular, bounded, non-symlink file inside `--root`. Unknown local `!`
 composition tags are loaded as safe data, while duplicate keys, malformed YAML,
-unsafe reads, excessive aliases/depth/nodes, and cyclic workspace aliases fail
-closed with E0 without echoing source lines into CI logs.
+non-string mapping keys, unsafe reads, excessive aliases/depth/nodes, and cyclic
+workspace aliases fail closed with E0. Conservative scan-wide limits also bound
+discovery entries, target files, YAML bytes/documents/nodes, workspace nodes,
+and defaults-to-workspace plugin composition. Findings never echo source lines,
+and control characters in paths or other rendered fields are escaped so one
+finding cannot forge additional CI log commands.
 
 ## Composite actions
 

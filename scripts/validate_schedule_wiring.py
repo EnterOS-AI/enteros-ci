@@ -26,9 +26,9 @@ E0  A target file that this gate could not read or parse, or an explicit
     expected file/schedule-block count that was not reached. Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
     are loaded safely as their underlying scalar/list/mapping so they cannot
-    make the whole document disappear from this gate. Duplicate mapping keys,
-    symlinks/path escapes, oversized inputs, and resource-limit violations also
-    fail closed without copying source lines into CI logs.
+    make the whole document disappear from this gate. Duplicate or non-string
+    mapping keys, symlinks/path escapes, oversized inputs, and resource-limit
+    violations also fail closed without copying source lines into CI logs.
 
 (There is no E1 — see the long note in check_node. The scheduler is declared
 on every workspace at provision, so "template does not name the scheduler" has
@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -82,10 +83,11 @@ SCHEDULER_MARKERS: tuple[str, ...] = (
     "molecule-scheduler",
 )
 
-# Resource limits apply before and during parsing. They are intentionally much
-# larger than the current fleet's files (the largest is well below 1 MiB and
-# each template has tens, not thousands, of nodes), while still preventing a
-# tiny alias graph or device/symlink input from consuming an entire CI runner.
+# Per-file and aggregate resource limits apply before, during, and after parsing.
+# They are intentionally much larger than the current fleet (the largest file is
+# well below 1 MiB and each template has tens, not thousands, of nodes), while
+# still preventing a wide repository, tiny alias graph, or defaults-by-workspace
+# cross product from consuming an entire CI runner.
 MAX_YAML_FILE_BYTES = 4 * 1024 * 1024
 MAX_YAML_DOCUMENTS = 128
 MAX_YAML_NODES = 100_000
@@ -93,6 +95,13 @@ MAX_YAML_DEPTH = 100
 MAX_YAML_ALIASES = 256
 MAX_WORKSPACE_NODES = 10_000
 MAX_WORKSPACE_DEPTH = 64
+MAX_TARGET_FILES = 2_048
+MAX_DISCOVERY_ENTRIES = 100_000
+MAX_TOTAL_YAML_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_YAML_DOCUMENTS = 2_048
+MAX_TOTAL_YAML_NODES = 500_000
+MAX_TOTAL_WORKSPACE_NODES = 50_000
+MAX_PLUGIN_COMPOSITION_WORK = 1_000_000
 
 # Tool checkouts live inside consumer worktrees but are not consumer input.
 # Counting their YAML makes exact anti-vacuity assertions depend on whichever
@@ -122,12 +131,74 @@ class DuplicateKeyError(yaml.constructor.ConstructorError):
     safe_reason = "target contains a duplicate mapping key"
 
 
+class NonStringMappingKeyError(yaml.constructor.ConstructorError):
+    """A mapping key the structural validator cannot safely interpret."""
+
+    safe_reason = "target contains a non-string mapping key"
+
+
 class ScanInputError(Exception):
     """A safe, non-disclosing refusal at the file/traversal boundary."""
 
     def __init__(self, safe_reason: str) -> None:
         super().__init__(safe_reason)
         self.safe_reason = safe_reason
+
+
+class ScanBudget:
+    """Aggregate resource accounting shared by every file in one scan."""
+
+    __slots__ = (
+        "yaml_bytes",
+        "yaml_documents",
+        "yaml_nodes",
+        "workspace_nodes",
+        "plugin_composition_work",
+        "exhausted",
+    )
+
+    def __init__(self) -> None:
+        self.yaml_bytes = 0
+        self.yaml_documents = 0
+        self.yaml_nodes = 0
+        self.workspace_nodes = 0
+        self.plugin_composition_work = 0
+        self.exhausted = False
+
+    def consume_yaml_bytes(self, amount: int) -> None:
+        if amount > MAX_TOTAL_YAML_BYTES - self.yaml_bytes:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the aggregate YAML byte limit")
+        self.yaml_bytes += amount
+
+    def consume_yaml_document(self) -> None:
+        if self.yaml_documents >= MAX_TOTAL_YAML_DOCUMENTS:
+            self.exhausted = True
+            raise YamlResourceLimitError(
+                "scan exceeds the aggregate YAML document limit"
+            )
+        self.yaml_documents += 1
+
+    def consume_yaml_node(self, mark: Any | None) -> None:
+        if self.yaml_nodes >= MAX_TOTAL_YAML_NODES:
+            self.exhausted = True
+            raise YamlResourceLimitError(
+                "scan exceeds the aggregate YAML node limit",
+                mark,
+            )
+        self.yaml_nodes += 1
+
+    def consume_workspace_node(self) -> None:
+        if self.workspace_nodes >= MAX_TOTAL_WORKSPACE_NODES:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the aggregate workspace node limit")
+        self.workspace_nodes += 1
+
+    def consume_plugin_composition_work(self, amount: int) -> None:
+        if amount > MAX_PLUGIN_COMPOSITION_WORK - self.plugin_composition_work:
+            self.exhausted = True
+            raise ScanInputError("scan exceeds the plugin composition work limit")
+        self.plugin_composition_work += amount
 
 
 class PermissiveLoader(yaml.SafeLoader):
@@ -140,14 +211,30 @@ class PermissiveLoader(yaml.SafeLoader):
     construct its underlying scalar/list/mapping using SafeLoader primitives.
     """
 
-    def __init__(self, stream: Any) -> None:
+    # PyYAML defaults to YAML 1.1, where the standard Actions key `on` becomes
+    # boolean True. Molecule templates and Gitea Actions use YAML 1.2 semantics:
+    # only true/false are implicit booleans. Clone the table before narrowing it
+    # so the process-wide SafeLoader is not mutated.
+    yaml_implicit_resolvers = {
+        first: [
+            (tag, expression)
+            for tag, expression in resolvers
+            if tag != "tag:yaml.org,2002:bool"
+        ]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+    def __init__(self, stream: Any, *, budget: ScanBudget | None = None) -> None:
         super().__init__(stream)
+        self._molecule_budget = budget
         self._molecule_aliases = 0
         self._molecule_nodes = 0
         self._molecule_depth = 0
 
     def compose_node(self, parent: Any, index: Any) -> yaml.Node:
         event = self.peek_event()
+        if self._molecule_budget is not None:
+            self._molecule_budget.consume_yaml_node(event.start_mark)
         self._molecule_nodes += 1
         if self._molecule_nodes > MAX_YAML_NODES:
             raise YamlResourceLimitError(
@@ -192,6 +279,13 @@ class PermissiveLoader(yaml.SafeLoader):
                 # Python mapping. A custom tag is deliberately erased by this
                 # loader, so it must not disguise a duplicate plain key.
                 key = self.construct_object(key_node, deep=deep)
+                if not isinstance(key, str):
+                    raise NonStringMappingKeyError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        "non-string mapping key",
+                        key_node.start_mark,
+                    )
             try:
                 if key in seen:
                     raise DuplicateKeyError(
@@ -210,6 +304,13 @@ class PermissiveLoader(yaml.SafeLoader):
                 ) from exc
 
         return super().construct_mapping(node, deep=deep)
+
+
+PermissiveLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
 
 
 def _construct_custom_tag(
@@ -242,8 +343,29 @@ class Finding:
         self.code, self.path, self.node, self.detail = code, path, node, detail
 
     def __str__(self) -> str:
-        where = f"{self.path}" + (f" :: node {self.node!r}" if self.node else "")
-        return f"::error::[{self.code}] {where} — {self.detail}"
+        path = _sanitize_log_text(self.path)
+        node = _sanitize_log_text(self.node)
+        detail = _sanitize_log_text(self.detail)
+        where = path + (f" :: node {node!r}" if node else "")
+        return f"::error::[{self.code}] {where} — {detail}"
+
+
+def _sanitize_log_text(value: object) -> str:
+    """Escape controls so one finding always occupies exactly one log line."""
+
+    safe: list[str] = []
+    for character in str(value):
+        if character.isprintable():
+            safe.append(character)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            safe.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            safe.append(f"\\u{codepoint:04x}")
+        else:
+            safe.append(f"\\U{codepoint:08x}")
+    return "".join(safe)
 
 
 def plugin_source(entry: Any) -> str:
@@ -321,7 +443,11 @@ def check_schedule_entries(
     return len(schedules)
 
 
-def effective_plugins(node_obj: dict, inherited: list) -> list:
+def effective_plugins(
+    node_obj: dict,
+    inherited: list,
+    budget: ScanBudget | None = None,
+) -> list:
     """A node's plugin list AFTER org-level `defaults.plugins` inheritance.
 
     Reading the node's own `plugins:` alone is wrong and would produce FALSE
@@ -344,29 +470,36 @@ def effective_plugins(node_obj: dict, inherited: list) -> list:
     # one configuration it most needs to catch. (Caught by
     # test_node_opt_out_defeats_an_inherited_scheduler; the docstring claimed
     # this behaviour before the code implemented it.)
-    declined: list[str] = []
+    if budget is not None:
+        budget.consume_plugin_composition_work(len(inherited) + len(own_list))
+
+    declined: set[str] = set()
     for entry in own_list:
-        src = plugin_source(entry).strip()
+        src = plugin_source(entry)
         if src.startswith(("!", "-")):
-            declined.append(src.lstrip("!-").strip().lower())
+            target = src.lstrip("!-")
+            if target:
+                declined.add(target)
 
-    def is_declined(entry: Any) -> bool:
-        src = plugin_source(entry).strip().lower()
-        if not src:
-            return False
-        return any(d and (d in src or src in d) for d in declined)
-
-    kept_inherited = [e for e in inherited if not is_declined(e)]
+    # Core's mergePlugins uses exact source-string identity for opt-outs. A set
+    # keeps this O(defaults + own) even when a workspace declines many plugins.
+    kept_inherited = [
+        entry for entry in inherited if plugin_source(entry) not in declined
+    ]
     return kept_inherited + own_list
 
 
 def check_node(
-    node_obj: dict, path: str, node_name: str, out: list[Finding],
+    node_obj: dict,
+    path: str,
+    node_name: str,
+    out: list[Finding],
     inherited_plugins: list | None = None,
+    budget: ScanBudget | None = None,
 ) -> tuple[int, int]:
     """Wiring checks for one workspace node (or a whole workspace template)."""
     legacy = node_obj.get("schedules")
-    plugins = effective_plugins(node_obj, inherited_plugins or [])
+    plugins = effective_plugins(node_obj, inherited_plugins or [], budget)
 
     plugin_scheds: list[tuple[str, Any]] = []
     seen_plugin_objects: set[int] = set()
@@ -472,6 +605,7 @@ def check_document(
     inherited_plugins: list | None = None,
     *,
     defaults_in_inherited: bool = False,
+    budget: ScanBudget | None = None,
 ) -> tuple[int, int]:
     if not isinstance(doc, dict):
         return 0, 0
@@ -523,6 +657,8 @@ def check_document(
             node_visits += 1
             if node_visits > MAX_WORKSPACE_NODES:
                 raise ScanInputError("target exceeds the workspace node limit")
+            if budget is not None:
+                budget.consume_workspace_node()
             nodes.append((str(w.get("name", "<unnamed>")), w))
             collect(w.get("children"), depth + 1)
 
@@ -543,12 +679,13 @@ def check_document(
                 name,
                 out,
                 inherited,
+                budget,
             )
             schedule_blocks += node_blocks
             schedule_entries += node_entries
         return schedule_blocks, schedule_entries
     # workspace template: the document IS the node
-    return check_node(doc, path, "", out, inherited)
+    return check_node(doc, path, "", out, inherited, budget)
 
 
 def _deduplicate_paths(paths: list[Path]) -> list[Path]:
@@ -560,6 +697,8 @@ def _deduplicate_paths(paths: list[Path]) -> list[Path]:
         key = os.path.normcase(os.path.abspath(os.fspath(path)))
         if key in seen:
             continue
+        if len(unique) >= MAX_TARGET_FILES:
+            raise ScanInputError("scan exceeds the aggregate target file limit")
         seen.add(key)
         unique.append(path)
     return unique
@@ -572,8 +711,7 @@ def _resolve_scan_root(paths: list[Path], root: Path | None) -> Path:
     elif paths:
         try:
             parents = [
-                os.path.dirname(os.path.abspath(os.fspath(path)))
-                for path in paths
+                os.path.dirname(os.path.abspath(os.fspath(path))) for path in paths
             ]
             candidate = Path(os.path.commonpath(parents))
         except ValueError as exc:
@@ -597,7 +735,7 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def _read_bounded_yaml(path: Path, root: Path) -> str:
+def _read_bounded_yaml(path: Path, root: Path) -> tuple[str, int]:
     """Read one regular in-root file without following the final symlink."""
     lexical = Path(os.path.abspath(os.fspath(path)))
     try:
@@ -605,7 +743,9 @@ def _read_bounded_yaml(path: Path, root: Path) -> str:
     except OSError as exc:
         raise ScanInputError("target could not be safely opened") from exc
     if stat.S_ISLNK(path_stat.st_mode):
-        raise ScanInputError("target is a symbolic link; only regular files are allowed")
+        raise ScanInputError(
+            "target is a symbolic link; only regular files are allowed"
+        )
     if not stat.S_ISREG(path_stat.st_mode):
         raise ScanInputError("target is not a regular file")
 
@@ -651,13 +791,13 @@ def _read_bounded_yaml(path: Path, root: Path) -> str:
         os.close(descriptor)
 
     try:
-        return b"".join(chunks).decode("utf-8")
+        return b"".join(chunks).decode("utf-8"), bytes_read
     except UnicodeDecodeError as exc:
         raise ScanInputError("target is not valid UTF-8") from exc
 
 
 def _yaml_error_detail(exc: yaml.YAMLError) -> str:
-    if isinstance(exc, DuplicateKeyError):
+    if isinstance(exc, (DuplicateKeyError, NonStringMappingKeyError)):
         detail = exc.safe_reason
     elif isinstance(exc, YamlResourceLimitError):
         detail = exc.safe_reason
@@ -669,12 +809,21 @@ def _yaml_error_detail(exc: yaml.YAMLError) -> str:
     return detail
 
 
-def _load_documents(text: str) -> list[Any]:
+def _load_documents(
+    text: str,
+    budget: ScanBudget | None = None,
+) -> list[Any]:
     documents: list[Any] = []
-    for document in yaml.load_all(text, Loader=PermissiveLoader):
-        if len(documents) >= MAX_YAML_DOCUMENTS:
-            raise YamlResourceLimitError("target exceeds the YAML document limit")
-        documents.append(document)
+    loader = PermissiveLoader(text, budget=budget)
+    try:
+        while loader.check_data():
+            if len(documents) >= MAX_YAML_DOCUMENTS:
+                raise YamlResourceLimitError("target exceeds the YAML document limit")
+            if budget is not None:
+                budget.consume_yaml_document()
+            documents.append(loader.get_data())
+    finally:
+        loader.dispose()
     return documents
 
 
@@ -683,9 +832,15 @@ def scan_with_stats(
     *,
     root: Path | None = None,
 ) -> tuple[list[Finding], ScanStats]:
-    targets = _deduplicate_paths(paths)
     out: list[Finding] = []
+    try:
+        targets = _deduplicate_paths(paths)
+    except ScanInputError as exc:
+        out.append(Finding("E0", "<scan>", "", exc.safe_reason))
+        return out, ScanStats(len(paths), 0, 0, 0, 0)
+
     loaded: list[tuple[Path, list[Any]]] = []
+    budget = ScanBudget()
     try:
         scan_root = _resolve_scan_root(targets, root)
     except ScanInputError as exc:
@@ -694,7 +849,8 @@ def scan_with_stats(
 
     for p in targets:
         try:
-            text = _read_bounded_yaml(p, scan_root)
+            text, byte_count = _read_bounded_yaml(p, scan_root)
+            budget.consume_yaml_bytes(byte_count)
         except ScanInputError as exc:
             out.append(
                 Finding(
@@ -704,9 +860,11 @@ def scan_with_stats(
                     exc.safe_reason,
                 )
             )
+            if budget.exhausted:
+                break
             continue
         try:
-            docs = _load_documents(text)
+            docs = _load_documents(text, budget)
         except yaml.YAMLError as exc:
             out.append(
                 Finding(
@@ -716,6 +874,8 @@ def scan_with_stats(
                     _yaml_error_detail(exc),
                 )
             )
+            if budget.exhausted:
+                break
             continue
         except RecursionError:
             out.append(
@@ -742,6 +902,8 @@ def scan_with_stats(
     schedule_blocks = 0
     schedule_entries = 0
     for p, docs in loaded:
+        if budget.exhausted:
+            break
         for doc in docs:
             try:
                 document_blocks, document_entries = check_document(
@@ -750,9 +912,12 @@ def scan_with_stats(
                     out,
                     repo_defaults,
                     defaults_in_inherited=True,
+                    budget=budget,
                 )
             except ScanInputError as exc:
                 out.append(Finding("E0", str(p), "", exc.safe_reason))
+                if budget.exhausted:
+                    break
                 continue
             schedule_blocks += document_blocks
             schedule_entries += document_entries
@@ -788,11 +953,33 @@ def _directory_name(raw: str) -> str:
 
 def discover_yaml_targets(root: Path, excluded_dirs: set[str]) -> list[Path]:
     """Discover YAML under root while excluding tool/generated directories."""
-    return sorted(
-        path
-        for path in root.rglob("*.y*ml")
-        if not any(part in excluded_dirs for part in path.relative_to(root).parts[:-1])
-    )
+
+    targets: list[Path] = []
+    discovered_entries = 0
+
+    def refuse_walk_error(exc: OSError) -> None:
+        raise ScanInputError("scan root could not be safely discovered") from exc
+
+    for current, directories, files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=refuse_walk_error,
+    ):
+        directories[:] = sorted(
+            name for name in directories if name not in excluded_dirs
+        )
+        names = [*directories, *sorted(files)]
+        for name in names:
+            discovered_entries += 1
+            if discovered_entries > MAX_DISCOVERY_ENTRIES:
+                raise ScanInputError("scan exceeds the discovery entry limit")
+            if not Path(name).match("*.y*ml"):
+                continue
+            if len(targets) >= MAX_TARGET_FILES:
+                raise ScanInputError("scan exceeds the aggregate target file limit")
+            targets.append(Path(current) / name)
+    return sorted(targets)
 
 
 def main() -> int:
@@ -838,14 +1025,23 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(args.root)
+    discovery_error: ScanInputError | None = None
     if args.paths:
         targets = [Path(p) for p in args.paths]
     else:
         excluded_dirs = set(DEFAULT_EXCLUDED_DIRS)
         excluded_dirs.update(args.exclude_dir)
-        targets = discover_yaml_targets(root, excluded_dirs)
+        try:
+            targets = discover_yaml_targets(root, excluded_dirs)
+        except ScanInputError as exc:
+            discovery_error = exc
+            targets = []
 
-    findings, stats = scan_with_stats(targets, root=root)
+    if discovery_error is None:
+        findings, stats = scan_with_stats(targets, root=root)
+    else:
+        findings = [Finding("E0", "<scan>", "", discovery_error.safe_reason)]
+        stats = ScanStats(0, 0, 0, 0, 0)
     if (
         args.expect_parsed_files is not None
         and stats.parsed_files != args.expect_parsed_files

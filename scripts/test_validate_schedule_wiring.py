@@ -301,6 +301,80 @@ def test_custom_tag_cannot_disguise_a_duplicate_mapping_key(tmp_path: Path) -> N
     assert codes(findings) == ["E0"]
 
 
+def test_binary_structural_key_fails_closed_instead_of_skipping_schedules(
+    tmp_path: Path,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            """
+        !!binary d29ya3NwYWNlcw==:
+          - name: Hidden
+            schedules:
+              - name: Broken
+                cron_expr: "0 0 0 * * *"
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert stats.schedule_blocks == 0
+    assert "non-string mapping key" in str(findings[0])
+
+
+def test_non_string_mapping_key_fails_closed(tmp_path: Path) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            """
+        workspaces:
+          - name: Invalid
+            1: value
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert "non-string mapping key" in str(findings[0])
+
+
+def test_yaml_12_on_key_remains_a_string_for_actions_workflows(
+    tmp_path: Path,
+) -> None:
+    findings, stats = scan_with_stats(write(tmp_path, """
+        name: CI
+        on: [push, pull_request]
+        jobs: {}
+    """, name="workflow.yml"))
+
+    assert findings == []
+    assert stats.parsed_files == 1
+
+
+def test_plain_and_binary_structural_keys_cannot_evade_duplicate_checks(
+    tmp_path: Path,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            """
+        workspaces: []
+        !!binary d29ya3NwYWNlcw==:
+          - name: Hidden
+            schedules:
+              - name: Broken
+                cron_expr: "0 0 0 * * *"
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert stats.schedule_blocks == 0
+
+
 def test_standard_yaml_merge_override_remains_supported(tmp_path: Path) -> None:
     findings, stats = scan_with_stats(write(tmp_path, f"""
         base: &base
@@ -468,6 +542,66 @@ def test_yaml_document_budget_fails_closed(
     assert "YAML document limit" in str(findings[0])
 
 
+def test_aggregate_target_file_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write(tmp_path, "workspaces: []\n", name="first.yaml")[0]
+    second = write(tmp_path, "workspaces: []\n", name="second.yaml")[0]
+    monkeypatch.setattr(_mod, "MAX_TARGET_FILES", 1, raising=False)
+
+    findings, stats = scan_with_stats([first, second], root=tmp_path)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert "target file limit" in str(findings[0])
+
+
+def test_aggregate_yaml_byte_budget_fails_closed_across_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write(tmp_path, "workspaces: []\n", name="first.yaml")[0]
+    second = write(tmp_path, "workspaces: []\n", name="second.yaml")[0]
+    monkeypatch.setattr(_mod, "MAX_TOTAL_YAML_BYTES", 20, raising=False)
+
+    findings, stats = scan_with_stats([first, second], root=tmp_path)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 1
+    assert "aggregate YAML byte limit" in str(findings[0])
+
+
+def test_aggregate_yaml_document_budget_fails_closed_across_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write(tmp_path, "workspaces: []\n", name="first.yaml")[0]
+    second = write(tmp_path, "workspaces: []\n", name="second.yaml")[0]
+    monkeypatch.setattr(_mod, "MAX_TOTAL_YAML_DOCUMENTS", 1, raising=False)
+
+    findings, stats = scan_with_stats([first, second], root=tmp_path)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 1
+    assert "aggregate YAML document limit" in str(findings[0])
+
+
+def test_aggregate_yaml_node_budget_fails_closed_across_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write(tmp_path, "value: one\n", name="first.yaml")[0]
+    second = write(tmp_path, "value: two\n", name="second.yaml")[0]
+    monkeypatch.setattr(_mod, "MAX_TOTAL_YAML_NODES", 5, raising=False)
+
+    findings, stats = scan_with_stats([first, second], root=tmp_path)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 1
+    assert "aggregate YAML node limit" in str(findings[0])
+
+
 def test_workspace_depth_budget_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -497,6 +631,86 @@ def test_workspace_node_budget_fails_closed(
 
     assert codes(findings) == ["E0"]
     assert "workspace node limit" in str(findings[0])
+
+
+def test_aggregate_workspace_budget_fails_closed_across_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write(
+        tmp_path,
+        "workspaces:\n  - name: One\n",
+        name="first.yaml",
+    )[0]
+    second = write(
+        tmp_path,
+        "workspaces:\n  - name: Two\n",
+        name="second.yaml",
+    )[0]
+    monkeypatch.setattr(_mod, "MAX_TOTAL_WORKSPACE_NODES", 1, raising=False)
+
+    findings, stats = scan_with_stats([first, second], root=tmp_path)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 2
+    assert "aggregate workspace node limit" in str(findings[0])
+
+
+def test_repo_default_composition_work_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_PLUGIN_COMPOSITION_WORK", 3, raising=False)
+    findings = scan(
+        write(
+            tmp_path,
+            """
+        defaults:
+          plugins: [plugin-a, plugin-b]
+        workspaces:
+          - name: One
+          - name: Two
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert "plugin composition work limit" in str(findings[0])
+
+
+def test_many_plugin_opt_outs_are_processed_in_linear_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    real_plugin_source = _mod.plugin_source
+
+    def counted_plugin_source(entry):
+        nonlocal calls
+        calls += 1
+        return real_plugin_source(entry)
+
+    monkeypatch.setattr(_mod, "plugin_source", counted_plugin_source)
+    inherited = [f"plugin-{index}" for index in range(100)]
+    own = [f"!plugin-{index}" for index in range(100)]
+
+    effective = _mod.effective_plugins({"plugins": own}, inherited)
+
+    assert effective == own
+    assert calls <= 300
+
+
+def test_plugin_opt_out_matching_uses_cores_exact_source_identity() -> None:
+    exact = _mod.effective_plugins(
+        {"plugins": [f"!{SCHED}"]},
+        [SCHED, "other-plugin"],
+    )
+    short = _mod.effective_plugins(
+        {"plugins": ["!molecule-ai-plugin-scheduler"]},
+        [SCHED, "other-plugin"],
+    )
+
+    assert exact == ["other-plugin", f"!{SCHED}"]
+    assert short == [SCHED, "other-plugin", "!molecule-ai-plugin-scheduler"]
 
 
 def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
@@ -645,6 +859,35 @@ def test_default_discovery_excludes_nested_molecule_ci_checkout(
     )
 
     assert _mod.main() == 0
+
+
+def test_default_discovery_has_an_aggregate_entry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "one.txt").write_text("one", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two", encoding="utf-8")
+    monkeypatch.setattr(_mod, "MAX_DISCOVERY_ENTRIES", 1, raising=False)
+
+    with pytest.raises(_mod.ScanInputError, match="discovery entry limit"):
+        _mod.discover_yaml_targets(tmp_path, set())
+
+
+def test_finding_paths_escape_newlines_and_terminal_controls() -> None:
+    rendered = str(
+        _mod.Finding(
+            "E0",
+            "bad\n::warning::forged\x1b[31m.yaml",
+            "",
+            "target contains invalid YAML",
+        )
+    )
+
+    assert "\n" not in rendered
+    assert "\r" not in rendered
+    assert "\x1b" not in rendered
+    assert "\\x0a" in rendered
+    assert "\\x1b" in rendered
 
 
 def test_repeatable_exclude_dir_is_safe_consumer_surface(
