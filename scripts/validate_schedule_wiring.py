@@ -23,8 +23,9 @@ gate that only understands one location would go green through the migration.
 WHAT IT REFUSES
 ---------------
 E0  A target file that this gate could not read or parse, a malformed schedule
-    entry, or an explicit expected file/schedule-block/schedule-entry count
-    that was not reached.
+    entry (including a plugin-config name the runtime rejects under the SDK
+    schedule contract), or an explicit expected
+    file/schedule-block/schedule-entry count that was not reached.
     Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
     are loaded safely as their underlying scalar/list/mapping so they cannot
@@ -61,10 +62,12 @@ where is a gate people learn to skip.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import stat
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -111,6 +114,7 @@ MAX_FINDING_FIELD_CHARS = 512
 MAX_FINDING_DETAIL_CHARS = 2_048
 MAX_PLUGIN_SOURCE_CHARS = 4_096
 MAX_SCHEDULE_FIELD_CHARS = 4_096
+MAX_SCHEDULE_CONTRACT_BYTES = 64 * 1024
 
 # Tool checkouts live inside consumer worktrees but are not consumer input.
 # Counting their YAML makes exact anti-vacuity assertions depend on whichever
@@ -380,6 +384,81 @@ class ScanStats(NamedTuple):
     schedule_entries: int
 
 
+class ScheduleNameContract(NamedTuple):
+    """Executable subset of the vendored SDK schedule-entry name contract."""
+
+    minimum: int
+    maximum: int
+    pattern: re.Pattern[str]
+
+
+@lru_cache(maxsize=1)
+def _load_schedule_name_contract() -> ScheduleNameContract:
+    """Load one byte-pinned SDK contract for canonical and mirrored scripts.
+
+    Canonical consumers invoke ``scripts/...`` while ecosystem repos invoke
+    ``.molecule-ci/scripts/...`` from a full molecule-ci checkout. Both paths
+    resolve to the repository-level ``schemas/`` mirror, whose byte parity
+    with molecule-ai-sdk is enforced by check-schemas-in-sync.sh.
+    """
+
+    script_dir = Path(__file__).resolve().parent
+    candidates = (
+        script_dir.parent / "schemas" / "schedule.schema.json",
+        script_dir.parent.parent / "schemas" / "schedule.schema.json",
+    )
+    schema_path = next((path for path in candidates if path.exists()), None)
+    if schema_path is None:
+        raise ScanInputError("vendored SDK schedule contract is unavailable")
+    try:
+        metadata = schema_path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ScanInputError(
+                "vendored SDK schedule contract is not a regular file"
+            )
+        if metadata.st_size > MAX_SCHEDULE_CONTRACT_BYTES:
+            raise ScanInputError(
+                "vendored SDK schedule contract exceeds its size limit"
+            )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        if not isinstance(schema, dict) or schema.get("$id") != (
+            "https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/"
+            "contracts/schedule/schedule.schema.json"
+        ):
+            raise ValueError("unexpected contract identity")
+        name_schema = schema["$defs"]["scheduleEntry"]["properties"]["name"]
+        if not isinstance(name_schema, dict):
+            raise ValueError("invalid name contract")
+        minimum = name_schema["minLength"]
+        maximum = name_schema["maxLength"]
+        raw_pattern = name_schema["pattern"]
+        if (
+            name_schema.get("type") != "string"
+            or type(minimum) is not int
+            or type(maximum) is not int
+            or minimum < 1
+            or maximum < minimum
+            or maximum > MAX_SCHEDULE_FIELD_CHARS
+            or not isinstance(raw_pattern, str)
+            or len(raw_pattern) > 512
+        ):
+            raise ValueError("invalid name contract")
+        pattern = re.compile(raw_pattern)
+    except ScanInputError:
+        raise
+    except (KeyError, OSError, UnicodeError, ValueError, TypeError, re.error) as exc:
+        raise ScanInputError("vendored SDK schedule contract is invalid") from exc
+    return ScheduleNameContract(minimum, maximum, pattern)
+
+
+def _schedule_name_is_valid(value: str) -> bool:
+    contract = _load_schedule_name_contract()
+    return (
+        contract.minimum <= len(value) <= contract.maximum
+        and contract.pattern.search(value) is not None
+    )
+
+
 class Finding:
     __slots__ = ("code", "path", "node", "detail")
 
@@ -478,6 +557,7 @@ def check_schedule_entries(
     out: list[Finding],
     budget: ScanBudget | None = None,
     owner_id: int | None = None,
+    enforce_sdk_name: bool = False,
 ) -> int:
     if not isinstance(schedules, list):
         _append_finding(
@@ -535,6 +615,10 @@ def check_schedule_entries(
         structural_errors: list[str] = []
         if not isinstance(raw_name, str) or not raw_name:
             structural_errors.append("a non-empty string `name`")
+        elif enforce_sdk_name and not _schedule_name_is_valid(raw_name):
+            structural_errors.append(
+                "a `name` matching the vendored SDK schedule contract"
+            )
         if len(cron_keys) != 1:
             structural_errors.append("exactly one of `cron_expr` or `cron`")
         elif not isinstance(sched[cron_keys[0]], str):
@@ -723,6 +807,7 @@ def check_node(
             out,
             budget,
             owner_id,
+            enforce_sdk_name=True,
         )
 
     if has_legacy:

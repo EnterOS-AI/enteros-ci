@@ -1,4 +1,4 @@
-# Vendored marketplace-artifact JSON-Schemas (SSOT mirror)
+# Vendored SDK JSON-Schemas (SSOT mirror)
 
 These `*.schema.json` files are **byte-for-byte copies** of the SSOT contract
 schemas that live in the [`molecule-ai-sdk (contracts/)`](https://git.moleculesai.app/molecule-ai/molecule-ai-sdk)
@@ -11,10 +11,11 @@ repository (the marketplace-catalog contract family, RFC
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #180 merge — schedule accepts `cron` or `cron_expr`) |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #179 merge — empty-declaration `anyOf` constraint) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
+| `schedule.schema.json`           | `contracts/schedule/schedule.schema.json`                     | `2eba5d9cd5ad3a936e659f6aa02e7c3202969c1d` (schedule-grid SSOT; stable lowercase-kebab entry names) |
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
-currently SDK PR #182 merge commit
-`dea2155364272605fceab5247c1e71b4ba444b2d`; every row is fetched from that
+currently SDK per-install-config commit
+`fd163eca94f7fa69570232fb4b4986d19a03c083`; every row is fetched from that
 same immutable commit even when the table records an older, last
 contract-changing commit for the individual file.
 
@@ -41,6 +42,12 @@ in the same change that lands the SDK edit, or expect a red here.
 > `repo-meta.yaml` OFFLINE against this copy — and kept byte-honest by the same
 > `check-schemas-in-sync.sh` drift gate.
 
+> **`schedule.schema.json` is also not a marketplace-artifact schema.** The
+> schedule wiring validator consumes its executable entry-name constraints so
+> CI counts only schedules the runtime will seed. Keeping that subset tied to
+> this byte-pinned copy prevents a duplicated Python regex from drifting away
+> from the SDK and runtime contract.
+
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 
 ## Why vendored (and not fetched at validate time)
@@ -48,7 +55,8 @@ IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 `scripts/validate-plugin.py`, `scripts/validate-workspace-template.py` and
 `scripts/validate-org-template.py` validate the REAL artifact manifests
 (`plugin.yaml` / `config.yaml` / `org.yaml`) against these schemas with
-`jsonschema`'s `Draft202012Validator`. Consumer CI anonymously fetches an
+`jsonschema`'s `Draft202012Validator`; `scripts/validate_schedule_wiring.py`
+loads the schedule entry-name subset directly. Consumer CI anonymously fetches an
 immutable, verified `molecule-ci` commit; the validator itself performs no
 authenticated cross-repo fetch of `molecule-ai-sdk (contracts/)`. The schemas
 are therefore vendored here rather than pulled at validate time.
@@ -58,8 +66,8 @@ to the `molecule-ai-sdk (contracts/)` originals. Two things keep them honest:
 
 1. `scripts/check-schemas-in-sync.sh` fetches the one immutable SDK commit in
    `schemas/SDK_SOURCE_COMMIT`, verifies the resolved commit, and byte-diffs all
-   four schemas from that same snapshot. It also fetches current SDK `main` and
-   requires the four canonical contracts there to match the pinned snapshot, so
+   five schemas from that same snapshot. It also fetches current SDK `main` and
+   requires the five canonical contracts there to match the pinned snapshot, so
    the mirror cannot silently freeze on an old commit. A source pin whose
    mirrored contracts differ from main, an invalid pin, fetch failure, missing
    source, or parity mismatch fails closed in required CI via
@@ -98,7 +106,7 @@ safe_git -C "$tmp/molecule-ai-sdk" remote add origin \
 safe_git -C "$tmp/molecule-ai-sdk" -c http.userAgent=curl/8.4.0 \
   fetch --depth=1 origin "$SDK_COMMIT"
 test "$(safe_git -C "$tmp/molecule-ai-sdk" rev-parse FETCH_HEAD)" = "$SDK_COMMIT"
-for s in plugin-manifest workspace-template org-template repo-meta; do
+for s in plugin-manifest workspace-template org-template repo-meta schedule; do
   safe_git -C "$tmp/molecule-ai-sdk" show \
     "FETCH_HEAD:contracts/$s/$s.schema.json" > "$tmp/$s.schema.json"
   python3 -m json.tool "$tmp/$s.schema.json" >/dev/null

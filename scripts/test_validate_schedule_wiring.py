@@ -13,6 +13,8 @@ direction broke.
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
 import textwrap
 from pathlib import Path
 
@@ -60,7 +62,7 @@ def test_E2_config_schedules_on_unrelated_plugin_is_refused(tmp_path):
               - source: gitea://molecule-ai/molecule-ai-plugin-seo
                 config:
                   schedules:
-                    - name: SEO Builder
+                    - name: seo-builder
                       cron_expr: "17 6 * * *"
                       prompt: run seo
     """,
@@ -80,7 +82,7 @@ def test_E2_config_schedules_on_the_scheduler_is_fine(tmp_path):
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: SEO Builder
+                    - name: seo-builder
                       cron_expr: "17 6 * * *"
                       prompt: run seo
     """,
@@ -103,7 +105,7 @@ def test_E3_both_locations_is_refused(tmp_path):
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: New
+                    - name: new
                       cron_expr: "0 * * * *"
                       prompt: new
             schedules:
@@ -240,7 +242,7 @@ def test_custom_composition_tags_do_not_skip_the_rest_of_a_document(
               - source: unrelated-plugin
                 config:
                   schedules:
-                    - name: Must be reached
+                    - name: must-be-reached
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -269,7 +271,7 @@ def test_scan_stats_prove_custom_tagged_files_and_schedule_blocks_were_reached(
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Counted
+                    - name: counted
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -506,7 +508,7 @@ def test_standard_yaml_merge_override_remains_supported(tmp_path: Path) -> None:
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Merged
+                    - name: merged
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -833,7 +835,7 @@ def test_repeated_schedule_list_alias_across_plugin_blocks_fails_closed(
             tmp_path,
             f"""
         shared: &shared
-          - name: Shared
+          - name: shared
             cron_expr: "0 * * * *"
             prompt: run
         workspaces:
@@ -1061,6 +1063,104 @@ def test_malformed_plugin_schedule_mapping_fails_closed_and_is_not_counted(
     assert "schedule entry" in str(findings[0])
 
 
+@pytest.mark.parametrize(
+    "invalid_name",
+    (
+        "   ",
+        "Hourly unanswered sweep",
+        "UPPERCASE",
+        "trailing-",
+        "a" * 129,
+    ),
+)
+def test_runtime_rejected_schedule_name_fails_closed_and_is_not_counted(
+    tmp_path: Path,
+    invalid_name: str,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: {invalid_name!r}
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 0
+    assert "SDK schedule contract" in str(findings[0])
+
+
+def test_sdk_kebab_schedule_name_is_accepted_and_counted(tmp_path: Path) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: hourly-unanswered-sweep
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """,
+        )
+    )
+
+    assert findings == []
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 1
+
+
+def test_schedule_name_rules_are_loaded_from_vendored_sdk_contract() -> None:
+    schema = json.loads(
+        (_HERE.parent / "schemas" / "schedule.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected = schema["$defs"]["scheduleEntry"]["properties"]["name"]
+    actual = _mod._load_schedule_name_contract()
+
+    assert actual.minimum == expected["minLength"]
+    assert actual.maximum == expected["maxLength"]
+    assert actual.pattern.pattern == expected["pattern"]
+    assert expected["pattern"] not in (_HERE / "validate_schedule_wiring.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_mirrored_validator_resolves_repository_level_schedule_contract(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "molecule-ci"
+    mirror = repo / ".molecule-ci" / "scripts"
+    schemas = repo / "schemas"
+    mirror.mkdir(parents=True)
+    schemas.mkdir()
+    shutil.copy2(_HERE / "validate_schedule_wiring.py", mirror)
+    shutil.copy2(_HERE.parent / "schemas" / "schedule.schema.json", schemas)
+    spec = importlib.util.spec_from_file_location(
+        "mirrored_validate_schedule_wiring", mirror / "validate_schedule_wiring.py"
+    )
+    assert spec and spec.loader
+    mirrored = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mirrored)
+
+    assert mirrored._schedule_name_is_valid("hourly-unanswered-sweep")
+    assert not mirrored._schedule_name_is_valid("Hourly unanswered sweep")
+
+
 def test_malformed_plugin_schedule_cannot_satisfy_exact_cli_entry_count(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1150,7 +1250,7 @@ def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
             - source: {SCHED}
               config:
                 schedules:
-                  - name: Inherited once
+                  - name: inherited-once
                     {cron_key}: "0 * * * *"
                     prompt: run
         workspaces:
@@ -1210,7 +1310,7 @@ def test_explicit_target_paths_are_deduplicated(tmp_path: Path) -> None:
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Once
+                    - name: once
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -1238,7 +1338,7 @@ def test_duplicate_explicit_targets_cannot_satisfy_exact_cli_counts(
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Once
+                    - name: once
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -1280,7 +1380,7 @@ def test_default_discovery_excludes_nested_molecule_ci_checkout(
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Once
+                    - name: once
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -1358,7 +1458,7 @@ def test_repeatable_exclude_dir_is_safe_consumer_surface(
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Once
+                    - name: once
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
@@ -1429,7 +1529,7 @@ def test_teams_nested_workspaces_are_scanned(tmp_path):
                   - source: some-plugin
                     config:
                       schedules:
-                        - name: H
+                        - name: h
                           cron_expr: "0 * * * *"
                           prompt: x
     """,
@@ -1448,7 +1548,7 @@ def test_workspace_template_document_is_treated_as_the_node(tmp_path):
           - source: some-plugin
             config:
               schedules:
-                - name: H
+                - name: h
                   cron_expr: "0 * * * *"
                   prompt: x
     """,
@@ -1497,7 +1597,7 @@ def test_children_are_walked(tmp_path):
                   - source: some-plugin
                     config:
                       schedules:
-                        - name: Heartbeat
+                        - name: heartbeat
                           cron_expr: "*/30 * * * *"
                           prompt: x
     """,
@@ -1521,7 +1621,7 @@ def test_children_nest_arbitrarily_deep(tmp_path):
                       - source: some-plugin
                         config:
                           schedules:
-                            - name: Deep
+                            - name: deep
                               cron_expr: "0 * * * *"
                               prompt: x
     """,
@@ -1632,7 +1732,7 @@ def test_no_finding_for_a_template_that_never_names_the_scheduler_new_shape(tmp_
               - source: {SCHED}
                 config:
                   schedules:
-                    - name: Heartbeat
+                    - name: heartbeat
                       cron_expr: "*/30 * * * *"
                       prompt: x
     """,

@@ -31,6 +31,10 @@ def test_schema_sync_uses_one_immutable_sdk_snapshot() -> None:
     assert 'CURL_HOME="$SAFE_GIT_HOME"' in script
     assert 'XDG_CONFIG_HOME="$SAFE_GIT_HOME/xdg"' in script
     assert "raw/branch/main" not in script
+    assert (
+        '[schedule.schema.json]="contracts/schedule/schedule.schema.json"'
+        in script
+    )
 
 
 def test_schema_sync_workflow_propagates_fetch_failures() -> None:
