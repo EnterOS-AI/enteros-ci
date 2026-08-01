@@ -26,7 +26,9 @@ E0  A target file that this gate could not read or parse, or an explicit
     expected file/schedule-block count that was not reached. Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
     are loaded safely as their underlying scalar/list/mapping so they cannot
-    make the whole document disappear from this gate.
+    make the whole document disappear from this gate. Duplicate mapping keys,
+    symlinks/path escapes, oversized inputs, and resource-limit violations also
+    fail closed without copying source lines into CI logs.
 
 (There is no E1 — see the long note in check_node. The scheduler is declared
 on every workspace at provision, so "template does not name the scheduler" has
@@ -57,12 +59,15 @@ where is a gate people learn to skip.
 from __future__ import annotations
 
 import argparse
+import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any, NamedTuple
 
 try:
     import yaml
+    from yaml.events import AliasEvent
 except ImportError:  # pragma: no cover - CI installs it
     print("::error::PyYAML is required (scripts/requirements.txt)", file=sys.stderr)
     raise SystemExit(2)
@@ -77,6 +82,53 @@ SCHEDULER_MARKERS: tuple[str, ...] = (
     "molecule-scheduler",
 )
 
+# Resource limits apply before and during parsing. They are intentionally much
+# larger than the current fleet's files (the largest is well below 1 MiB and
+# each template has tens, not thousands, of nodes), while still preventing a
+# tiny alias graph or device/symlink input from consuming an entire CI runner.
+MAX_YAML_FILE_BYTES = 4 * 1024 * 1024
+MAX_YAML_DOCUMENTS = 128
+MAX_YAML_NODES = 100_000
+MAX_YAML_DEPTH = 100
+MAX_YAML_ALIASES = 256
+MAX_WORKSPACE_NODES = 10_000
+MAX_WORKSPACE_DEPTH = 64
+
+# Tool checkouts live inside consumer worktrees but are not consumer input.
+# Counting their YAML makes exact anti-vacuity assertions depend on whichever
+# files happen to exist in the validator repo itself.
+DEFAULT_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        ".molecule-ci-canonical",
+        ".molecule-ci-ssot",
+    }
+)
+
+
+class YamlResourceLimitError(yaml.YAMLError):
+    """A bounded-parser refusal whose message is safe for public CI logs."""
+
+    def __init__(self, safe_reason: str, mark: Any | None = None) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+        self.problem_mark = mark
+
+
+class DuplicateKeyError(yaml.constructor.ConstructorError):
+    """Duplicate mapping key without retaining the potentially secret key."""
+
+    safe_reason = "target contains a duplicate mapping key"
+
+
+class ScanInputError(Exception):
+    """A safe, non-disclosing refusal at the file/traversal boundary."""
+
+    def __init__(self, safe_reason: str) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+
 
 class PermissiveLoader(yaml.SafeLoader):
     """Safe YAML loader that preserves Molecule composition-tag contents.
@@ -87,6 +139,77 @@ class PermissiveLoader(yaml.SafeLoader):
     schedule declarations. The tag itself has no wiring semantics here, so
     construct its underlying scalar/list/mapping using SafeLoader primitives.
     """
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._molecule_aliases = 0
+        self._molecule_nodes = 0
+        self._molecule_depth = 0
+
+    def compose_node(self, parent: Any, index: Any) -> yaml.Node:
+        event = self.peek_event()
+        self._molecule_nodes += 1
+        if self._molecule_nodes > MAX_YAML_NODES:
+            raise YamlResourceLimitError(
+                "target exceeds the YAML node limit",
+                event.start_mark,
+            )
+        if self.check_event(AliasEvent):
+            self._molecule_aliases += 1
+            if self._molecule_aliases > MAX_YAML_ALIASES:
+                raise YamlResourceLimitError(
+                    "target exceeds the YAML alias limit",
+                    event.start_mark,
+                )
+
+        self._molecule_depth += 1
+        try:
+            if self._molecule_depth > MAX_YAML_DEPTH:
+                raise YamlResourceLimitError(
+                    "target exceeds the YAML depth limit",
+                    event.start_mark,
+                )
+            return super().compose_node(parent, index)
+        finally:
+            self._molecule_depth -= 1
+
+    def construct_mapping(self, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
+        if not isinstance(node, yaml.MappingNode):
+            return super().construct_mapping(node, deep=deep)
+
+        # SafeLoader normally accepts duplicate keys and silently keeps the
+        # last value. A later benign `plugins:`/`schedules:` key can therefore
+        # hide a broken earlier block from both findings and exact counters.
+        # Inspect the literal mapping before SafeLoader expands `<<` merges.
+        # An explicit key overriding an inherited merge value is standard YAML,
+        # whereas two literal keys in this node are ambiguous and rejected.
+        seen: set[Any] = set()
+        for key_node, _value_node in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                key: Any = (key_node.tag, "<<")
+            else:
+                # Compare the value SafeLoader will actually place in the
+                # Python mapping. A custom tag is deliberately erased by this
+                # loader, so it must not disguise a duplicate plain key.
+                key = self.construct_object(key_node, deep=deep)
+            try:
+                if key in seen:
+                    raise DuplicateKeyError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        "duplicate mapping key",
+                        key_node.start_mark,
+                    )
+                seen.add(key)
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    key_node.start_mark,
+                ) from exc
+
+        return super().construct_mapping(node, deep=deep)
 
 
 def _construct_custom_tag(
@@ -160,9 +283,16 @@ def check_schedule_entries(
 ) -> int:
     if not isinstance(schedules, list):
         return 0
+    seen_entries: set[int] = set()
     for sched in schedules:
         if not isinstance(sched, dict):
             continue
+        object_id = id(sched)
+        if object_id in seen_entries:
+            raise ScanInputError(
+                "target contains a cyclic or repeated YAML alias in schedules"
+            )
+        seen_entries.add(object_id)
         name = str(sched.get("name", "<unnamed>"))
         cron = sched.get("cron_expr")
         if isinstance(cron, str) and cron.strip():
@@ -239,10 +369,17 @@ def check_node(
     plugins = effective_plugins(node_obj, inherited_plugins or [])
 
     plugin_scheds: list[tuple[str, Any]] = []
+    seen_plugin_objects: set[int] = set()
     if isinstance(plugins, list):
         for p in plugins:
             if not isinstance(p, dict):
                 continue
+            object_id = id(p)
+            if object_id in seen_plugin_objects:
+                raise ScanInputError(
+                    "target contains a cyclic or repeated YAML alias in plugins"
+                )
+            seen_plugin_objects.add(object_id)
             cfg = p.get("config")
             if isinstance(cfg, dict) and "schedules" in cfg:
                 plugin_scheds.append((plugin_source(p), cfg["schedules"]))
@@ -328,17 +465,30 @@ def org_default_plugins(doc: Any) -> list:
     return []
 
 
-def check_document(doc: Any, path: str, out: list[Finding],
-                   inherited_plugins: list | None = None) -> tuple[int, int]:
+def check_document(
+    doc: Any,
+    path: str,
+    out: list[Finding],
+    inherited_plugins: list | None = None,
+    *,
+    defaults_in_inherited: bool = False,
+) -> tuple[int, int]:
     if not isinstance(doc, dict):
         return 0, 0
     # A node inherits BOTH the repo-wide org defaults and any defaults declared
-    # in its own document.
-    inherited = list(inherited_plugins or []) + org_default_plugins(doc)
+    # in its own document. scan_with_stats passes the complete repo-defaults
+    # collection, which already contains this document's defaults; direct
+    # callers retain the historical behavior of adding document defaults here.
+    inherited = list(inherited_plugins or [])
+    if not defaults_in_inherited:
+        inherited.extend(org_default_plugins(doc))
     # org template: workspaces live under teams[].workspaces[] or workspaces[]
     nodes: list[tuple[str, dict]] = []
+    seen_containers: set[int] = set()
+    seen_nodes: set[int] = set()
+    node_visits = 0
 
-    def collect(container: Any) -> None:
+    def collect(container: Any, depth: int = 1) -> None:
         """Walk the node tree, INCLUDING `children:`.
 
         Org templates nest. reno-stars declares exactly ONE top-level
@@ -350,13 +500,31 @@ def check_document(doc: Any, path: str, out: list[Finding],
         against fixtures; every test here used a flat shape and all 20 passed
         while the gate was blind to reno-stars entirely.
         """
+        nonlocal node_visits
         if not isinstance(container, list):
             return
+        if depth > MAX_WORKSPACE_DEPTH:
+            raise ScanInputError("target exceeds the workspace depth limit")
+        container_id = id(container)
+        if container_id in seen_containers:
+            raise ScanInputError(
+                "target contains a cyclic or repeated YAML alias in the workspace tree"
+            )
+        seen_containers.add(container_id)
         for w in container:
             if not isinstance(w, dict):
                 continue
+            node_id = id(w)
+            if node_id in seen_nodes:
+                raise ScanInputError(
+                    "target contains a cyclic or repeated YAML alias in the workspace tree"
+                )
+            seen_nodes.add(node_id)
+            node_visits += 1
+            if node_visits > MAX_WORKSPACE_NODES:
+                raise ScanInputError("target exceeds the workspace node limit")
             nodes.append((str(w.get("name", "<unnamed>")), w))
-            collect(w.get("children"))
+            collect(w.get("children"), depth + 1)
 
     collect(doc.get("workspaces"))
     teams = doc.get("teams")
@@ -383,31 +551,179 @@ def check_document(doc: Any, path: str, out: list[Finding],
     return check_node(doc, path, "", out, inherited)
 
 
-def scan_with_stats(paths: list[Path]) -> tuple[list[Finding], ScanStats]:
+def _deduplicate_paths(paths: list[Path]) -> list[Path]:
+    """Preserve first-seen order while counting each lexical file once."""
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path)
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _resolve_scan_root(paths: list[Path], root: Path | None) -> Path:
+    candidate: Path
+    if root is not None:
+        candidate = Path(root)
+    elif paths:
+        try:
+            parents = [
+                os.path.dirname(os.path.abspath(os.fspath(path)))
+                for path in paths
+            ]
+            candidate = Path(os.path.commonpath(parents))
+        except ValueError as exc:
+            raise ScanInputError("scan root could not be inferred") from exc
+    else:
+        candidate = Path.cwd()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScanInputError("scan root is unavailable") from exc
+    if not resolved.is_dir():
+        raise ScanInputError("scan root is not a directory")
+    return resolved
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _read_bounded_yaml(path: Path, root: Path) -> str:
+    """Read one regular in-root file without following the final symlink."""
+    lexical = Path(os.path.abspath(os.fspath(path)))
+    try:
+        path_stat = lexical.lstat()
+    except OSError as exc:
+        raise ScanInputError("target could not be safely opened") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ScanInputError("target is a symbolic link; only regular files are allowed")
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ScanInputError("target is not a regular file")
+
+    try:
+        resolved = lexical.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ScanInputError("target could not be safely resolved") from exc
+    if not _is_within(resolved, root):
+        raise ScanInputError("target resolves outside the scan root")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise ScanInputError("target could not be safely opened") from exc
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ScanInputError("target is not a regular file")
+        if opened_stat.st_size > MAX_YAML_FILE_BYTES:
+            raise ScanInputError(
+                f"target exceeds the maximum size of {MAX_YAML_FILE_BYTES} bytes"
+            )
+
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while bytes_read <= MAX_YAML_FILE_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_YAML_FILE_BYTES + 1 - bytes_read),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        if bytes_read > MAX_YAML_FILE_BYTES:
+            raise ScanInputError(
+                f"target exceeds the maximum size of {MAX_YAML_FILE_BYTES} bytes"
+            )
+    except OSError as exc:
+        raise ScanInputError("target could not be safely read") from exc
+    finally:
+        os.close(descriptor)
+
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ScanInputError("target is not valid UTF-8") from exc
+
+
+def _yaml_error_detail(exc: yaml.YAMLError) -> str:
+    if isinstance(exc, DuplicateKeyError):
+        detail = exc.safe_reason
+    elif isinstance(exc, YamlResourceLimitError):
+        detail = exc.safe_reason
+    else:
+        detail = "target contains invalid YAML"
+    mark = getattr(exc, "problem_mark", None)
+    if mark is not None:
+        detail += f" at line {mark.line + 1}, column {mark.column + 1}"
+    return detail
+
+
+def _load_documents(text: str) -> list[Any]:
+    documents: list[Any] = []
+    for document in yaml.load_all(text, Loader=PermissiveLoader):
+        if len(documents) >= MAX_YAML_DOCUMENTS:
+            raise YamlResourceLimitError("target exceeds the YAML document limit")
+        documents.append(document)
+    return documents
+
+
+def scan_with_stats(
+    paths: list[Path],
+    *,
+    root: Path | None = None,
+) -> tuple[list[Finding], ScanStats]:
+    targets = _deduplicate_paths(paths)
     out: list[Finding] = []
     loaded: list[tuple[Path, list[Any]]] = []
-    for p in paths:
+    try:
+        scan_root = _resolve_scan_root(targets, root)
+    except ScanInputError as exc:
+        out.append(Finding("E0", "<scan>", "", exc.safe_reason))
+        return out, ScanStats(len(targets), 0, 0, 0, 0)
+
+    for p in targets:
         try:
-            text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            text = _read_bounded_yaml(p, scan_root)
+        except ScanInputError as exc:
             out.append(
                 Finding(
                     "E0",
                     str(p),
                     "",
-                    f"target could not be read by the wiring gate: {exc}",
+                    exc.safe_reason,
                 )
             )
             continue
         try:
-            docs = list(yaml.load_all(text, Loader=PermissiveLoader))
+            docs = _load_documents(text)
         except yaml.YAMLError as exc:
             out.append(
                 Finding(
                     "E0",
                     str(p),
                     "",
-                    f"target could not be parsed by the wiring gate: {exc}",
+                    _yaml_error_detail(exc),
+                )
+            )
+            continue
+        except RecursionError:
+            out.append(
+                Finding(
+                    "E0",
+                    str(p),
+                    "",
+                    "target exceeds the YAML processing limits",
                 )
             )
             continue
@@ -427,16 +743,21 @@ def scan_with_stats(paths: list[Path]) -> tuple[list[Finding], ScanStats]:
     schedule_entries = 0
     for p, docs in loaded:
         for doc in docs:
-            document_blocks, document_entries = check_document(
-                doc,
-                str(p),
-                out,
-                repo_defaults,
-            )
+            try:
+                document_blocks, document_entries = check_document(
+                    doc,
+                    str(p),
+                    out,
+                    repo_defaults,
+                    defaults_in_inherited=True,
+                )
+            except ScanInputError as exc:
+                out.append(Finding("E0", str(p), "", exc.safe_reason))
+                continue
             schedule_blocks += document_blocks
             schedule_entries += document_entries
     return out, ScanStats(
-        target_files=len(paths),
+        target_files=len(targets),
         parsed_files=len(loaded),
         documents=sum(len(docs) for _path, docs in loaded),
         schedule_blocks=schedule_blocks,
@@ -444,38 +765,87 @@ def scan_with_stats(paths: list[Path]) -> tuple[list[Finding], ScanStats]:
     )
 
 
-def scan(paths: list[Path]) -> list[Finding]:
-    findings, _stats = scan_with_stats(paths)
+def scan(paths: list[Path], *, root: Path | None = None) -> list[Finding]:
+    findings, _stats = scan_with_stats(paths, root=root)
     return findings
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return value
+
+
+def _directory_name(raw: str) -> str:
+    if not raw or raw in {".", ".."} or "/" in raw or "\\" in raw:
+        raise argparse.ArgumentTypeError("must be a single directory name")
+    return raw
+
+
+def discover_yaml_targets(root: Path, excluded_dirs: set[str]) -> list[Path]:
+    """Discover YAML under root while excluding tool/generated directories."""
+    return sorted(
+        path
+        for path in root.rglob("*.y*ml")
+        if not any(part in excluded_dirs for part in path.relative_to(root).parts[:-1])
+    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=None,
-                    help="YAML files to check (default: all *.yaml/*.yml under the repo root).")
-    ap.add_argument("--root", default=".", help="Repo root to scan when no paths are given.")
+    ap.add_argument(
+        "paths",
+        nargs="*",
+        default=None,
+        help=(
+            "Explicit YAML allowlist (default: discover *.yaml/*.yml under --root). "
+            "Every target must be a regular file inside --root; duplicates collapse."
+        ),
+    )
+    ap.add_argument(
+        "--root",
+        default=".",
+        help="Security boundary and discovery root (default: current directory).",
+    )
+    ap.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        type=_directory_name,
+        metavar="NAME",
+        help=(
+            "Additional directory name to omit during discovery (repeatable). "
+            "Tool checkouts such as .molecule-ci-canonical are excluded by default."
+        ),
+    )
     ap.add_argument(
         "--expect-parsed-files",
-        type=int,
-        help="Fail unless exactly this many target files are parsed.",
+        type=_positive_int,
+        help="Fail unless exactly this positive number of target files are parsed.",
     )
     ap.add_argument(
         "--expect-schedule-blocks",
-        type=int,
-        help="Fail unless exactly this many node/plugin schedule blocks are reached.",
+        type=_positive_int,
+        help=(
+            "Fail unless exactly this positive number of node/plugin schedule "
+            "blocks are reached."
+        ),
     )
     args = ap.parse_args()
 
+    root = Path(args.root)
     if args.paths:
         targets = [Path(p) for p in args.paths]
     else:
-        root = Path(args.root)
-        targets = sorted(
-            p for p in root.rglob("*.y*ml")
-            if ".git" not in p.parts and "node_modules" not in p.parts
-        )
+        excluded_dirs = set(DEFAULT_EXCLUDED_DIRS)
+        excluded_dirs.update(args.exclude_dir)
+        targets = discover_yaml_targets(root, excluded_dirs)
 
-    findings, stats = scan_with_stats(targets)
+    findings, stats = scan_with_stats(targets, root=root)
     if (
         args.expect_parsed_files is not None
         and stats.parsed_files != args.expect_parsed_files

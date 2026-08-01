@@ -123,6 +123,33 @@ also assert script sentinels. Updating any pin is a reviewed dependency change.
 | Direct-workspace count | Notice | Resolved inline workspace inventory |
 | No committed secrets | Error | Leaked API keys |
 
+### validate-schedule-wiring
+
+`scripts/validate_schedule_wiring.py` complements the org schema: it proves
+that schedule blocks are attached where the scheduler can read them. Consumers
+with a known inventory should make the scan non-vacuous with positive exact
+counts:
+
+```bash
+python3 .molecule-ci-canonical/.molecule-ci/scripts/validate_schedule_wiring.py \
+  --root . \
+  --expect-parsed-files 16 \
+  --expect-schedule-blocks 9
+```
+
+Default discovery excludes `.git`, `node_modules`, `.molecule-ci-canonical`,
+and `.molecule-ci-ssot`, so a validator checkout nested in the consumer does
+not change its file count. The example is the current molecule-dev contract:
+16 consumer-owned YAML files (including `channel-dependency-lock.yaml`) and 9
+schedule blocks. Change either exact number in the same reviewed consumer diff
+that intentionally changes that inventory. `--exclude-dir NAME` adds another
+generated/tool directory exclusion. Passing YAML paths positionally is the
+explicit allowlist form; duplicate paths collapse, and every target must be a
+regular, bounded, non-symlink file inside `--root`. Unknown local `!`
+composition tags are loaded as safe data, while duplicate keys, malformed YAML,
+unsafe reads, excessive aliases/depth/nodes, and cyclic workspace aliases fail
+closed with E0 without echoing source lines into CI logs.
+
 ## Composite actions
 
 ### conformance-gate

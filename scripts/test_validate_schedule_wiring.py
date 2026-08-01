@@ -201,6 +201,14 @@ def test_custom_composition_tags_do_not_skip_the_rest_of_a_document(
     assert codes(findings) == ["E2"]
 
 
+def test_python_object_tags_remain_rejected_by_safe_loader(tmp_path: Path) -> None:
+    findings = scan(
+        write(tmp_path, "value: !!python/object/new:builtins.str []\n")
+    )
+
+    assert codes(findings) == ["E0"]
+
+
 def test_scan_stats_prove_custom_tagged_files_and_schedule_blocks_were_reached(
     tmp_path: Path,
 ) -> None:
@@ -238,6 +246,8 @@ def test_main_rejects_vacuous_expected_scan_counts(
         "argv",
         [
             "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
             "--expect-parsed-files",
             "2",
             "--expect-schedule-blocks",
@@ -250,6 +260,452 @@ def test_main_rejects_vacuous_expected_scan_counts(
     captured = capsys.readouterr()
     assert "expected 2 parsed file(s), reached 1" in captured.err
     assert "expected 9 schedule block(s), reached 0" in captured.err
+
+
+def test_duplicate_mapping_keys_fail_closed_instead_of_shadowing_schedules(
+    tmp_path: Path,
+) -> None:
+    paths = write(tmp_path, f"""
+        workspaces:
+          - name: Duplicate
+            plugins:
+              - source: unrelated-plugin
+                config:
+                  schedules:
+                    - name: Hidden broken schedule
+                      cron_expr: "0 0 0 * * *"
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Visible benign schedule
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)
+
+    findings, stats = scan_with_stats(paths)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert "Hidden broken schedule" not in str(findings[0])
+
+
+def test_custom_tag_cannot_disguise_a_duplicate_mapping_key(tmp_path: Path) -> None:
+    findings = scan(write(tmp_path, """
+        workspaces:
+          - ? !local plugins
+            : [hidden]
+            plugins: [visible]
+    """))
+
+    assert codes(findings) == ["E0"]
+
+
+def test_standard_yaml_merge_override_remains_supported(tmp_path: Path) -> None:
+    findings, stats = scan_with_stats(write(tmp_path, f"""
+        base: &base
+          name: Scheduled
+          plugins: []
+        workspaces:
+          - <<: *base
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Merged
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """))
+
+    assert findings == []
+    assert stats.schedule_blocks == 1
+
+
+def test_symlinked_yaml_is_rejected_without_disclosing_target_contents(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside-data"
+    marker = "CONFIDENTIAL_MARKER_MUST_NOT_APPEAR"
+    outside.write_text(f"value: [{marker}\n", encoding="utf-8")
+    linked = root / "linked.yaml"
+    linked.symlink_to(outside)
+
+    findings, stats = _mod.scan_with_stats([linked], root=root)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert marker not in str(findings[0])
+    assert "symbolic link" in str(findings[0])
+
+
+def test_regular_file_outside_scan_root_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("workspaces: []\n", encoding="utf-8")
+
+    findings, stats = _mod.scan_with_stats([outside], root=root)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert "outside the scan root" in str(findings[0])
+
+
+def test_non_regular_yaml_target_is_rejected_before_read(tmp_path: Path) -> None:
+    directory = tmp_path / "directory.yaml"
+    directory.mkdir()
+
+    findings, stats = scan_with_stats([directory])
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert "not a regular file" in str(findings[0])
+
+
+def test_oversized_yaml_is_rejected_without_echoing_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "PRIVATE_OVERSIZED_MARKER"
+    paths = write(tmp_path, f"value: {marker}\n")
+    monkeypatch.setattr(_mod, "MAX_YAML_FILE_BYTES", 8, raising=False)
+
+    findings, stats = scan_with_stats(paths)
+
+    assert codes(findings) == ["E0"]
+    assert stats.parsed_files == 0
+    assert marker not in str(findings[0])
+    assert "maximum size" in str(findings[0])
+
+
+def test_yaml_parse_error_does_not_echo_the_source_line(tmp_path: Path) -> None:
+    marker = "CONFIDENTIAL_PARSE_MARKER"
+    findings = scan(write(tmp_path, f"value: [{marker}\n"))
+
+    assert codes(findings) == ["E0"]
+    assert marker not in str(findings[0])
+    assert "line " in str(findings[0])
+    assert "column " in str(findings[0])
+
+
+def test_recursive_workspace_alias_fails_closed(tmp_path: Path) -> None:
+    findings = scan(write(tmp_path, """
+        workspaces: &nodes
+          - name: Loop
+            children: *nodes
+    """))
+
+    assert codes(findings) == ["E0"]
+    assert "cyclic or repeated YAML alias" in str(findings[0])
+
+
+def test_repeated_workspace_alias_fails_before_exponential_walk(
+    tmp_path: Path,
+) -> None:
+    findings = scan(write(tmp_path, """
+        definitions:
+          - &leaf
+            name: Leaf
+          - &branch
+            name: Branch
+            children: [*leaf, *leaf]
+        workspaces: [*branch, *branch]
+    """))
+
+    assert codes(findings) == ["E0"]
+    assert "cyclic or repeated YAML alias" in str(findings[0])
+
+
+def test_yaml_alias_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_YAML_ALIASES", 1, raising=False)
+    findings = scan(write(tmp_path, """
+        definitions:
+          value: &shared {name: shared}
+          first: *shared
+          second: *shared
+        workspaces: []
+    """))
+
+    assert codes(findings) == ["E0"]
+    assert "alias limit" in str(findings[0])
+
+
+def test_yaml_depth_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_YAML_DEPTH", 3, raising=False)
+    findings = scan(write(tmp_path, "value: {a: {b: {c: {d: leaf}}}}\n"))
+
+    assert codes(findings) == ["E0"]
+    assert "YAML depth limit" in str(findings[0])
+
+
+def test_yaml_node_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_YAML_NODES", 5, raising=False)
+    findings = scan(write(tmp_path, "value: [one, two, three, four, five]\n"))
+
+    assert codes(findings) == ["E0"]
+    assert "YAML node limit" in str(findings[0])
+
+
+def test_yaml_document_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_YAML_DOCUMENTS", 1, raising=False)
+    findings = scan(write(tmp_path, "---\nvalue: one\n---\nvalue: two\n"))
+
+    assert codes(findings) == ["E0"]
+    assert "YAML document limit" in str(findings[0])
+
+
+def test_workspace_depth_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_WORKSPACE_DEPTH", 1, raising=False)
+    findings = scan(write(tmp_path, """
+        workspaces:
+          - name: Root
+            children:
+              - name: Too deep
+    """))
+
+    assert codes(findings) == ["E0"]
+    assert "workspace depth limit" in str(findings[0])
+
+
+def test_workspace_node_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_mod, "MAX_WORKSPACE_NODES", 1, raising=False)
+    findings = scan(write(tmp_path, """
+        workspaces:
+          - name: One
+          - name: Two
+    """))
+
+    assert codes(findings) == ["E0"]
+    assert "workspace node limit" in str(findings[0])
+
+
+def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
+    tmp_path: Path,
+) -> None:
+    findings, stats = scan_with_stats(write(tmp_path, f"""
+        defaults:
+          plugins:
+            - source: {SCHED}
+              config:
+                schedules:
+                  - name: Inherited once
+                    cron_expr: "0 * * * *"
+                    prompt: run
+        workspaces:
+          - name: A
+    """))
+
+    assert findings == []
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    (
+        ("--expect-parsed-files", "0"),
+        ("--expect-parsed-files", "-1"),
+        ("--expect-schedule-blocks", "0"),
+        ("--expect-schedule-blocks", "-1"),
+    ),
+)
+def test_expectations_must_be_positive_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+) -> None:
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            flag,
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.main()
+
+    assert exc_info.value.code == 2
+
+
+def test_explicit_target_paths_are_deduplicated(tmp_path: Path) -> None:
+    path = write(tmp_path, f"""
+        workspaces:
+          - name: One
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Once
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)[0]
+
+    findings, stats = scan_with_stats([path, path, Path(str(path))])
+
+    assert findings == []
+    assert stats.target_files == 1
+    assert stats.parsed_files == 1
+    assert stats.schedule_blocks == 1
+
+
+def test_duplicate_explicit_targets_cannot_satisfy_exact_cli_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = write(tmp_path, f"""
+        workspaces:
+          - name: One
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Once
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)[0]
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--expect-parsed-files",
+            "2",
+            "--expect-schedule-blocks",
+            "2",
+            str(path),
+            str(path),
+        ],
+    )
+
+    assert _mod.main() == 1
+    captured = capsys.readouterr()
+    assert "expected 2 parsed file(s), reached 1" in captured.err
+    assert "expected 2 schedule block(s), reached 1" in captured.err
+
+
+def test_default_discovery_excludes_nested_molecule_ci_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(tmp_path, f"""
+        workspaces:
+          - name: One
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Once
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)
+    tool_checkout = tmp_path / ".molecule-ci-canonical"
+    tool_checkout.mkdir()
+    (tool_checkout / "tool.yaml").write_text("workspaces: []\n", encoding="utf-8")
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--expect-parsed-files",
+            "1",
+            "--expect-schedule-blocks",
+            "1",
+        ],
+    )
+
+    assert _mod.main() == 0
+
+
+def test_repeatable_exclude_dir_is_safe_consumer_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write(tmp_path, f"""
+        workspaces:
+          - name: One
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Once
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "copy.yaml").write_text("workspaces: []\n", encoding="utf-8")
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--exclude-dir",
+            "generated",
+            "--expect-parsed-files",
+            "1",
+            "--expect-schedule-blocks",
+            "1",
+        ],
+    )
+
+    assert _mod.main() == 0
+
+
+@pytest.mark.parametrize("value", (".", "..", "nested/tool", "nested\\tool"))
+def test_exclude_dir_accepts_only_one_directory_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--exclude-dir",
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _mod.main()
+
+    assert exc_info.value.code == 2
 
 
 # --- shapes that must be understood -----------------------------------------
