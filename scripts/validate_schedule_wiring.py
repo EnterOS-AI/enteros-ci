@@ -78,6 +78,13 @@ except ImportError:  # pragma: no cover - CI installs it
     print("::error::PyYAML is required (scripts/requirements.txt)", file=sys.stderr)
     raise SystemExit(2)
 
+try:
+    from jsonschema import Draft7Validator
+    from jsonschema.exceptions import SchemaError
+except ImportError:  # pragma: no cover - CI installs it
+    print("::error::jsonschema is required (scripts/requirements.txt)", file=sys.stderr)
+    raise SystemExit(2)
+
 # Source strings that identify the scheduler. Matched as a SUBSTRING against
 # each plugin source so a pin (`...#v0.2.0`) or a full gitea:// URL still
 # matches. Kept as a tuple rather than one string because the install
@@ -390,6 +397,7 @@ class ScheduleNameContract(NamedTuple):
     minimum: int
     maximum: int
     pattern: re.Pattern[str]
+    validator: Draft7Validator
 
 
 @lru_cache(maxsize=1)
@@ -403,19 +411,16 @@ def _load_schedule_name_contract() -> ScheduleNameContract:
     """
 
     script_dir = Path(__file__).resolve().parent
-    candidates = (
-        script_dir.parent / "schemas" / "schedule.schema.json",
-        script_dir.parent.parent / "schemas" / "schedule.schema.json",
-    )
-    schema_path = next((path for path in candidates if path.exists()), None)
-    if schema_path is None:
+    tool_root = script_dir.parent
+    if tool_root.name == ".molecule-ci":
+        tool_root = tool_root.parent
+    schema_path = tool_root / "schemas" / "schedule.schema.json"
+    if not schema_path.exists():
         raise ScanInputError("vendored SDK schedule contract is unavailable")
     try:
         metadata = schema_path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise ScanInputError(
-                "vendored SDK schedule contract is not a regular file"
-            )
+            raise ScanInputError("vendored SDK schedule contract is not a regular file")
         if metadata.st_size > MAX_SCHEDULE_CONTRACT_BYTES:
             raise ScanInputError(
                 "vendored SDK schedule contract exceeds its size limit"
@@ -444,19 +449,26 @@ def _load_schedule_name_contract() -> ScheduleNameContract:
         ):
             raise ValueError("invalid name contract")
         pattern = re.compile(raw_pattern)
+        Draft7Validator.check_schema(name_schema)
+        validator = Draft7Validator(name_schema)
     except ScanInputError:
         raise
-    except (KeyError, OSError, UnicodeError, ValueError, TypeError, re.error) as exc:
+    except (
+        KeyError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        re.error,
+        SchemaError,
+    ) as exc:
         raise ScanInputError("vendored SDK schedule contract is invalid") from exc
-    return ScheduleNameContract(minimum, maximum, pattern)
+    return ScheduleNameContract(minimum, maximum, pattern, validator)
 
 
 def _schedule_name_is_valid(value: str) -> bool:
     contract = _load_schedule_name_contract()
-    return (
-        contract.minimum <= len(value) <= contract.maximum
-        and contract.pattern.search(value) is not None
-    )
+    return contract.validator.is_valid(value)
 
 
 class Finding:

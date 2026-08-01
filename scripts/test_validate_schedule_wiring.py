@@ -1125,9 +1125,7 @@ def test_sdk_kebab_schedule_name_is_accepted_and_counted(tmp_path: Path) -> None
 
 def test_schedule_name_rules_are_loaded_from_vendored_sdk_contract() -> None:
     schema = json.loads(
-        (_HERE.parent / "schemas" / "schedule.schema.json").read_text(
-            encoding="utf-8"
-        )
+        (_HERE.parent / "schemas" / "schedule.schema.json").read_text(encoding="utf-8")
     )
     expected = schema["$defs"]["scheduleEntry"]["properties"]["name"]
     actual = _mod._load_schedule_name_contract()
@@ -1159,6 +1157,82 @@ def test_mirrored_validator_resolves_repository_level_schedule_contract(
 
     assert mirrored._schedule_name_is_valid("hourly-unanswered-sweep")
     assert not mirrored._schedule_name_is_valid("Hourly unanswered sweep")
+
+
+def test_mirrored_validator_ignores_shadow_schema_inside_mirror(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "molecule-ci"
+    mirror = repo / ".molecule-ci" / "scripts"
+    shadow_schemas = repo / ".molecule-ci" / "schemas"
+    schemas = repo / "schemas"
+    mirror.mkdir(parents=True)
+    shadow_schemas.mkdir()
+    schemas.mkdir()
+    shutil.copy2(_HERE / "validate_schedule_wiring.py", mirror)
+    shutil.copy2(_HERE.parent / "schemas" / "schedule.schema.json", schemas)
+    shadow = json.loads(
+        (_HERE.parent / "schemas" / "schedule.schema.json").read_text(encoding="utf-8")
+    )
+    shadow["$defs"]["scheduleEntry"]["properties"]["name"]["pattern"] = ".*"
+    (shadow_schemas / "schedule.schema.json").write_text(
+        json.dumps(shadow), encoding="utf-8"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "shadowed_validate_schedule_wiring",
+        mirror / "validate_schedule_wiring.py",
+    )
+    assert spec and spec.loader
+    shadowed = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shadowed)
+
+    assert not shadowed._schedule_name_is_valid("UPPERCASE")
+
+
+def test_canonical_validator_does_not_load_contract_outside_repository(
+    tmp_path: Path,
+) -> None:
+    repo_scripts = tmp_path / "consumer" / "scripts"
+    outside_schemas = tmp_path / "schemas"
+    repo_scripts.mkdir(parents=True)
+    outside_schemas.mkdir()
+    shutil.copy2(_HERE / "validate_schedule_wiring.py", repo_scripts)
+    shutil.copy2(_HERE.parent / "schemas" / "schedule.schema.json", outside_schemas)
+    spec = importlib.util.spec_from_file_location(
+        "isolated_validate_schedule_wiring",
+        repo_scripts / "validate_schedule_wiring.py",
+    )
+    assert spec and spec.loader
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+
+    with pytest.raises(isolated.ScanInputError, match="contract is unavailable"):
+        isolated._load_schedule_name_contract()
+
+
+def test_schedule_name_validation_honors_future_schema_keywords(
+    tmp_path: Path,
+) -> None:
+    repo_scripts = tmp_path / "molecule-ci" / "scripts"
+    schemas = tmp_path / "molecule-ci" / "schemas"
+    repo_scripts.mkdir(parents=True)
+    schemas.mkdir()
+    shutil.copy2(_HERE / "validate_schedule_wiring.py", repo_scripts)
+    schema = json.loads(
+        (_HERE.parent / "schemas" / "schedule.schema.json").read_text(encoding="utf-8")
+    )
+    schema["$defs"]["scheduleEntry"]["properties"]["name"]["enum"] = ["only-approved"]
+    (schemas / "schedule.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        "evolved_validate_schedule_wiring",
+        repo_scripts / "validate_schedule_wiring.py",
+    )
+    assert spec and spec.loader
+    evolved = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evolved)
+
+    assert evolved._schedule_name_is_valid("only-approved")
+    assert not evolved._schedule_name_is_valid("hourly-unanswered-sweep")
 
 
 def test_malformed_plugin_schedule_cannot_satisfy_exact_cli_entry_count(
