@@ -27,6 +27,7 @@ _mod = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_mod)
 
 scan = _mod.scan
+scan_with_stats = _mod.scan_with_stats
 is_scheduler = _mod.is_scheduler
 declares_scheduler = _mod.declares_scheduler
 plugin_source = _mod.plugin_source
@@ -168,9 +169,87 @@ def test_a_template_with_no_schedules_is_silent(tmp_path):
     assert f == []
 
 
-def test_malformed_yaml_is_left_to_the_schema_gate(tmp_path):
+def test_malformed_yaml_fails_closed_in_this_gate_too(tmp_path):
     f = scan(write(tmp_path, "workspaces: [oops\n  - broken"))
-    assert f == []
+    assert codes(f) == ["E0"]
+
+
+@pytest.mark.parametrize(
+    "tagged_entry",
+    (
+        "!include ./agent/workspace.yaml",
+        "!external {repo: molecule-ai/department, ref: v1.2.3, path: workspace.yaml}",
+    ),
+)
+def test_custom_composition_tags_do_not_skip_the_rest_of_a_document(
+    tmp_path: Path,
+    tagged_entry: str,
+) -> None:
+    findings = scan(write(tmp_path, f"""
+        workspaces:
+          - {tagged_entry}
+          - name: Scheduled
+            plugins:
+              - source: unrelated-plugin
+                config:
+                  schedules:
+                    - name: Must be reached
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """))
+
+    assert codes(findings) == ["E2"]
+
+
+def test_scan_stats_prove_custom_tagged_files_and_schedule_blocks_were_reached(
+    tmp_path: Path,
+) -> None:
+    paths = write(tmp_path, f"""
+        workspaces:
+          - !include ./agent/workspace.yaml
+          - name: Scheduled
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Counted
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """)
+
+    findings, stats = scan_with_stats(paths)
+
+    assert findings == []
+    assert stats.target_files == 1
+    assert stats.parsed_files == 1
+    assert stats.documents == 1
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 1
+
+
+def test_main_rejects_vacuous_expected_scan_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = write(tmp_path, "workspaces: []")[0]
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--expect-parsed-files",
+            "2",
+            "--expect-schedule-blocks",
+            "9",
+            str(path),
+        ],
+    )
+
+    assert _mod.main() == 1
+    captured = capsys.readouterr()
+    assert "expected 2 parsed file(s), reached 1" in captured.err
+    assert "expected 9 schedule block(s), reached 0" in captured.err
 
 
 # --- shapes that must be understood -----------------------------------------

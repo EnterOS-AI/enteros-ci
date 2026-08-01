@@ -22,6 +22,12 @@ gate that only understands one location would go green through the migration.
 
 WHAT IT REFUSES
 ---------------
+E0  A target file that this gate could not read or parse, or an explicit
+    expected file/schedule-block count that was not reached. Molecule
+    composition tags (``!include``, ``!external``, and other local ``!`` tags)
+    are loaded safely as their underlying scalar/list/mapping so they cannot
+    make the whole document disappear from this gate.
+
 (There is no E1 — see the long note in check_node. The scheduler is declared
 on every workspace at provision, so "template does not name the scheduler" has
 no reachable true positive and was removed rather than left as noise.)
@@ -53,7 +59,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     import yaml
@@ -70,6 +76,40 @@ SCHEDULER_MARKERS: tuple[str, ...] = (
     "molecule-ai-plugin-scheduler",
     "molecule-scheduler",
 )
+
+
+class PermissiveLoader(yaml.SafeLoader):
+    """Safe YAML loader that preserves Molecule composition-tag contents.
+
+    Org templates legitimately contain local tags such as ``!include`` and
+    ``!external``. ``yaml.safe_load_all`` rejects the whole document when it
+    sees one, which previously made this gate silently skip otherwise visible
+    schedule declarations. The tag itself has no wiring semantics here, so
+    construct its underlying scalar/list/mapping using SafeLoader primitives.
+    """
+
+
+def _construct_custom_tag(
+    loader: PermissiveLoader,
+    _suffix: str,
+    node: yaml.Node,
+) -> Any:
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node, deep=True)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node, deep=True)
+    return loader.construct_scalar(node)
+
+
+PermissiveLoader.add_multi_constructor("!", _construct_custom_tag)
+
+
+class ScanStats(NamedTuple):
+    target_files: int
+    parsed_files: int
+    documents: int
+    schedule_blocks: int
+    schedule_entries: int
 
 
 class Finding:
@@ -117,9 +157,9 @@ def declares_scheduler(plugins: Any) -> bool:
 
 def check_schedule_entries(
     schedules: Any, path: str, node: str, origin: str, out: list[Finding]
-) -> None:
+) -> int:
     if not isinstance(schedules, list):
-        return
+        return 0
     for sched in schedules:
         if not isinstance(sched, dict):
             continue
@@ -148,6 +188,7 @@ def check_schedule_entries(
                     f"`prompt_file`; it would tick forever and run nothing.",
                 )
             )
+    return len(schedules)
 
 
 def effective_plugins(node_obj: dict, inherited: list) -> list:
@@ -192,7 +233,7 @@ def effective_plugins(node_obj: dict, inherited: list) -> list:
 def check_node(
     node_obj: dict, path: str, node_name: str, out: list[Finding],
     inherited_plugins: list | None = None,
-) -> None:
+) -> tuple[int, int]:
     """Wiring checks for one workspace node (or a whole workspace template)."""
     legacy = node_obj.get("schedules")
     plugins = effective_plugins(node_obj, inherited_plugins or [])
@@ -208,6 +249,8 @@ def check_node(
 
     has_legacy = isinstance(legacy, list) and len(legacy) > 0
     has_plugin_scheds = len(plugin_scheds) > 0
+    schedule_blocks = len(plugin_scheds) + (1 if "schedules" in node_obj else 0)
+    schedule_entries = 0
 
     if has_legacy and has_plugin_scheds:
         out.append(
@@ -254,10 +297,23 @@ def check_node(
                     f"no-op, so this fails silently.",
                 )
             )
-        check_schedule_entries(scheds, path, node_name, f"via plugin {src}", out)
+        schedule_entries += check_schedule_entries(
+            scheds,
+            path,
+            node_name,
+            f"via plugin {src}",
+            out,
+        )
 
     if has_legacy:
-        check_schedule_entries(legacy, path, node_name, "node-level", out)
+        schedule_entries += check_schedule_entries(
+            legacy,
+            path,
+            node_name,
+            "node-level",
+            out,
+        )
+    return schedule_blocks, schedule_entries
 
 
 def org_default_plugins(doc: Any) -> list:
@@ -273,9 +329,9 @@ def org_default_plugins(doc: Any) -> list:
 
 
 def check_document(doc: Any, path: str, out: list[Finding],
-                   inherited_plugins: list | None = None) -> None:
+                   inherited_plugins: list | None = None) -> tuple[int, int]:
     if not isinstance(doc, dict):
-        return
+        return 0, 0
     # A node inherits BOTH the repo-wide org defaults and any defaults declared
     # in its own document.
     inherited = list(inherited_plugins or []) + org_default_plugins(doc)
@@ -310,47 +366,87 @@ def check_document(doc: Any, path: str, out: list[Finding],
                 collect(t.get("workspaces"))
 
     if nodes:
+        schedule_blocks = 0
+        schedule_entries = 0
         for name, node in nodes:
-            check_node(node, path, name, out, inherited)
-    else:
-        # workspace template: the document IS the node
-        check_node(doc, path, "", out, inherited)
+            node_blocks, node_entries = check_node(
+                node,
+                path,
+                name,
+                out,
+                inherited,
+            )
+            schedule_blocks += node_blocks
+            schedule_entries += node_entries
+        return schedule_blocks, schedule_entries
+    # workspace template: the document IS the node
+    return check_node(doc, path, "", out, inherited)
 
 
-def scan(paths: list[Path]) -> list[Finding]:
+def scan_with_stats(paths: list[Path]) -> tuple[list[Finding], ScanStats]:
     out: list[Finding] = []
+    loaded: list[tuple[Path, list[Any]]] = []
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            out.append(
+                Finding(
+                    "E0",
+                    str(p),
+                    "",
+                    f"target could not be read by the wiring gate: {exc}",
+                )
+            )
+            continue
+        try:
+            docs = list(yaml.load_all(text, Loader=PermissiveLoader))
+        except yaml.YAMLError as exc:
+            out.append(
+                Finding(
+                    "E0",
+                    str(p),
+                    "",
+                    f"target could not be parsed by the wiring gate: {exc}",
+                )
+            )
+            continue
+        loaded.append((p, docs))
+
     # PASS 1 — collect repo-wide org defaults. In an org template the nodes
     # frequently live in SEPARATE workspace.yaml files while the scheduler is
     # installed once via org.yaml's `defaults.plugins`. Checking each file in
     # isolation would report every one of them as unwired: a false-positive
     # storm on a correctly composed repo.
     repo_defaults: list = []
-    for p in paths:
-        try:
-            text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            continue
+    for _path, docs in loaded:
         for doc in docs:
             repo_defaults.extend(org_default_plugins(doc))
 
-    for p in paths:
-        try:
-            text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            # Malformed YAML is the schema gate's job, not ours. Skipping keeps
-            # this gate's failures unambiguous.
-            continue
+    schedule_blocks = 0
+    schedule_entries = 0
+    for p, docs in loaded:
         for doc in docs:
-            check_document(doc, str(p), out, repo_defaults)
-    return out
+            document_blocks, document_entries = check_document(
+                doc,
+                str(p),
+                out,
+                repo_defaults,
+            )
+            schedule_blocks += document_blocks
+            schedule_entries += document_entries
+    return out, ScanStats(
+        target_files=len(paths),
+        parsed_files=len(loaded),
+        documents=sum(len(docs) for _path, docs in loaded),
+        schedule_blocks=schedule_blocks,
+        schedule_entries=schedule_entries,
+    )
+
+
+def scan(paths: list[Path]) -> list[Finding]:
+    findings, _stats = scan_with_stats(paths)
+    return findings
 
 
 def main() -> int:
@@ -358,6 +454,16 @@ def main() -> int:
     ap.add_argument("paths", nargs="*", default=None,
                     help="YAML files to check (default: all *.yaml/*.yml under the repo root).")
     ap.add_argument("--root", default=".", help="Repo root to scan when no paths are given.")
+    ap.add_argument(
+        "--expect-parsed-files",
+        type=int,
+        help="Fail unless exactly this many target files are parsed.",
+    )
+    ap.add_argument(
+        "--expect-schedule-blocks",
+        type=int,
+        help="Fail unless exactly this many node/plugin schedule blocks are reached.",
+    )
     args = ap.parse_args()
 
     if args.paths:
@@ -369,15 +475,48 @@ def main() -> int:
             if ".git" not in p.parts and "node_modules" not in p.parts
         )
 
-    findings = scan(targets)
+    findings, stats = scan_with_stats(targets)
+    if (
+        args.expect_parsed_files is not None
+        and stats.parsed_files != args.expect_parsed_files
+    ):
+        findings.append(
+            Finding(
+                "E0",
+                "<scan>",
+                "",
+                f"expected {args.expect_parsed_files} parsed file(s), "
+                f"reached {stats.parsed_files}",
+            )
+        )
+    if (
+        args.expect_schedule_blocks is not None
+        and stats.schedule_blocks != args.expect_schedule_blocks
+    ):
+        findings.append(
+            Finding(
+                "E0",
+                "<scan>",
+                "",
+                f"expected {args.expect_schedule_blocks} schedule block(s), "
+                f"reached {stats.schedule_blocks}",
+            )
+        )
     if not findings:
-        print(f"schedule wiring OK — {len(targets)} file(s) checked, no unreachable schedules")
+        print(
+            "schedule wiring OK — "
+            f"{stats.parsed_files}/{stats.target_files} file(s) parsed, "
+            f"{stats.documents} document(s), "
+            f"{stats.schedule_blocks} schedule block(s), "
+            f"{stats.schedule_entries} schedule entry/entries checked, "
+            "no unreachable schedules"
+        )
         return 0
     for f in findings:
         print(str(f), file=sys.stderr)
     print(
-        f"::error::{len(findings)} schedule-wiring problem(s). These parse and validate "
-        f"but would never fire — see the codes above.",
+        f"::error::{len(findings)} schedule-wiring or scan-integrity problem(s) — "
+        f"see the codes above.",
         file=sys.stderr,
     )
     return 1
