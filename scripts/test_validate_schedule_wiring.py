@@ -119,7 +119,8 @@ def test_E3_both_locations_is_refused(tmp_path):
 # --- E4: cron arity ----------------------------------------------------------
 
 
-def test_E4_six_field_cron_is_refused(tmp_path):
+@pytest.mark.parametrize("cron_key", ("cron_expr", "cron"))
+def test_E4_six_field_cron_is_refused(tmp_path, cron_key: str) -> None:
     f = scan(
         write(
             tmp_path,
@@ -129,7 +130,7 @@ def test_E4_six_field_cron_is_refused(tmp_path):
             plugins: [{SCHED}]
             schedules:
               - name: Secondsy
-                cron_expr: "0 */30 * * * *"
+                {cron_key}: "0 */30 * * * *"
                 prompt: x
     """,
         )
@@ -137,7 +138,8 @@ def test_E4_six_field_cron_is_refused(tmp_path):
     assert "E4" in codes(f)
 
 
-def test_E4_five_field_cron_passes(tmp_path):
+@pytest.mark.parametrize("cron_key", ("cron_expr", "cron"))
+def test_E4_five_field_cron_passes(tmp_path, cron_key: str) -> None:
     f = scan(
         write(
             tmp_path,
@@ -147,7 +149,7 @@ def test_E4_five_field_cron_passes(tmp_path):
             plugins: [{SCHED}]
             schedules:
               - name: Fine
-                cron_expr: "*/30 * * * *"
+                {cron_key}: "*/30 * * * *"
                 prompt: x
     """,
         )
@@ -1024,6 +1026,81 @@ def test_malformed_schedule_blocks_fail_closed_and_do_not_count_entries(
     assert stats.schedule_entries == 0
 
 
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        "{prompt: run}",
+        "{name: Missing cron, prompt: run}",
+        "{name: Both, cron_expr: '0 * * * *', cron: '0 * * * *', prompt: run}",
+        "{name: 7, cron: '0 * * * *', prompt: run}",
+        "{name: Wrong cron type, cron: 7, prompt: run}",
+    ),
+)
+def test_malformed_plugin_schedule_mapping_fails_closed_and_is_not_counted(
+    tmp_path: Path,
+    schedule: str,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Malformed
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - {schedule}
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 0
+    assert "schedule entry" in str(findings[0])
+
+
+def test_malformed_plugin_schedule_cannot_satisfy_exact_cli_entry_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = write(
+        tmp_path,
+        f"""
+        workspaces:
+          - name: Malformed
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - {{prompt: run}}
+    """,
+    )[0]
+    monkeypatch.setattr(
+        _mod.sys,
+        "argv",
+        [
+            "validate_schedule_wiring.py",
+            "--root",
+            str(tmp_path),
+            "--expect-parsed-files",
+            "1",
+            "--expect-schedule-blocks",
+            "1",
+            "--expect-schedule-entries",
+            "1",
+            str(path),
+        ],
+    )
+
+    assert _mod.main() == 1
+    captured = capsys.readouterr()
+    assert "schedule entry" in captured.err
+    assert "expected 1 schedule entry/entries, reached 0" in captured.err
+
+
 def test_many_plugin_opt_outs_are_processed_in_linear_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1059,8 +1136,10 @@ def test_plugin_opt_out_matching_uses_cores_exact_source_identity() -> None:
     assert short == [SCHED, "other-plugin", "!molecule-ai-plugin-scheduler"]
 
 
+@pytest.mark.parametrize("cron_key", ("cron_expr", "cron"))
 def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
     tmp_path: Path,
+    cron_key: str,
 ) -> None:
     findings, stats = scan_with_stats(
         write(
@@ -1072,7 +1151,7 @@ def test_repo_defaults_schedule_block_is_counted_once_per_workspace(
               config:
                 schedules:
                   - name: Inherited once
-                    cron_expr: "0 * * * *"
+                    {cron_key}: "0 * * * *"
                     prompt: run
         workspaces:
           - name: A

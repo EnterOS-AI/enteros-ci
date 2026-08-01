@@ -22,8 +22,9 @@ gate that only understands one location would go green through the migration.
 
 WHAT IT REFUSES
 ---------------
-E0  A target file that this gate could not read or parse, or an explicit
-    expected file/schedule-block/schedule-entry count that was not reached.
+E0  A target file that this gate could not read or parse, a malformed schedule
+    entry, or an explicit expected file/schedule-block/schedule-entry count
+    that was not reached.
     Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
     are loaded safely as their underlying scalar/list/mapping so they cannot
@@ -45,7 +46,7 @@ E3  BOTH node-level `schedules:` and `plugins[].config.schedules`
     Ambiguous ownership during the flag day. Refuse rather than guess which
     one wins — guessing is how you lose half a grid.
 
-E4  cron_expr that is not 5 fields
+E4  cron or cron_expr that is not 5 fields
     6-field (seconds-first) cron is the common paste from other schedulers; it
     parses as a string and never matches.
 
@@ -512,7 +513,6 @@ def check_schedule_entries(
                 budget,
             )
             continue
-        checked_entries += 1
         object_id = id(sched)
         if object_id in seen_entries:
             raise ScanInputError(
@@ -523,22 +523,50 @@ def check_schedule_entries(
         if isinstance(raw_name, str):
             if len(raw_name) > MAX_SCHEDULE_FIELD_CHARS:
                 raise ScanInputError("target exceeds the schedule field length limit")
-            name = raw_name
-        else:
-            name = "<unnamed>"
-        cron = sched.get("cron_expr")
-        if isinstance(cron, str):
-            if len(cron) > MAX_SCHEDULE_FIELD_CHARS:
+        cron_keys = tuple(key for key in ("cron_expr", "cron") if key in sched)
+        for cron_key in cron_keys:
+            cron_value = sched[cron_key]
+            if (
+                isinstance(cron_value, str)
+                and len(cron_value) > MAX_SCHEDULE_FIELD_CHARS
+            ):
                 raise ScanInputError("target exceeds the schedule field length limit")
+
+        structural_errors: list[str] = []
+        if not isinstance(raw_name, str) or not raw_name:
+            structural_errors.append("a non-empty string `name`")
+        if len(cron_keys) != 1:
+            structural_errors.append("exactly one of `cron_expr` or `cron`")
+        elif not isinstance(sched[cron_keys[0]], str):
+            structural_errors.append(f"a string `{cron_keys[0]}`")
+        if structural_errors:
+            _append_finding(
+                out,
+                Finding(
+                    "E0",
+                    path,
+                    node,
+                    f"schedule entry ({origin}) must declare "
+                    + " and ".join(structural_errors),
+                ),
+                budget,
+            )
+            continue
+
+        checked_entries += 1
+        name = raw_name
+        cron_key = cron_keys[0]
+        cron = sched[cron_key]
+        if isinstance(cron, str):
             fields = cron.split()
-            if fields and len(fields) != 5:
+            if len(fields) != 5:
                 _append_finding(
                     out,
                     Finding(
                         "E4",
                         path,
                         node,
-                        f"schedule {name!r} ({origin}) has a {len(fields)}-field cron_expr "
+                        f"schedule {name!r} ({origin}) has a {len(fields)}-field {cron_key} "
                         f"{cron!r}; this system takes 5-field cron (min hour dom mon dow). "
                         f"A 6-field seconds-first expression parses fine and never matches.",
                     ),
