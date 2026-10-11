@@ -7,15 +7,15 @@ repository (the marketplace-catalog contract family, RFC
 
 | Vendored copy | Source path in `molecule-ai-sdk (contracts/)` | Source commit |
 | --- | --- | --- |
-| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `dea2155364272605fceab5247c1e71b4ba444b2d` (SDK PR #182 merge — `contributes.state`, contract-version 0.6.0) |
+| `plugin-manifest.schema.json`    | `contracts/plugin-manifest/plugin-manifest.schema.json`       | `8538b0e05261a33e7c88139a415fc2c1ec4cfd4a` (SDK PR #201 — `digestProviders` are not native-only, contract-version 0.7.0) |
 | `workspace-template.schema.json` | `contracts/workspace-template/workspace-template.schema.json` | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #180 merge — schedule accepts `cron` or `cron_expr`) |
 | `org-template.schema.json`       | `contracts/org-template/org-template.schema.json`             | `2c4457da12b9978b7343da684ffe901d94ee3eac` (SDK PR #179 merge — empty-declaration `anyOf` constraint) |
 | `repo-meta.schema.json`          | `contracts/repo-meta/repo-meta.schema.json`                   | `faa0fecf` (SDK PR #116 merged — `node-package` added to knownCapability) |
 | `schedule.schema.json`           | `contracts/schedule/schedule.schema.json`                     | `2eba5d9cd5ad3a936e659f6aa02e7c3202969c1d` (schedule-grid SSOT; stable lowercase-kebab entry names) |
 
 The complete mirror snapshot is pinned in `schemas/SDK_SOURCE_COMMIT`. It is
-currently SDK per-install-config commit
-`fd163eca94f7fa69570232fb4b4986d19a03c083`; every row is fetched from that
+currently SDK main commit
+`1f6af8be118b33700c367e9ebce64f9b085a7716`; every row is fetched from that
 same immutable commit even when the table records an older, last
 contract-changing commit for the individual file.
 
