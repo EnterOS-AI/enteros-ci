@@ -1091,13 +1091,152 @@ def test_runtime_rejected_schedule_name_fails_closed_and_is_not_counted(
                       cron_expr: "0 * * * *"
                       prompt: run
     """,
-        )
+        ),
+        enforce_sdk_names=True,
     )
 
     assert codes(findings) == ["E0"]
     assert stats.schedule_blocks == 1
     assert stats.schedule_entries == 0
     assert "SDK schedule contract" in str(findings[0])
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    (
+        "Hourly unanswered sweep",
+        "UPPERCASE",
+        "trailing-",
+        "a" * 129,
+    ),
+)
+def test_runtime_rejected_schedule_name_warns_and_is_counted_by_default(
+    tmp_path: Path,
+    invalid_name: str,
+) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: {invalid_name!r}
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """,
+        )
+    )
+
+    assert codes(findings) == ["W1"]
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 1
+    rendered = str(findings[0])
+    assert rendered.startswith("::warning::[W1] ")
+    assert "org.yaml :: node 'Runtime parity'" in rendered
+    assert repr(invalid_name) in rendered
+    assert f"via plugin {SCHED}" in rendered
+    assert "schedule_seed -> schedule_store.validate_entry" in rendered
+    assert "--enforce-sdk-schedule-names" in rendered
+
+
+def test_blank_schedule_name_fails_closed_by_default(tmp_path: Path) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: '   '
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """,
+        )
+    )
+
+    assert codes(findings) == ["E0"]
+    assert stats.schedule_blocks == 1
+    assert stats.schedule_entries == 0
+    assert "non-blank string `name`" in str(findings[0])
+
+
+def test_warned_schedule_name_still_gets_the_wiring_checks(tmp_path: Path) -> None:
+    findings, stats = scan_with_stats(
+        write(
+            tmp_path,
+            f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Hourly sweep
+                      cron_expr: "0 0 * * * *"
+    """,
+        )
+    )
+
+    assert codes(findings) == ["W1", "E4", "E5"]
+    assert stats.schedule_entries == 1
+
+
+def test_cli_warns_on_runtime_rejected_name_unless_enforced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write(
+        tmp_path,
+        f"""
+        workspaces:
+          - name: Runtime parity
+            plugins:
+              - source: {SCHED}
+                config:
+                  schedules:
+                    - name: Hourly unanswered sweep
+                      cron_expr: "0 * * * *"
+                      prompt: run
+    """,
+    )
+    argv = [
+        "validate_schedule_wiring.py",
+        "--root",
+        str(tmp_path),
+        "--expect-parsed-files",
+        "1",
+        "--expect-schedule-blocks",
+        "1",
+        "--expect-schedule-entries",
+        "1",
+    ]
+
+    monkeypatch.setattr(_mod.sys, "argv", argv)
+    assert _mod.main() == 0
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "::warning::[W1]" in output
+    assert "schedule wiring OK" in output
+    assert "1 schedule entry/entries checked" in output
+    assert "::error::" not in output
+
+    monkeypatch.setattr(_mod.sys, "argv", [*argv, "--enforce-sdk-schedule-names"])
+    assert _mod.main() == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "::error::[E0]" in output
+    assert "SDK schedule contract" in output
+    assert "expected 1 schedule entry/entries, reached 0" in output
+    assert "::warning::" not in output
+    assert "schedule wiring OK" not in output
 
 
 def test_sdk_kebab_schedule_name_is_accepted_and_counted(tmp_path: Path) -> None:

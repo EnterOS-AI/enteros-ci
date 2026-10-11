@@ -162,6 +162,20 @@ closed. Findings never echo source lines; attacker-controlled fields are
 truncated before retention, and control characters are escaped so one finding
 cannot forge additional CI log commands.
 
+Plugin-config schedule names are also checked against the SDK schedule-entry
+name subset vendored in `schemas/schedule.schema.json` (a lowercase-kebab
+slug). The workspace runtime seeder (`schedule_seed` ->
+`schedule_store.validate_entry`) skips an entry whose name is outside it, so
+that schedule never fires. The subset is enforced only with
+`--enforce-sdk-schedule-names`: the name is then E0 and the entry is not
+counted. Without the flag the gate prints a `::warning::` (W1), still checks
+the entry for E2-E5 and counts it, and can stay green. A blank plugin-config
+name is E0 either way. The default is a warning because molecule-dev and
+reno-stars run this script from unpinned molecule-ci `main`, so enforcing it
+here would turn both repos red at once, and renaming their schedules starts
+schedules that are dormant today. A consumer opts in by renaming its schedules
+to slugs and adding the flag in the same reviewed change.
+
 ## Composite actions
 
 ### conformance-gate

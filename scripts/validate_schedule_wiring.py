@@ -23,8 +23,9 @@ gate that only understands one location would go green through the migration.
 WHAT IT REFUSES
 ---------------
 E0  A target file that this gate could not read or parse, a malformed schedule
-    entry (including a plugin-config name the runtime rejects under the SDK
-    schedule contract), or an explicit expected
+    entry (including a blank plugin-config name and, with
+    --enforce-sdk-schedule-names, a plugin-config name the runtime rejects
+    under the SDK schedule contract), or an explicit expected
     file/schedule-block/schedule-entry count that was not reached.
     Molecule
     composition tags (``!include``, ``!external``, and other local ``!`` tags)
@@ -54,9 +55,21 @@ E4  cron or cron_expr that is not 5 fields
 E5  neither `prompt` nor `prompt_file`
     A schedule with no body ticks forever and does nothing.
 
-Exit 0 clean, 1 on any refusal. Every message names the file, the node, the
-schedule, and the concrete fix — a gate that says "invalid" without saying
-where is a gate people learn to skip.
+WHAT IT WARNS ABOUT
+-------------------
+W1  A plugin-config schedule `name` outside the vendored SDK schedule contract
+    (a lowercase-kebab slug). The workspace runtime seeder
+    (schedule_seed -> schedule_store.validate_entry) skips such an entry, so it
+    never fires. This is a warning by default: the entry is still checked by
+    E2-E5 and counted. molecule-dev and reno-stars run this script from
+    unpinned molecule-ci main, and the fix (renaming) starts schedules that are
+    dormant today, so turning it into a refusal is the consumer's decision.
+    --enforce-sdk-schedule-names makes the same name E0 and leaves the entry
+    uncounted.
+
+Exit 0 clean (warnings allowed), 1 on any refusal. Every message names the
+file, the node, the schedule, and the concrete fix — a gate that says
+"invalid" without saying where is a gate people learn to skip.
 """
 
 from __future__ import annotations
@@ -480,12 +493,18 @@ class Finding:
         self.node = _truncate_finding_text(node, MAX_FINDING_FIELD_CHARS)
         self.detail = _truncate_finding_text(detail, MAX_FINDING_DETAIL_CHARS)
 
+    @property
+    def is_warning(self) -> bool:
+        """W-codes are reported but never fail the gate or count as problems."""
+        return self.code.startswith("W")
+
     def __str__(self) -> str:
         path = _sanitize_log_text(self.path)
         node = _sanitize_log_text(self.node)
         detail = _sanitize_log_text(self.detail)
         where = path + (f" :: node {node!r}" if node else "")
-        return f"::error::[{self.code}] {where} — {detail}"
+        level = "warning" if self.is_warning else "error"
+        return f"::{level}::[{self.code}] {where} — {detail}"
 
 
 def _truncate_finding_text(value: object, maximum: int) -> str:
@@ -570,7 +589,15 @@ def check_schedule_entries(
     budget: ScanBudget | None = None,
     owner_id: int | None = None,
     enforce_sdk_name: bool = False,
+    warn_sdk_name: bool = False,
 ) -> int:
+    """Check one schedule block and return how many entries were counted.
+
+    ``enforce_sdk_name`` refuses (E0, uncounted) a name outside the vendored
+    SDK schedule contract. ``warn_sdk_name`` refuses only a blank name and
+    reports any other contract miss as W1, then checks and counts the entry.
+    With neither, the SDK name contract is not applied (node-level blocks).
+    """
     if not isinstance(schedules, list):
         _append_finding(
             out,
@@ -625,12 +652,17 @@ def check_schedule_entries(
                 raise ScanInputError("target exceeds the schedule field length limit")
 
         structural_errors: list[str] = []
+        sdk_name_rejected = False
         if not isinstance(raw_name, str) or not raw_name:
             structural_errors.append("a non-empty string `name`")
         elif enforce_sdk_name and not _schedule_name_is_valid(raw_name):
             structural_errors.append(
                 "a `name` matching the vendored SDK schedule contract"
             )
+        elif warn_sdk_name and not raw_name.strip():
+            structural_errors.append("a non-blank string `name`")
+        elif warn_sdk_name and not _schedule_name_is_valid(raw_name):
+            sdk_name_rejected = True
         if len(cron_keys) != 1:
             structural_errors.append("exactly one of `cron_expr` or `cron`")
         elif not isinstance(sched[cron_keys[0]], str):
@@ -651,6 +683,23 @@ def check_schedule_entries(
 
         checked_entries += 1
         name = raw_name
+        if sdk_name_rejected:
+            maximum = _load_schedule_name_contract().maximum
+            _append_finding(
+                out,
+                Finding(
+                    "W1",
+                    path,
+                    node,
+                    f"schedule {name!r} ({origin}) does not match the vendored SDK "
+                    f"schedule-name contract (a lowercase-kebab slug of at most "
+                    f"{maximum} characters), so the workspace runtime seeder "
+                    f"(schedule_seed -> schedule_store.validate_entry) will skip it "
+                    f"and it never fires. Rename it to a lowercase-kebab slug, then "
+                    f"pass --enforce-sdk-schedule-names.",
+                ),
+                budget,
+            )
         cron_key = cron_keys[0]
         cron = sched[cron_key]
         if isinstance(cron, str):
@@ -736,6 +785,7 @@ def check_node(
     out: list[Finding],
     inherited_plugins: list | None = None,
     budget: ScanBudget | None = None,
+    enforce_sdk_names: bool = False,
 ) -> tuple[int, int]:
     """Wiring checks for one workspace node (or a whole workspace template)."""
     legacy = node_obj.get("schedules")
@@ -819,7 +869,8 @@ def check_node(
             out,
             budget,
             owner_id,
-            enforce_sdk_name=True,
+            enforce_sdk_name=enforce_sdk_names,
+            warn_sdk_name=not enforce_sdk_names,
         )
 
     if has_legacy:
@@ -855,6 +906,7 @@ def check_document(
     *,
     defaults_in_inherited: bool = False,
     budget: ScanBudget | None = None,
+    enforce_sdk_names: bool = False,
 ) -> tuple[int, int]:
     if not isinstance(doc, dict):
         return 0, 0
@@ -929,12 +981,21 @@ def check_document(
                 out,
                 inherited,
                 budget,
+                enforce_sdk_names=enforce_sdk_names,
             )
             schedule_blocks += node_blocks
             schedule_entries += node_entries
         return schedule_blocks, schedule_entries
     # workspace template: the document IS the node
-    return check_node(doc, path, "", out, inherited, budget)
+    return check_node(
+        doc,
+        path,
+        "",
+        out,
+        inherited,
+        budget,
+        enforce_sdk_names=enforce_sdk_names,
+    )
 
 
 def _deduplicate_paths(paths: list[Path]) -> list[Path]:
@@ -1080,6 +1141,7 @@ def scan_with_stats(
     paths: list[Path],
     *,
     root: Path | None = None,
+    enforce_sdk_names: bool = False,
 ) -> tuple[list[Finding], ScanStats]:
     out: list[Finding] = []
     try:
@@ -1162,6 +1224,7 @@ def scan_with_stats(
                     repo_defaults,
                     defaults_in_inherited=True,
                     budget=budget,
+                    enforce_sdk_names=enforce_sdk_names,
                 )
             except ScanInputError as exc:
                 out.append(Finding("E0", str(p), "", exc.safe_reason))
@@ -1179,8 +1242,17 @@ def scan_with_stats(
     )
 
 
-def scan(paths: list[Path], *, root: Path | None = None) -> list[Finding]:
-    findings, _stats = scan_with_stats(paths, root=root)
+def scan(
+    paths: list[Path],
+    *,
+    root: Path | None = None,
+    enforce_sdk_names: bool = False,
+) -> list[Finding]:
+    findings, _stats = scan_with_stats(
+        paths,
+        root=root,
+        enforce_sdk_names=enforce_sdk_names,
+    )
     return findings
 
 
@@ -1279,6 +1351,16 @@ def main() -> int:
             "entries are checked. Required with --expect-schedule-blocks."
         ),
     )
+    ap.add_argument(
+        "--enforce-sdk-schedule-names",
+        action="store_true",
+        help=(
+            "Refuse (E0) a plugin-config schedule name outside the vendored SDK "
+            "schedule contract and leave it uncounted. Default: warn (W1) and "
+            "count it, because unpinned consumers run this script from "
+            "molecule-ci main."
+        ),
+    )
     args = ap.parse_args()
     if args.expect_schedule_blocks is not None and args.expect_schedule_entries is None:
         ap.error(
@@ -1300,7 +1382,11 @@ def main() -> int:
             targets = []
 
     if discovery_error is None:
-        findings, stats = scan_with_stats(targets, root=root)
+        findings, stats = scan_with_stats(
+            targets,
+            root=root,
+            enforce_sdk_names=args.enforce_sdk_schedule_names,
+        )
     else:
         findings = [Finding("E0", "<scan>", "", discovery_error.safe_reason)]
         stats = ScanStats(0, 0, 0, 0, 0)
@@ -1343,20 +1429,29 @@ def main() -> int:
                 f"reached {stats.schedule_entries}",
             )
         )
-    if not findings:
+    # Warnings are printed as ::warning:: lines but never fail the gate or
+    # count as problems.
+    for f in findings:
+        print(str(f), file=sys.stderr)
+    warning_count = sum(1 for f in findings if f.is_warning)
+    problem_count = len(findings) - warning_count
+    if problem_count == 0:
+        outcome = (
+            f"{warning_count} warning(s) reported"
+            if warning_count
+            else "no unreachable schedules"
+        )
         print(
             "schedule wiring OK — "
             f"{stats.parsed_files}/{stats.target_files} file(s) parsed, "
             f"{stats.documents} document(s), "
             f"{stats.schedule_blocks} schedule block(s), "
             f"{stats.schedule_entries} schedule entry/entries checked, "
-            "no unreachable schedules"
+            f"{outcome}"
         )
         return 0
-    for f in findings:
-        print(str(f), file=sys.stderr)
     print(
-        f"::error::{len(findings)} schedule-wiring or scan-integrity problem(s) — "
+        f"::error::{problem_count} schedule-wiring or scan-integrity problem(s) — "
         f"see the codes above.",
         file=sys.stderr,
     )

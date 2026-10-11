@@ -43,10 +43,14 @@ in the same change that lands the SDK edit, or expect a red here.
 > `check-schemas-in-sync.sh` drift gate.
 
 > **`schedule.schema.json` is also not a marketplace-artifact schema.** The
-> schedule wiring validator consumes its executable entry-name constraints so
-> CI counts only schedules the runtime will seed. Keeping that subset tied to
-> this byte-pinned copy prevents a duplicated Python regex from drifting away
-> from the SDK and runtime contract.
+> schedule wiring validator consumes its executable entry-name constraints to
+> find plugin-config schedules the runtime seeder will skip. It enforces that
+> subset (E0, entry not counted) only with `--enforce-sdk-schedule-names`;
+> by default it reports a W1 warning and still counts the entry, because
+> molecule-dev and reno-stars run the validator from unpinned molecule-ci
+> `main` and renaming their schedules would start schedules that are dormant
+> today. Keeping that subset tied to this byte-pinned copy prevents a
+> duplicated Python regex from drifting away from the SDK and runtime contract.
 
 IDL: JSON-Schema **draft 2020-12** (RFC §15 decision).
 
