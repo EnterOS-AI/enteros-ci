@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check-schemas-in-sync.sh — fail if the vendored marketplace-artifact
-# JSON-Schemas in schemas/ have drifted from one immutable molecule-ai-sdk
+# check-schemas-in-sync.sh — fail if the vendored SDK JSON-Schemas in schemas/
+# have drifted from one immutable molecule-ai-sdk
 # contracts snapshot.
 #
 # The schemas under schemas/ are a byte-for-byte SSOT mirror of the
@@ -66,6 +66,7 @@ declare -A MAP=(
   [workspace-template.schema.json]="contracts/workspace-template/workspace-template.schema.json"
   [org-template.schema.json]="contracts/org-template/org-template.schema.json"
   [repo-meta.schema.json]="contracts/repo-meta/repo-meta.schema.json"
+  [schedule.schema.json]="contracts/schedule/schedule.schema.json"
 )
 
 tmp="$(mktemp -d)"

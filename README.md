@@ -123,6 +123,59 @@ also assert script sentinels. Updating any pin is a reviewed dependency change.
 | Direct-workspace count | Notice | Resolved inline workspace inventory |
 | No committed secrets | Error | Leaked API keys |
 
+### validate-schedule-wiring
+
+`scripts/validate_schedule_wiring.py` complements the org schema: it proves
+that schedule blocks are attached where the scheduler can read them. Consumers
+with a known inventory should make the scan non-vacuous with positive exact
+counts:
+
+```bash
+python3 .molecule-ci-canonical/.molecule-ci/scripts/validate_schedule_wiring.py \
+  --root . \
+  --expect-parsed-files 16 \
+  --expect-schedule-blocks 9 \
+  --expect-schedule-entries 9
+```
+
+Default discovery excludes `.git`, `node_modules`, `.molecule-ci-canonical`,
+and `.molecule-ci-ssot`, so a validator checkout nested in the consumer does
+not change its file count. The example is the current molecule-dev contract:
+16 consumer-owned YAML files (including `channel-dependency-lock.yaml`), 9
+schedule blocks, and 9 structurally valid schedule entries actually checked. A
+block expectation requires the positive exact entry expectation so an empty or
+malformed block cannot make the gate vacuously green. Change any exact number
+in the same reviewed consumer diff that intentionally changes that inventory.
+`--exclude-dir NAME` adds another generated/tool directory exclusion. Passing
+YAML paths
+positionally is the explicit allowlist form; duplicate paths collapse, and
+every target must be a regular, bounded, non-symlink file inside `--root`.
+Unknown local `!`
+composition tags are loaded as safe data, while duplicate keys, malformed YAML,
+malformed schedule mappings, non-string mapping keys, unsafe reads, excessive
+aliases/depth/nodes, and cyclic workspace aliases fail closed with E0.
+Conservative scan-wide limits also bound
+discovery entries, target files, YAML bytes/documents/nodes, workspace nodes,
+defaults-to-workspace plugin composition, schedule visits, finding count, and
+finding detail bytes. Reusing one aliased schedule list across blocks fails
+closed. Findings never echo source lines; attacker-controlled fields are
+truncated before retention, and control characters are escaped so one finding
+cannot forge additional CI log commands.
+
+Plugin-config schedule names are also checked against the SDK schedule-entry
+name subset vendored in `schemas/schedule.schema.json` (a lowercase-kebab
+slug). The workspace runtime seeder (`schedule_seed` ->
+`schedule_store.validate_entry`) skips an entry whose name is outside it, so
+that schedule never fires. The subset is enforced only with
+`--enforce-sdk-schedule-names`: the name is then E0 and the entry is not
+counted. Without the flag the gate prints a `::warning::` (W1), still checks
+the entry for E2-E5 and counts it, and can stay green. A blank plugin-config
+name is E0 either way. The default is a warning because molecule-dev and
+reno-stars run this script from unpinned molecule-ci `main`, so enforcing it
+here would turn both repos red at once, and renaming their schedules starts
+schedules that are dormant today. A consumer opts in by renaming its schedules
+to slugs and adding the flag in the same reviewed change.
+
 ## Composite actions
 
 ### conformance-gate

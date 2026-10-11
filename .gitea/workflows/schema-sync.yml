@@ -1,4 +1,4 @@
-# schema-sync — keep the vendored marketplace-artifact JSON-Schemas in
+# schema-sync — keep the vendored SDK JSON-Schemas in
 # schemas/ byte-identical to their molecule-ai-sdk (contracts/) SSOT originals.
 #
 # The validate-plugin / validate-workspace-template / validate-org-template
